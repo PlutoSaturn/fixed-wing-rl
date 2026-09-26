@@ -1,0 +1,8 @@
+jsbsim
+gymnasium
+stable-baselines3
+tensorboard
+torch
+numpy
+matplotlib
+modal

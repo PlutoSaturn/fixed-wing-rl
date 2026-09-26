@@ -1,0 +1,1 @@
+"C:\Program Files\FlightGear 2024.1\bin\fgfs.exe" --fg-scenery="C:\Users\alexa\Documents\fixed_wing_rl\fg_scenery\env1" --aircraft=c172p --fdm=null --native-fdm=socket,in,60,,5550,udp --lat=37.001371 --lon=-119.996286 --altitude=2144 --heading=82.4 --in-air --timeofday=noon --disable-real-weather-fetch --disable-ai-traffic --enable-terrasync --prop:/sim/freeze/fuel=true

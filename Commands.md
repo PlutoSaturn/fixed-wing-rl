@@ -21,3 +21,5 @@ python jsbsim_c172.py fgview 1 --speed 4
 Generates a .bat file and scenery to initialize FlightGear simulation. Plays generated maneuvers from JSBsim.
 
 ____
+
+[Demo Video](https://huggingface.co/datasets/PlutoJupiter/fixed-wing-rl/resolve/main/SCPdemo.mp4)

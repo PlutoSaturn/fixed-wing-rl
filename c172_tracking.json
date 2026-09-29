@@ -1,0 +1,16 @@
+[
+  {
+    "env_index": 1,
+    "status": "flown",
+    "max_error_m": 12.239620289227787,
+    "rms_error_m": 5.535041856356034,
+    "final_error_m": 3.3368966936865867,
+    "min_clearance_m": 21.833336409419573,
+    "planned_clearance_m": 30.0,
+    "left_workspace_m": 0.0,
+    "collision_free": true,
+    "throttle_saturated_frac": 0.026579520697167756,
+    "aileron_saturated_frac": 0.0,
+    "elevator_saturated_frac": 0.0
+  }
+]

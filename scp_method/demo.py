@@ -13,6 +13,7 @@ generator will eventually produce -- swap `build_demo_problem()` for
 their generator's output once it exists; everything downstream
 (the solver, the Solution schema) stays the same.
 """
+# this is a new comment
 
 from __future__ import annotations
 

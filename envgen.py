@@ -20,21 +20,32 @@ vehicle radius, and d = r + margin the required clearance.
 
 (3) Obstacle keep-out constraints, one per convex obstacle piece:
         h_i(p; d) >= 0
+    Rotations: spheroids and oriented cylinders are defined upright and turned
+    by an angle vector (roll, pitch, yaw) in degrees,
+        R = Rz(yaw) Ry(pitch) Rx(roll)          (aerospace Z-Y-X convention)
+    and their axis (polar axis / cylinder axis) is a = R e_z.
     Spheroid  (center c, semi-axes a, rotation R, a_min = min(a)):
         h = || diag(1/a) R^T (p - c) ||_2  -  (1 + d / a_min)
-    Cylinder  (vertical, standing on the floor; axis center c_xy, radius rho, top z_top):
+    Oriented cylinder  (finite, center c, rotation R, axis a = R e_z,
+                        radius rho, half-length L):
+        s = a . (p - c)                      (position along the axis)
+        r = || (p - c) - s a ||_2            (distance from the axis)
+        h = max( r - (rho + d),  |s| - (L + d) )
+    Cylinder  (legacy upright pillar standing on the floor; axis center c_xy,
+               radius rho, top z_top):
         h = max( ||(x, y) - c_xy||_2 - (rho + d),  z - (z_top + d) )
         full-height cylinders (z_top = ceiling) drop the second term:
         h = ||(x, y) - c_xy||_2 - (rho + d)
-    Box       (axis-aligned; center c, half-extents e):
-        h = max_k ( |p_k - c_k| - (e_k + d) )
-    Wall      (slab with a rectangular opening): the union of up to four boxes,
-              so it contributes one box constraint per piece.
+    Box       (center c, half-extents e, rotation R from its angle vector):
+        h = max_k ( |(R^T (p - c))_k| - (e_k + d) )
+    Wall      (finite panel with one rectangular opening, yawed and leaned):
+              the union of up to four rotated boxes around the opening, so it
+              contributes one box constraint per piece.
 
 Properties (why these forms are used):
   * Conservative: h_i(p; d) >= 0 guarantees the vehicle's sphere of radius d
     does not touch the obstacle. (Spheroid: the ellipsoid scaled by
-    1 + d/a_min contains the obstacle grown by d. Cylinder/box: the max-form
+    1 + d/a_min contains the obstacle grown by d. Cylinders/box: the max-form
     keeps square edges, which contain the rounded grown shape.)
   * Convex: every h_i is convex in p (a norm of an affine map, or a max of
     convex functions). So its first-order linearization about any p_ref,
@@ -53,7 +64,14 @@ Generation procedure
 --------------------------------------------------------------------------
   1. Sample start and goal positions (minimum separation enforced).
   2. Draw a fill target uniformly from OCCUPANCY_RANGE.
-  3. Propose obstacles of random type, log-uniform size, uniform position.
+  3. Propose obstacles of random type, log-uniform size, uniform position and
+     a random angle vector (roll, pitch, yaw), each angle drawn from its own
+     range, so a sweep can go from upright pillars to horizontal bars. The
+     type is drawn per obstacle, so the obstacle count depends only on the
+     fill target. Obstacles below MIN_OBSTACLE_RADIUS are discarded, so the
+     fill is made of fewer, larger pieces. Walls (panels across the start-goal
+     line) are capped per environment, and later obstacles must leave each
+     wall's opening passable.
      Keep one only if start and goal stay clear of it (with extra margin) and
      it does not overshoot the fill target. Filled volume is a union over
      Monte Carlo points, so overlaps are not double-counted. Proposed sizes
@@ -65,6 +83,10 @@ Usage
         python envgen.py
     or override from the command line:
         python envgen.py --size 10 10 5 --n 100 --seed 0 --out envs.json --plot
+    choose obstacle types and orientations:
+        python envgen.py --types spheroid=1 oriented_cylinder=1 box=1 wall=0.1 \\
+                         --cylinder-rotation 0 75:90 180 --spheroid-rotation 90 90 180
+    (each angle: m means [-m, m], lo:hi means [lo, hi], degrees)
 """
 from __future__ import annotations
 
@@ -97,23 +119,79 @@ OCCUPANCY_RANGE     = (0.20, 0.60)
 OCCUPANCY_TOLERANCE = 0.01          # max allowed overshoot of the target
 OCCUPANCY_SAMPLES   = 20000         # Monte Carlo points for estimating fill
 
-# ---- obstacle types (relative probability of proposing each) -------------
+# ---- obstacle types -----------------------------------------------------------
+# Every obstacle's type is drawn at random from these weights, one obstacle at a
+# time, until the fill target is reached. So enabling more types changes the
+# MIX, not the number of obstacles: the count is set by OCCUPANCY_RANGE and the
+# obstacle sizes. Walls are whole-workspace gates, so at most MAX_WALLS are
+# placed per environment; once that many exist, "wall" is dropped from the draw.
 TYPE_WEIGHTS = {
-    "spheroid": 0.5,
-    "cylinder": 0.5,
-    # "box": 0.3,                   # <- uncomment to enable boxes
-    # "wall": 0.05,                 # <- uncomment to enable walls
+    "spheroid": 0.35,
+    "oriented_cylinder": 0.35,      # finite cylinder, rotated by CYLINDER_ROTATION_DEG
+    "box": 0.29,                    # rotated by BOX_ROTATION_DEG
+    "wall": 0.01,                   # vertical gate with one opening (see WALL_* below); at the
+                                    #   C172 scale this gives about 13% / 20% / 67% of
+                                    #   environments with 0 / 1 / 2 walls
+    # "cylinder": 0.2,              # <- uncomment for upright pillars standing on the floor
 }
+MAX_WALLS          = 2
 
 # ---- obstacle sizes (fractions of the smallest box dimension; log-uniform) -
 SPHEROID_RADIUS    = (0.03, 0.30)   # equatorial semi-axis
 SPHEROID_ASPECT    = (0.5, 2.0)     # polar / equatorial ratio
-CYLINDER_RADIUS    = (0.03, 0.20)
-CYLINDER_HEIGHT    = (0.3, 1.0)     # fraction of box height (Lz), partial-height cylinders
-CYLINDER_FULL_HEIGHT_PROB = 0.5     # chance a cylinder spans floor to ceiling (smooth constraint)
-BOX_HALF_EXTENT    = (0.03, 0.20)
+CYLINDER_RADIUS    = (0.03, 0.20)   # used by both cylinder types
+CYLINDER_LENGTH    = (0.5, 3.0)     # oriented cylinders: full length (end cap to end cap)
+CYLINDER_HEIGHT    = (0.3, 1.0)     # upright pillars: fraction of box height (Lz), partial height
+CYLINDER_FULL_HEIGHT_PROB = 0.5     # upright pillars: chance of spanning floor to ceiling
+
+
+# ---- obstacle orientations ---------------------------------------------------
+# Each obstacle is built upright (axis along +z) and turned by an angle vector
+# (roll, pitch, yaw) in degrees: R = Rz(yaw) @ Ry(pitch) @ Rx(roll).
+#   roll  - about x      pitch - about y      (together: how far it leans)
+#   yaw   - about z      (which compass direction it leans toward)
+# For cylinders the axis is the long axis; for spheroids, the polar axis
+# (the one scaled by SPHEROID_ASPECT).
+# Every entry gives the range one angle is drawn from, uniformly per obstacle:
+#     m          ->  [-m, m]          e.g. 90
+#     (lo, hi)   ->  [lo, hi]         e.g. (75, 90);  (30, 30) fixes it at 30
+# Examples (roll, pitch, yaw):
+#     (0, 0, 0)            upright, all identical
+#     (15, 15, 180)        mostly upright, leaning up to ~20 deg
+#     (0, (75, 90), 180)   near-horizontal bars pointing any way
+#     (90, 90, 180)        any orientation (default)
+CYLINDER_ROTATION_DEG = (90.0, 90.0, 180.0)
+SPHEROID_ROTATION_DEG = (90.0, 90.0, 180.0)
+
+CYLINDER_UPRIGHT_FRAC = 0.2         # share of oriented cylinders forced exactly vertical
+                                    #   (the rest use CYLINDER_ROTATION_DEG). A random angle
+                                    #   vector is almost never vertical, so without this
+                                    #   upright cylinders essentially never appear.
+BOX_ROTATION_DEG      = (0.0, 0.0, 180.0)   # upright boxes at any heading (buildings,
+                                            #   terrain blocks); widen roll/pitch for OOD sets
+
+# ---- boxes and walls (sizes as fractions of the smallest box dimension) -----
+BOX_HALF_EXTENT    = (0.055, 0.33)   # log-uniform per side; sized so a box averages about
+                                    #   the volume of a spheroid / cylinder, which keeps
+                                    #   the obstacle count unchanged when boxes are mixed in
 WALL_THICKNESS     = (0.02, 0.05)
-WALL_OPENING       = (0.10, 0.30)   # extra opening beyond the minimum passable width
+WALL_WIDTH         = (0.3, 0.7)     # panel width, fraction of the workspace's width along the
+                                    #   wall line (so a wall never spans the whole corridor)
+WALL_HEIGHT        = (0.5, 1.0)     # panel height above the floor, fraction of box height (Lz);
+                                    #   panels stand on the floor, so 1.0 reaches the ceiling
+WALL_OPENING       = (0.10, 0.30)   # extra opening (width, height) beyond the minimum 2 * (radius + margin)
+WALL_YAW_DEG       = 30.0           # the panel faces within +-this of the start->goal heading,
+                                    #   so it stands roughly across the flight path
+WALL_PITCH_DEG     = 15.0           # and leans up to +-this toward (+) or away from (-) the goal
+WALL_GATE_CLEAR    = 0.25           # other obstacles must leave a straight passage through each
+                                    #   opening, this far (fraction of smallest box dim) on
+                                    #   either side of the wall
+
+# ---- clutter -------------------------------------------------------------------
+MIN_OBSTACLE_RADIUS = 0.08          # drop any obstacle smaller than this, measured as the radius
+                                    #   of the sphere with the same volume (fraction of the
+                                    #   smallest box dimension; 0 keeps everything). Fewer,
+                                    #   larger obstacles then make up the same fill.
 
 # ---- size shrinking when the box gets crowded -----------------------------
 SHRINK_AFTER       = 30             # consecutive failed placements before shrinking
@@ -139,13 +217,43 @@ MAX_ENV_TRIES      = 50             # environment attempts before giving up
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
-def _random_rotation(rng):
-    """Uniformly random 3x3 rotation matrix."""
-    q, r = np.linalg.qr(rng.normal(size=(3, 3)))
-    q *= np.sign(np.diag(r))
-    if np.linalg.det(q) < 0:
-        q[:, 0] *= -1
-    return q
+def rotation_from_angles(angles_deg):
+    """Rotation matrix for an angle vector (roll, pitch, yaw) in degrees,
+    R = Rz(yaw) @ Ry(pitch) @ Rx(roll). Columns are the rotated x, y, z axes,
+    so R[:, 2] is where an upright obstacle's axis ends up."""
+    r, p, y = np.radians(np.asarray(angles_deg, float))
+    cr, sr, cp, sp, cy, sy = np.cos(r), np.sin(r), np.cos(p), np.sin(p), np.cos(y), np.sin(y)
+    Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+    Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+    Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+    return Rz @ Ry @ Rx
+
+
+def angle_ranges(spec):
+    """Normalize a (roll, pitch, yaw) range spec to three (lo, hi) pairs.
+    Each entry is a number m (meaning [-m, m]) or a (lo, hi) pair."""
+    spec = list(spec)
+    if len(spec) != 3:
+        raise ValueError(f"rotation spec needs 3 entries (roll, pitch, yaw), got {spec!r}")
+    out = []
+    for e in spec:
+        lo, hi = (-abs(float(e)), abs(float(e))) if np.isscalar(e) else map(float, e)
+        if lo > hi:
+            raise ValueError(f"rotation range {e!r} has lo > hi")
+        out.append((lo, hi))
+    return tuple(out)
+
+
+def sample_angles(rng, spec):
+    """Random (roll, pitch, yaw) in degrees, each uniform in its range."""
+    return np.array([rng.uniform(lo, hi) for lo, hi in angle_ranges(spec)])
+
+
+def tilt_deg(axis):
+    """Angle between an axis and vertical, in degrees (0 = upright, 90 = flat).
+    Axes are treated as unsigned, so the result is always in [0, 90]."""
+    a = np.asarray(axis, float)
+    return float(np.degrees(np.arccos(np.clip(abs(a[2]) / np.linalg.norm(a), 0.0, 1.0))))
 
 
 def _fmt(v):
@@ -185,21 +293,47 @@ class Obstacle:
     def to_dict(self):
         raise NotImplementedError
 
+    def equivalent_radius(self):
+        """Radius of the sphere with the same volume: one size number that
+        works for every shape. Used to drop obstacles too small to matter."""
+        raise NotImplementedError
+
+
+def _r_eq(volume):
+    return float((3.0 * volume / (4.0 * np.pi)) ** (1.0 / 3.0))
+
 
 @dataclass
 class Spheroid(Obstacle):
-    """Ellipsoid with semi-axes `radii` (two equal -> spheroid), rotated by R.
-    h = ||diag(1/a) R^T (p - c)||_2 - (1 + d / a_min)"""
+    """Ellipsoid with semi-axes `radii` = (a1, a2, a_polar) (two equal ->
+    spheroid), built upright and rotated by R.
+        h = ||diag(1/a) R^T (p - c)||_2 - (1 + d / a_min)
+    Give the orientation as `angles_deg` = (roll, pitch, yaw); R is computed
+    from it. Files written before angle vectors existed store the matrix as
+    `rotation` instead, and still load (R is then taken as given)."""
     center: np.ndarray
     radii: np.ndarray
-    rotation: np.ndarray = field(default_factory=lambda: np.eye(3))
+    angles_deg: np.ndarray = None
+    rotation: np.ndarray = None
     kind = "spheroid"
     n_features = 15
 
     def __post_init__(self):
         self.center = np.asarray(self.center, float)
         self.radii = np.asarray(self.radii, float)
-        self.rotation = np.asarray(self.rotation, float)
+        if self.angles_deg is not None:
+            self.angles_deg = np.asarray(self.angles_deg, float)
+            self.rotation = rotation_from_angles(self.angles_deg)
+        else:
+            self.rotation = np.eye(3) if self.rotation is None else np.asarray(self.rotation, float)
+
+    @property
+    def axis(self):
+        """Polar axis direction, R e_z."""
+        return self.rotation[:, 2]
+
+    def equivalent_radius(self):
+        return float(np.prod(self.radii) ** (1.0 / 3.0))
 
     def _body(self, p):
         q = (np.asarray(p, float) - self.center) @ self.rotation      # R^T (p - c)
@@ -216,19 +350,92 @@ class Spheroid(Obstacle):
 
     def formula(self, d):
         return (f"||diag(1/a) R^T (p - c)||_2 >= {1 + d / self.radii.min():.4f}   "
-                f"c={_fmt(self.center)}, a={_fmt(self.radii)}, R=stored rotation")
+                f"c={_fmt(self.center)}, a={_fmt(self.radii)}, "
+                + (f"angles={_fmt(self.angles_deg)} deg" if self.angles_deg is not None
+                   else "R=stored rotation"))
 
     def features(self):
         return np.r_[self.center, self.radii, self.rotation.ravel()]
 
     def to_dict(self):
+        d = {"type": self.kind, "center": self.center.tolist(), "radii": self.radii.tolist()}
+        if self.angles_deg is not None:
+            d["angles_deg"] = self.angles_deg.tolist()
+        else:                                   # legacy: matrix only, keeps old fingerprints
+            d["rotation"] = self.rotation.tolist()
+        return d
+
+
+@dataclass
+class OrientedCylinder(Obstacle):
+    """Finite solid cylinder with flat end caps, built upright (axis along +z)
+    and rotated by the angle vector `angles_deg` = (roll, pitch, yaw):
+        R = rotation_from_angles(angles_deg),   a = R e_z
+        s = a . (p - c),   r = ||(p - c) - s a||_2
+        h = max(r - (rho + d), |s| - (L + d))
+    `half_length` is L (center to cap)."""
+    center: np.ndarray
+    angles_deg: np.ndarray
+    radius: float
+    half_length: float
+    kind = "oriented_cylinder"
+    n_features = 8
+
+    def __post_init__(self):
+        self.center = np.asarray(self.center, float)
+        self.angles_deg = np.asarray(self.angles_deg, float)
+        self.radius = float(self.radius)
+        self.half_length = float(self.half_length)
+        self.rotation = rotation_from_angles(self.angles_deg)
+        self.axis = self.rotation[:, 2]
+
+    def _terms(self, p, d):
+        q = np.asarray(p, float) - self.center
+        s = q @ self.axis
+        rvec = q - s[..., None] * self.axis
+        r = np.linalg.norm(rvec, axis=-1)
+        return rvec, r, s, r - (self.radius + d), np.abs(s) - (self.half_length + d)
+
+    def constraint(self, p, d=0.0):
+        _, _, _, radial, axial = self._terms(p, d)
+        return np.maximum(radial, axial)
+
+    def gradient(self, p, d=0.0):
+        rvec, r, s, radial, axial = self._terms(p, d)
+        on_axis = (r < 1e-9)[..., None]                 # any perpendicular is a valid subgradient
+        g_rad = np.where(on_axis, self.rotation[:, 0], rvec / np.maximum(r, 1e-9)[..., None])
+        g_ax = np.where((s >= 0)[..., None], 1.0, -1.0) * self.axis
+        return np.where((radial >= axial)[..., None], g_rad, g_ax)
+
+    def equivalent_radius(self):
+        return _r_eq(np.pi * self.radius**2 * 2.0 * self.half_length)
+
+    def endpoints(self):
+        """Centers of the two end caps."""
+        return self.center - self.half_length * self.axis, self.center + self.half_length * self.axis
+
+    def formula(self, d):
+        return (f"max(||(p - c) - (a.(p - c)) a||_2 - {self.radius + d:.4f}, "
+                f"|a.(p - c)| - {self.half_length + d:.4f}) >= 0   "
+                f"c={_fmt(self.center)}, angles={_fmt(self.angles_deg)} deg, "
+                f"a={_fmt(self.axis)} (tilt {tilt_deg(self.axis):.1f} deg)")
+
+    def features(self):
+        # The axis (sign fixed so a_z >= 0, since a and -a are the same cylinder)
+        # rather than the angles: angles wrap around and many triples give the
+        # same cylinder, which makes them a poor input for learning.
+        a = -self.axis if self.axis[2] < 0 else self.axis
+        return np.r_[self.center, a, self.radius, self.half_length]
+
+    def to_dict(self):
         return {"type": self.kind, "center": self.center.tolist(),
-                "radii": self.radii.tolist(), "rotation": self.rotation.tolist()}
+                "angles_deg": self.angles_deg.tolist(),
+                "radius": self.radius, "half_length": self.half_length}
 
 
 @dataclass
 class Cylinder(Obstacle):
-    """Vertical cylinder standing on the floor.
+    """Legacy upright cylinder (pillar) standing on the floor.
     h = max(||(x,y) - c_xy||_2 - (rho + d), z - (z_top + d)),
     or just the first term if full_height."""
     center_xy: np.ndarray
@@ -270,6 +477,11 @@ class Cylinder(Obstacle):
     def features(self):
         return np.r_[self.center_xy, self.radius, self.z_top, float(self.full_height)]
 
+    def equivalent_radius(self):
+        # the floor height is not stored on the pillar; z_top approximates its
+        # height above the floor, which is exact for workspaces with z_lo = 0
+        return _r_eq(np.pi * self.radius**2 * max(self.z_top, self.radius))
+
     def to_dict(self):
         return {"type": self.kind, "center_xy": self.center_xy.tolist(),
                 "radius": float(self.radius), "z_top": float(self.z_top),
@@ -278,86 +490,132 @@ class Cylinder(Obstacle):
 
 @dataclass
 class Box(Obstacle):
-    """Axis-aligned box.  h = max_k (|p_k - c_k| - (e_k + d))"""
+    """Box with half-extents e, built axis-aligned and rotated by the angle
+    vector `angles_deg` = (roll, pitch, yaw), R = rotation_from_angles(...):
+        q = R^T (p - c),    h = max_k (|q_k| - (e_k + d))
+    Without angles_deg the box is axis-aligned (R = I), as in older files."""
     center: np.ndarray
     half_extents: np.ndarray
+    angles_deg: np.ndarray = None
     kind = "box"
-    n_features = 6
+    n_features = 15
 
     def __post_init__(self):
         self.center = np.asarray(self.center, float)
         self.half_extents = np.asarray(self.half_extents, float)
+        if self.angles_deg is not None:
+            self.angles_deg = np.asarray(self.angles_deg, float)
+            self.rotation = rotation_from_angles(self.angles_deg)
+        else:
+            self.rotation = np.eye(3)
 
     @classmethod
     def from_bounds(cls, lo, hi):
         lo, hi = np.asarray(lo, float), np.asarray(hi, float)
         return cls(0.5 * (lo + hi), 0.5 * (hi - lo))
 
+    def _local(self, p):
+        return (np.asarray(p, float) - self.center) @ self.rotation          # R^T (p - c)
+
     def constraint(self, p, d=0.0):
-        q = np.abs(np.asarray(p, float) - self.center) - (self.half_extents + d)
-        return q.max(axis=-1)
+        return (np.abs(self._local(p)) - (self.half_extents + d)).max(axis=-1)
 
     def gradient(self, p, d=0.0):
-        diff = np.asarray(p, float) - self.center
-        q = np.abs(diff) - (self.half_extents + d)
-        k = np.argmax(q, axis=-1)
-        g = np.zeros_like(diff)
-        s = np.where(np.take_along_axis(diff, np.asarray(k)[..., None], -1) >= 0, 1.0, -1.0)
-        np.put_along_axis(g, np.asarray(k)[..., None], s, axis=-1)
-        return g
+        q = self._local(p)
+        k = np.argmax(np.abs(q) - (self.half_extents + d), axis=-1)          # active face
+        s = np.where(np.take_along_axis(q, np.asarray(k)[..., None], -1) >= 0, 1.0, -1.0)
+        return s * self.rotation.T[k]                                        # +-R[:, k]
+
+    def equivalent_radius(self):
+        return _r_eq(8.0 * np.prod(self.half_extents))
+
+    def halfspaces(self):
+        """The box as A x <= b (6 rows), used for clipping and meshing."""
+        n = np.vstack([self.rotation.T, -self.rotation.T])                  # outward face normals
+        b = n @ self.center + np.r_[self.half_extents, self.half_extents]
+        return n, b
 
     def formula(self, d):
-        return (f"max_k(|p_k - c_k| - (e_k + {d:.3f})) >= 0   "
-                f"c={_fmt(self.center)}, e={_fmt(self.half_extents)}")
+        rot = f", angles={_fmt(self.angles_deg)} deg" if self.angles_deg is not None else ""
+        return (f"max_k(|R^T(p - c)|_k - (e_k + {d:.3f})) >= 0   "
+                f"c={_fmt(self.center)}, e={_fmt(self.half_extents)}{rot}")
 
     def features(self):
-        return np.r_[self.center, self.half_extents]
+        return np.r_[self.center, self.half_extents, self.rotation.ravel()]
 
     def to_dict(self):
-        return {"type": self.kind, "center": self.center.tolist(),
-                "half_extents": self.half_extents.tolist()}
+        d = {"type": self.kind, "center": self.center.tolist(),
+             "half_extents": self.half_extents.tolist()}
+        if self.angles_deg is not None:
+            d["angles_deg"] = self.angles_deg.tolist()
+        return d
 
 
 @dataclass
 class Wall(Obstacle):
-    """Slab normal to `axis` at `position`, spanning the whole workspace, with a
-    rectangular opening. Represented as up to four boxes around the opening,
-    each contributing its own box constraint. opening_center / opening_size
-    are in the two in-plane axes, in increasing axis order."""
-    axis: int
-    position: float
+    """A finite wall panel (thickness x width x height) with one rectangular
+    opening, rotated by yaw about z and then leaned by pitch:
+        R = rotation_from_angles((0, pitch_deg, yaw_deg)),   columns n, u, v
+    n is the panel normal (heading yaw, tipped by pitch), u runs along the
+    panel (always horizontal) and v up the panel (vertical when pitch = 0).
+    Positive pitch leans the top toward +n, i.e. toward the goal for a wall
+    across the flight path.
+    `center` is the middle of the panel; `opening_center` = (u, v) and
+    `opening_size` = (width, height) of the opening, measured from it.
+    The panel is up to four rotated boxes around the opening (one constraint each)."""
+    center: np.ndarray
+    yaw_deg: float
+    pitch_deg: float
+    width: float
+    height: float
     thickness: float
     opening_center: np.ndarray
     opening_size: np.ndarray
-    bounds_lo: np.ndarray
-    bounds_hi: np.ndarray
     kind = "wall"
-    n_features = 10
+    n_features = 13
 
     def __post_init__(self):
+        self.center = np.asarray(self.center, float)
+        self.yaw_deg, self.pitch_deg = float(self.yaw_deg), float(self.pitch_deg)
+        self.width, self.height, self.thickness = float(self.width), float(self.height), float(self.thickness)
         self.opening_center = np.asarray(self.opening_center, float)
         self.opening_size = np.asarray(self.opening_size, float)
-        self.bounds_lo = np.asarray(self.bounds_lo, float)
-        self.bounds_hi = np.asarray(self.bounds_hi, float)
+        self.angles_deg = np.array([0.0, self.pitch_deg, self.yaw_deg])
+        self.rotation = rotation_from_angles(self.angles_deg)            # columns n, u, v
         self.boxes = self._build_boxes()
 
+    @property
+    def normal(self):
+        return self.rotation[:, 0]
+
     def _build_boxes(self):
-        k = self.axis
-        i, j = [a for a in range(3) if a != k]
-        lo, hi = self.bounds_lo, self.bounds_hi
-        gi0, gi1 = np.clip(self.opening_center[0] + np.array([-0.5, 0.5]) * self.opening_size[0], lo[i], hi[i])
-        gj0, gj1 = np.clip(self.opening_center[1] + np.array([-0.5, 0.5]) * self.opening_size[1], lo[j], hi[j])
-        spans = [((lo[i], gi0), (lo[j], hi[j])), ((gi1, hi[i]), (lo[j], hi[j])),
-                 ((gi0, gi1), (lo[j], gj0)), ((gi0, gi1), (gj1, hi[j]))]
+        W, H = self.width / 2, self.height / 2
+        (ou, ov), (w, h) = self.opening_center, self.opening_size
+        g_u0, g_u1 = np.clip([ou - w / 2, ou + w / 2], -W, W)
+        g_v0, g_v1 = np.clip([ov - h / 2, ov + h / 2], -H, H)
+        spans = [((-W, g_u0), (-H, H)), ((g_u1, W), (-H, H)),           # left, right of the opening
+                 ((g_u0, g_u1), (-H, g_v0)), ((g_u0, g_u1), (g_v1, H))]  # below, above it
         boxes = []
         for (a0, a1), (b0, b1) in spans:
             if a1 - a0 < 1e-9 or b1 - b0 < 1e-9:
                 continue
-            blo, bhi = np.empty(3), np.empty(3)
-            blo[k], bhi[k] = self.position - self.thickness / 2, self.position + self.thickness / 2
-            blo[i], bhi[i], blo[j], bhi[j] = a0, a1, b0, b1
-            boxes.append(Box.from_bounds(blo, bhi))
+            local = np.array([0.0, 0.5 * (a0 + a1), 0.5 * (b0 + b1)])
+            boxes.append(Box(self.center + self.rotation @ local,
+                             [self.thickness / 2, 0.5 * (a1 - a0), 0.5 * (b1 - b0)],
+                             angles_deg=self.angles_deg))
         return boxes
+
+    def opening_world_center(self):
+        return self.center + self.rotation @ np.r_[0.0, self.opening_center]
+
+    def equivalent_radius(self):
+        return float("inf")                      # walls are never too small to keep
+
+    def gate_line(self, depth, spacing):
+        """Points along the wall normal through the middle of the opening, from
+        -depth to +depth: the straight passage the generator keeps clear."""
+        n = max(int(np.ceil(2 * depth / spacing)) + 1, 2)
+        return self.opening_world_center() + np.linspace(-depth, depth, n)[:, None] * self.normal
 
     def pieces(self):
         return list(self.boxes)
@@ -370,26 +628,91 @@ class Wall(Obstacle):
         raise NotImplementedError("Use the individual pieces (wall.pieces()).")
 
     def formula(self, d):
-        return "; ".join(b.formula(d) for b in self.boxes)
+        return (f"wall {self.width:.1f} x {self.height:.1f}, yaw {self.yaw_deg:.1f} deg, "
+                f"pitch {self.pitch_deg:.1f} deg, opening {_fmt(self.opening_size)}: "
+                + "; ".join(b.formula(d) for b in self.boxes))
 
     def features(self):
-        return np.r_[np.eye(3)[self.axis], self.position, self.thickness,
-                     self.opening_center, self.opening_size]
+        y = np.radians(self.yaw_deg)
+        return np.r_[self.center, np.cos(y), np.sin(y), np.radians(self.pitch_deg),
+                     self.width, self.height, self.thickness, self.opening_center, self.opening_size]
 
     def to_dict(self):
-        return {"type": self.kind, "axis": int(self.axis), "position": float(self.position),
-                "thickness": float(self.thickness),
-                "opening_center": self.opening_center.tolist(),
-                "opening_size": self.opening_size.tolist(),
-                "bounds_lo": self.bounds_lo.tolist(), "bounds_hi": self.bounds_hi.tolist()}
+        return {"type": self.kind, "center": self.center.tolist(), "yaw_deg": self.yaw_deg,
+                "pitch_deg": self.pitch_deg, "width": self.width, "height": self.height,
+                "thickness": self.thickness, "opening_center": self.opening_center.tolist(),
+                "opening_size": self.opening_size.tolist()}
+
+    @classmethod
+    def from_workspace_gate(cls, opening_world_center, yaw_deg, thickness, opening_size,
+                            bounds_lo, bounds_hi):
+        """A wall that spans the whole workspace around one opening, as earlier
+        versions of envgen.py generated. Used to load their files: inside the
+        workspace the result is the same solid."""
+        span = 4.0 * float(np.linalg.norm(np.asarray(bounds_hi, float) - np.asarray(bounds_lo, float)))
+        return cls(opening_world_center, yaw_deg, 0.0, span, span, thickness, [0.0, 0.0], opening_size)
 
 
-OBSTACLE_TYPES = {c.kind: c for c in (Spheroid, Cylinder, Box, Wall)}
+def _wall_from_old_dict(d):
+    """Walls from files written before finite, leaning walls existed."""
+    if "axis" in d:                              # oldest: normal along x (axis 0) or y (axis 1)
+        if d["axis"] not in (0, 1):
+            raise ValueError("only vertical walls (axis 0 or 1) are supported")
+        oc = np.asarray(d["opening_center"], float)
+        p = d["position"]
+        c = np.array([p, oc[0], oc[1]]) if d["axis"] == 0 else np.array([oc[0], p, oc[1]])
+        yaw = 0.0 if d["axis"] == 0 else 90.0
+    else:                                        # full-width yawed gate
+        R = rotation_from_angles((0.0, 0.0, d["yaw_deg"]))
+        c = np.asarray(d["center"], float) + R @ np.r_[0.0, d["opening_center"]]
+        yaw = d["yaw_deg"]
+    return Wall.from_workspace_gate(c, yaw, d["thickness"], d["opening_size"], d["bounds_lo"], d["bounds_hi"])
+
+
+OBSTACLE_TYPES = {c.kind: c for c in (Spheroid, OrientedCylinder, Cylinder, Box, Wall)}
 
 
 def obstacle_from_dict(d):
     d = dict(d)
-    return OBSTACLE_TYPES[d.pop("type")](**d)
+    kind = d.pop("type")
+    if kind == "wall" and "width" not in d:              # written before finite walls existed
+        return _wall_from_old_dict(d)
+    return OBSTACLE_TYPES[kind](**d)
+
+
+def clip_polytope(A, b, lo, hi):
+    """Vertices and faces of {x : A x <= b} intersected with the box [lo, hi],
+    or None if that is empty. Faces are polygons (vertex index lists) wound
+    counter-clockwise seen from outside. Used to draw and mesh boxes and wall
+    pieces only where they lie inside the workspace."""
+    from scipy.optimize import linprog
+    from scipy.spatial import ConvexHull, HalfspaceIntersection
+    A = np.vstack([A, np.eye(3), -np.eye(3)])
+    b = np.r_[b, hi, -np.asarray(lo, float)]
+    norms = np.linalg.norm(A, axis=1)
+    # Chebyshev center: a strictly interior point, needed by HalfspaceIntersection
+    res = linprog(np.r_[0, 0, 0, -1], A_ub=np.c_[A, norms], b_ub=b,
+                  bounds=[(None, None)] * 3 + [(0, None)], method="highs")
+    if res.status != 0 or res.x[3] < 1e-6 * max(1.0, float(np.max(np.abs(hi - lo)))):
+        return None
+    hull = ConvexHull(HalfspaceIntersection(np.c_[A, -b], res.x[:3]).intersections)
+    keep = np.unique(hull.simplices)
+    V = hull.points[keep]
+    remap = {old: new for new, old in enumerate(keep)}
+    # merge the hull's coplanar triangles into one polygon per face
+    faces = {}
+    for tri, eq in zip(hull.simplices, hull.equations):
+        key = tuple(np.round(eq / np.linalg.norm(eq[:3]), 6))
+        faces.setdefault(key, (eq[:3], set()))[1].update(remap[i] for i in tri)
+    F = []
+    for normal, idx in faces.values():
+        idx = np.array(sorted(idx))
+        P = V[idx] - V[idx].mean(axis=0)
+        e1 = P[np.argmax(np.linalg.norm(P, axis=1))]
+        e1 /= np.linalg.norm(e1)
+        e2 = np.cross(normal / np.linalg.norm(normal), e1)
+        F.append(list(idx[np.argsort(np.arctan2(P @ e2, P @ e1))]))   # CCW about the outward normal
+    return V, F
 
 
 # --------------------------------------------------------------------------
@@ -456,7 +779,8 @@ class Environment:
         """Fixed-size vector: boundary conditions, bounds, then a fixed number of
         slots per obstacle type as [present, features...]. Dense environments can
         hold 100+ obstacles per type; occupancy_grid() is often a better input."""
-        max_per_type = max_per_type or {"spheroid": 160, "cylinder": 160}
+        max_per_type = max_per_type or {"spheroid": 160, "oriented_cylinder": 160, "cylinder": 160,
+                                        "box": 160, "wall": 4}
         parts = [self.start_pos, self.start_vel, self.goal_pos, self.goal_vel,
                  self.bounds_lo, self.bounds_hi]
         for kind, n_slots in max_per_type.items():
@@ -522,6 +846,18 @@ class EnvConfig:
     spheroid_radius: tuple = SPHEROID_RADIUS
     spheroid_aspect: tuple = SPHEROID_ASPECT
     cylinder_radius: tuple = CYLINDER_RADIUS
+    cylinder_length: tuple = CYLINDER_LENGTH
+    cylinder_rotation_deg: tuple = CYLINDER_ROTATION_DEG
+    spheroid_rotation_deg: tuple = SPHEROID_ROTATION_DEG
+    cylinder_upright_frac: float = CYLINDER_UPRIGHT_FRAC
+    box_rotation_deg: tuple = BOX_ROTATION_DEG
+    max_walls: int = MAX_WALLS
+    wall_yaw_deg: float = WALL_YAW_DEG
+    wall_pitch_deg: float = WALL_PITCH_DEG
+    wall_width: tuple = WALL_WIDTH
+    wall_height: tuple = WALL_HEIGHT
+    min_obstacle_radius: float = MIN_OBSTACLE_RADIUS
+    wall_gate_clear: float = WALL_GATE_CLEAR
     cylinder_height: tuple = CYLINDER_HEIGHT
     cylinder_full_height_prob: float = CYLINDER_FULL_HEIGHT_PROB
     box_half_extent: tuple = BOX_HALF_EXTENT
@@ -557,8 +893,19 @@ class EnvironmentGenerator:
         self.scale = float(min(c.size))
         if np.any(self.inner_hi <= self.inner_lo):
             raise ValueError("Workspace too small for the vehicle radius + margin.")
-        self.proposers = {"spheroid": self._propose_spheroid, "cylinder": self._propose_cylinder,
+        self.proposers = {"spheroid": self._propose_spheroid,
+                          "oriented_cylinder": self._propose_oriented_cylinder,
+                          "cylinder": self._propose_cylinder,
                           "box": self._propose_box, "wall": self._propose_wall}
+        unknown = set(self.cfg.type_weights) - set(self.proposers)
+        if unknown:
+            raise ValueError(f"Unknown obstacle type(s) {sorted(unknown)}; "
+                             f"choose from {sorted(self.proposers)}.")
+        if sum(self.cfg.type_weights.values()) <= 0:
+            raise ValueError("At least one obstacle type needs a positive weight.")
+        angle_ranges(self.cfg.cylinder_rotation_deg)        # fail early on a malformed spec
+        angle_ranges(self.cfg.spheroid_rotation_deg)
+        angle_ranges(self.cfg.box_rotation_deg)
 
     # ---- public API ------------------------------------------------------
     def generate(self) -> Environment:
@@ -582,21 +929,43 @@ class EnvironmentGenerator:
         samples = rng.uniform(self.lo, self.hi, size=(c.occupancy_samples, 3))
         occupied = np.zeros(len(samples), dtype=bool)
 
-        kinds = list(c.type_weights)
-        probs = np.array([c.type_weights[k] for k in kinds], float)
-        probs /= probs.sum()
+        def type_draw(allow_walls):
+            kinds = [k for k, w in c.type_weights.items() if w > 0 and (allow_walls or k != "wall")]
+            p = np.array([c.type_weights[k] for k in kinds], float)
+            return kinds, p / p.sum()
+        kinds, probs = type_draw(c.max_walls > 0)
 
-        obstacles, size_scale, fails = [], 1.0, 0
+        # Point sets every obstacle must stay clear of: (points, clearance).
+        # Start and goal first; each accepted wall adds the passage through its opening.
+        keep_clear = [(np.stack([start, goal]), c.endpoint_clearance * self.d)]
+        gate_depth = c.wall_gate_clear * self.scale
+
+        min_r = c.min_obstacle_radius * self.scale
+        obstacles, size_scale, fails, n_walls = [], 1.0, 0, 0
         for _ in range(c.max_proposals):
             if occupied.mean() >= target:
                 break
-            obs = self.proposers[kinds[rng.choice(len(kinds), p=probs)]](start, goal, size_scale)
-            if self._endpoints_clear(obs, start, goal):
-                new_occ = occupied | (obs.constraint(samples, 0.0) < 0)
-                if new_occ.mean() <= target + c.occupancy_tolerance:
-                    obstacles.append(obs)
-                    occupied, fails = new_occ, 0
-                    continue
+            kind = kinds[rng.choice(len(kinds), p=probs)]
+            obs = self.proposers[kind](start, goal, size_scale)
+            if obs is not None and obs.equivalent_radius() < min_r:
+                continue                                 # too small to keep; not a placement failure
+            if obs is not None and self._clear_of(obs, keep_clear):
+                gate = None
+                if kind == "wall":                       # its opening must not already be blocked
+                    gate = obs.gate_line(gate_depth, 0.5 * self.d)
+                    if any(np.any(o.constraint(gate, self.d) < 0) for o in obstacles):
+                        gate = False
+                if gate is not False:
+                    new_occ = occupied | (obs.constraint(samples, 0.0) < 0)
+                    if new_occ.mean() <= target + c.occupancy_tolerance:
+                        obstacles.append(obs)
+                        occupied, fails = new_occ, 0
+                        if kind == "wall":
+                            keep_clear.append((gate, self.d))
+                            n_walls += 1
+                            if n_walls >= c.max_walls:
+                                kinds, probs = type_draw(False)
+                        continue
             fails += 1
             if fails >= c.shrink_after:          # stuck: try smaller obstacles
                 size_scale = max(size_scale * c.shrink_factor, c.min_size_scale)
@@ -636,9 +1005,9 @@ class EnvironmentGenerator:
                 return a, b
         raise RuntimeError("START_GOAL_MIN_FRAC too large for this workspace.")
 
-    def _endpoints_clear(self, obs, start, goal):
-        ep = self.cfg.endpoint_clearance * self.d
-        return bool(np.all(obs.constraint(np.stack([start, goal]), ep) >= 0))
+    @staticmethod
+    def _clear_of(obs, keep_clear):
+        return all(np.all(obs.constraint(P, d) >= 0) for P, d in keep_clear)
 
     def _size(self, bounds, s, n=None):
         """Log-uniform size in `bounds` (fraction of min dim), shrunk by factor s."""
@@ -649,7 +1018,18 @@ class EnvironmentGenerator:
         c, rng = self.cfg, self.rng
         eq = self._size(c.spheroid_radius, s)
         radii = np.array([eq, eq, eq * rng.uniform(*c.spheroid_aspect)])
-        return Spheroid(rng.uniform(self.lo, self.hi), radii, _random_rotation(rng))
+        angles = sample_angles(rng, c.spheroid_rotation_deg)
+        return Spheroid(rng.uniform(self.lo, self.hi), radii, angles_deg=angles)
+
+    def _propose_oriented_cylinder(self, start, goal, s=1.0):
+        c, rng = self.cfg, self.rng
+        r = self._size(c.cylinder_radius, s)
+        half = 0.5 * self._size(c.cylinder_length, s)
+        if rng.random() < c.cylinder_upright_frac:
+            angles = np.zeros(3)                     # exactly vertical
+        else:
+            angles = sample_angles(rng, c.cylinder_rotation_deg)
+        return OrientedCylinder(rng.uniform(self.lo, self.hi), angles, r, half)
 
     def _propose_cylinder(self, start, goal, s=1.0):
         c, rng = self.cfg, self.rng
@@ -662,20 +1042,55 @@ class EnvironmentGenerator:
 
     def _propose_box(self, start, goal, s=1.0):
         half = self._size(self.cfg.box_half_extent, s, n=3)
-        return Box(self.rng.uniform(self.lo, self.hi), half)
+        angles = sample_angles(self.rng, self.cfg.box_rotation_deg)
+        return Box(self.rng.uniform(self.lo, self.hi), half, angles_deg=angles)
 
     def _propose_wall(self, start, goal, s=1.0):
-        """Vertical wall between start and goal with a randomly placed opening.
-        Walls are large, so they are not shrunk by s."""
+        """A finite wall panel standing on the floor across the start-goal line:
+        facing within +-WALL_YAW_DEG of the flight direction, leaning up to
+        +-WALL_PITCH_DEG toward or away from the goal, WALL_WIDTH of the
+        corridor wide and WALL_HEIGHT of the box tall, with one opening placed
+        inside the workspace. Walls are not shrunk by s. Returns None if the
+        drawn panel cannot hold its opening (it is then simply redrawn)."""
         c, rng = self.cfg, self.rng
         dvec = goal - start
-        k = int(np.argmax(np.abs(dvec[:2])))                # wall normal: x or y
-        i, j = [a for a in range(3) if a != k]
-        position = start[k] + rng.uniform(0.3, 0.7) * dvec[k]
-        size = 2 * self.d + rng.uniform(*c.wall_opening, size=2) * self.scale
-        center = rng.uniform(self.inner_lo[[i, j]], self.inner_hi[[i, j]])
-        return Wall(k, position, rng.uniform(*c.wall_thickness) * self.scale,
-                    center, size, self.lo, self.hi)
+        heading = np.degrees(np.arctan2(dvec[1], dvec[0]))
+        yaw = heading + rng.uniform(-c.wall_yaw_deg, c.wall_yaw_deg)
+        pitch = rng.uniform(-c.wall_pitch_deg, c.wall_pitch_deg)
+        R = rotation_from_angles((0.0, pitch, yaw))
+        u_dir, v_dir = R[:, 1], R[:, 2]                     # along the panel (horizontal), up it
+        base = start + rng.uniform(0.3, 0.7) * dvec          # where it crosses the flight path
+        base[2] = self.lo[2]                                 # standing on the floor
+
+        # stretch of the wall line (base + t u) inside the inner box
+        t_lo, t_hi = -np.inf, np.inf
+        for k in range(2):
+            if abs(u_dir[k]) > 1e-12:
+                a, b = sorted(((self.inner_lo[k] - base[k]) / u_dir[k], (self.inner_hi[k] - base[k]) / u_dir[k]))
+                t_lo, t_hi = max(t_lo, a), min(t_hi, b)
+        if not t_lo < t_hi:
+            return None
+
+        thickness = rng.uniform(*c.wall_thickness) * self.scale
+        frame = max(thickness, 0.5 * self.d)                 # solid border kept around the opening
+        sink = self.d + thickness                            # bottom edge sits this far below the floor
+        width = rng.uniform(*c.wall_width) * (t_hi - t_lo)
+        height = rng.uniform(*c.wall_height) * c.size[2] / np.cos(np.radians(pitch)) + sink
+        t_c = rng.uniform(t_lo, t_hi)                        # panel middle, along the wall line
+        center = base + t_c * u_dir + (height / 2 - sink) * v_dir
+
+        ow, oh = 2 * self.d + rng.uniform(*c.wall_opening, size=2) * self.scale
+        # opening along u: inside the panel (with a frame) and inside the workspace
+        u_min = max(-width / 2 + frame, t_lo - t_c) + ow / 2
+        u_max = min(width / 2 - frame, t_hi - t_c) - ow / 2
+        # opening along v: above the floor, below the ceiling, inside the panel
+        cos_p = np.cos(np.radians(pitch))
+        v_min = max(-height / 2 + sink + frame, (self.inner_lo[2] - center[2]) / cos_p) + oh / 2
+        v_max = min(height / 2 - frame, (self.inner_hi[2] - center[2]) / cos_p) - oh / 2
+        if u_min > u_max or v_min > v_max:
+            return None
+        return Wall(center, yaw, pitch, width, height, thickness,
+                    [rng.uniform(u_min, u_max), rng.uniform(v_min, v_max)], [ow, oh])
 
     def _line_blocked(self, start, goal, obstacles):
         n = max(int(np.linalg.norm(goal - start) / (self.cfg.line_check_spacing * self.d)), 2)
@@ -683,9 +1098,15 @@ class EnvironmentGenerator:
         return bool(any(np.any(o.constraint(line, self.d) < 0) for o in obstacles))
 
     def _metrics(self, env, samples, line_blocked, target, achieved):
-        counts = {}
+        counts, tilts = {}, {}
         for o in env.obstacles:
             counts[o.kind] = counts.get(o.kind, 0) + 1
+            if o.kind in ("spheroid", "oriented_cylinder"):
+                tilts.setdefault(o.kind, []).append(tilt_deg(o.axis))
+            elif o.kind == "box":
+                tilts.setdefault(o.kind, []).append(tilt_deg(o.rotation[:, 2]))
+            elif o.kind == "cylinder":
+                tilts.setdefault(o.kind, []).append(0.0)
         # fraction of the box the vehicle CENTER cannot reach (obstacles grown by d)
         blocked = (env.constraint_values(samples) < 0).any(axis=0)
         return {"occupancy_target": float(target),
@@ -694,7 +1115,8 @@ class EnvironmentGenerator:
                 "straight_line_blocked": line_blocked,
                 "straight_line_distance": float(np.linalg.norm(env.goal_pos - env.start_pos)),
                 "n_constraint_pieces": len(env.pieces()),
-                "obstacle_counts": counts}
+                "obstacle_counts": counts,
+                "mean_tilt_deg": {k: float(np.mean(v)) for k, v in tilts.items()}}
 
 
 # --------------------------------------------------------------------------
@@ -716,24 +1138,41 @@ def plot_environment(env, ax=None):
 
     if ax is None:
         ax = plt.figure(figsize=(8, 6)).add_subplot(projection="3d")
+    # matplotlib >= 3.10 can clip 3D artists to the axes box, so obstacles that
+    # extend past the workspace (e.g. long tilted cylinders) are drawn cut off
+    import matplotlib
+    clip = {"axlim_clip": True} if tuple(int(v) for v in matplotlib.__version__.split(".")[:2]) >= (3, 10) else {}
 
     def draw_box(b, color):
-        lo, hi = b.center - b.half_extents, b.center + b.half_extents
-        v = np.array([[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
-        faces = [[0, 1, 3, 2], [4, 5, 7, 6], [0, 1, 5, 4], [2, 3, 7, 6], [0, 2, 6, 4], [1, 3, 7, 5]]
-        ax.add_collection3d(Poly3DCollection([v[f] for f in faces], alpha=0.35,
-                                             facecolor=color, edgecolor="k", linewidth=0.2))
+        mesh = clip_polytope(*b.halfspaces(), env.bounds_lo, env.bounds_hi)    # part inside the box
+        if mesh is not None:
+            V, F = mesh
+            ax.add_collection3d(Poly3DCollection([V[f] for f in F], alpha=0.35,
+                                                 facecolor=color, edgecolor="k", linewidth=0.2))
 
     u, w = np.meshgrid(np.linspace(0, 2 * np.pi, 24), np.linspace(0, np.pi, 12))
     for o in env.obstacles:
         if o.kind == "spheroid":
             s = np.stack([np.cos(u) * np.sin(w), np.sin(u) * np.sin(w), np.cos(w)], -1) * o.radii
             s = s @ o.rotation.T + o.center
-            ax.plot_surface(s[..., 0], s[..., 1], s[..., 2], color="tab:orange", alpha=0.45, linewidth=0)
+            ax.plot_surface(s[..., 0], s[..., 1], s[..., 2], color="tab:orange", alpha=0.45, linewidth=0, **clip)
+        elif o.kind == "oriented_cylinder":
+            R = o.rotation
+            # many rows along the length so clipping trims a cylinder at the box edge
+            # instead of dropping whole side panels
+            th, sl = np.meshgrid(np.linspace(0, 2 * np.pi, 24), np.linspace(-o.half_length, o.half_length, 40))
+            pts = (o.center + sl[..., None] * R[:, 2]
+                   + o.radius * (np.cos(th)[..., None] * R[:, 0] + np.sin(th)[..., None] * R[:, 1]))
+            ax.plot_surface(pts[..., 0], pts[..., 1], pts[..., 2], color="tab:purple", alpha=0.45, linewidth=0, **clip)
+            for end in o.endpoints():                          # end caps inside the workspace
+                if np.any(end < env.bounds_lo) or np.any(end > env.bounds_hi):
+                    continue
+                rim = end + o.radius * (np.cos(th[0])[:, None] * R[:, 0] + np.sin(th[0])[:, None] * R[:, 1])
+                ax.add_collection3d(Poly3DCollection([rim], alpha=0.45, facecolor="tab:purple", linewidth=0), **clip)
         elif o.kind == "cylinder":
             th, z = np.meshgrid(np.linspace(0, 2 * np.pi, 24), [env.bounds_lo[2], o.z_top])
             ax.plot_surface(o.center_xy[0] + o.radius * np.cos(th), o.center_xy[1] + o.radius * np.sin(th),
-                            z, color="tab:blue", alpha=0.45, linewidth=0)
+                            z, color="tab:blue", alpha=0.45, linewidth=0, **clip)
         elif o.kind == "box":
             draw_box(o, "tab:green")
         elif o.kind == "wall":
@@ -754,6 +1193,17 @@ def plot_environment(env, ax=None):
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
+def _angle_arg(text):
+    """CLI angle range: 'M' -> M (meaning -M..M), 'LO:HI' -> (LO, HI)."""
+    try:
+        if ":" in text:
+            lo, hi = (float(v) for v in text.split(":"))
+            return (lo, hi)
+        return float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not M or LO:HI (degrees)")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Generate random 3D obstacle environments. "
                                  "Defaults come from the USER SETTINGS block.")
@@ -765,13 +1215,54 @@ def main():
     ap.add_argument("--occupancy", type=float, nargs=2, default=list(OCCUPANCY_RANGE), metavar=("LO", "HI"),
                     help="fill target range, fractions of box volume")
     ap.add_argument("--endpoints", choices=["random", "ends"], default=ENDPOINT_MODE)
+    ap.add_argument("--types", nargs="+", default=None, metavar="TYPE=WEIGHT",
+                    help="obstacle types and relative weights, e.g. spheroid=1 oriented_cylinder=1 "
+                         f"cylinder=0.5 (types: {', '.join(OBSTACLE_TYPES)}). Default: TYPE_WEIGHTS")
+    ap.add_argument("--cylinder-rotation", nargs=3, type=_angle_arg, default=None,
+                    metavar=("ROLL", "PITCH", "YAW"),
+                    help="oriented-cylinder angle ranges in degrees; each is M (= -M..M) or LO:HI. "
+                         "0 0 0 = upright, 0 75:90 180 = near-horizontal, 90 90 180 = any "
+                         "(default: CYLINDER_ROTATION_DEG)")
+    ap.add_argument("--spheroid-rotation", nargs=3, type=_angle_arg, default=None,
+                    metavar=("ROLL", "PITCH", "YAW"),
+                    help="spheroid angle ranges, same format (default: SPHEROID_ROTATION_DEG)")
+    ap.add_argument("--box-rotation", nargs=3, type=_angle_arg, default=None,
+                    metavar=("ROLL", "PITCH", "YAW"),
+                    help="box angle ranges, same format (default: BOX_ROTATION_DEG, upright boxes)")
+    ap.add_argument("--upright-frac", type=float, default=CYLINDER_UPRIGHT_FRAC,
+                    help="share of oriented cylinders that are exactly vertical")
+    ap.add_argument("--max-walls", type=int, default=MAX_WALLS, help="most walls per environment")
+    ap.add_argument("--wall-yaw", type=float, default=WALL_YAW_DEG,
+                    help="walls face within +-this many degrees of the start->goal heading")
+    ap.add_argument("--wall-pitch", type=float, default=WALL_PITCH_DEG,
+                    help="walls lean up to +-this many degrees toward / away from the goal")
+    ap.add_argument("--min-size", type=float, default=MIN_OBSTACLE_RADIUS,
+                    help="drop obstacles whose equal-volume sphere radius is below this fraction "
+                         "of the smallest box dimension (0 = keep all)")
     ap.add_argument("--out", default=OUTPUT_FILE)
     ap.add_argument("--plot", action=argparse.BooleanOptionalAction, default=PLOT_FIRST,
                     help="plot the first environment")
     args = ap.parse_args()
 
+    type_weights = dict(TYPE_WEIGHTS)
+    if args.types:
+        type_weights = {}
+        for item in args.types:
+            name, _, w = item.partition("=")
+            try:
+                type_weights[name] = float(w) if w else 1.0
+            except ValueError:
+                ap.error(f"bad --types entry {item!r}; use TYPE=WEIGHT")
+        type_weights = {k: w for k, w in type_weights.items() if w > 0}
     cfg = EnvConfig(size=tuple(args.size), vehicle_radius=args.vehicle_radius, margin=args.margin,
-                    occupancy_range=tuple(args.occupancy), endpoint_mode=args.endpoints)
+                    occupancy_range=tuple(args.occupancy), endpoint_mode=args.endpoints,
+                    type_weights=type_weights,
+                    cylinder_rotation_deg=tuple(args.cylinder_rotation or CYLINDER_ROTATION_DEG),
+                    spheroid_rotation_deg=tuple(args.spheroid_rotation or SPHEROID_ROTATION_DEG),
+                    box_rotation_deg=tuple(args.box_rotation or BOX_ROTATION_DEG),
+                    cylinder_upright_frac=args.upright_frac, max_walls=args.max_walls,
+                    wall_yaw_deg=args.wall_yaw, wall_pitch_deg=args.wall_pitch,
+                    min_obstacle_radius=args.min_size)
     envs = EnvironmentGenerator(cfg, seed=args.seed).generate_many(args.n)
     save_environments(envs, args.out)
     print(f"Saved {len(envs)} environments to {args.out}")
@@ -779,7 +1270,8 @@ def main():
         m = e.metrics
         print(f"  env {k}: {m['obstacle_counts']}, fill {m['occupancy_fraction']:.1%} "
               f"(target {m['occupancy_target']:.1%}), "
-              f"inflated fill {m['inflated_occupancy_fraction']:.1%}")
+              f"inflated fill {m['inflated_occupancy_fraction']:.1%}, mean tilt "
+              + ", ".join(f"{k} {v:.0f} deg" for k, v in m.get("mean_tilt_deg", {}).items()))
     if args.plot:
         import matplotlib.pyplot as plt
         plot_environment(envs[0])

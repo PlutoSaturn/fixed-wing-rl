@@ -1,4 +1,4 @@
-python envgen.py --size 12000 2500 600 --vehicle-radius 6 --margin 30 --occupancy 0.05 0.08 --endpoints ends --n 3 --seed 1 --out c172_envs.json --plot
+python envgen.py --size 12000 2500 600 --vehicle-radius 6 --margin 30 --occupancy 0.05 0.08 --endpoints ends --n 3 --out c172_envs.json --plot
 
 generates --n random trajectories of size --size for a given vehicle radius. --occupancy defines randomized maximum and minimum infill rates. 
 

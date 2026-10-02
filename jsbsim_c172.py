@@ -500,6 +500,7 @@ def _box_mesh(lo, hi):
 
 def obstacle_meshes(env, segments=MESH_SEGMENTS, floor=None):
     """(name, vertices, faces) for every obstacle, in the local ENU frame, metres."""
+    from envgen import clip_polytope
     floor = env.bounds_lo[2] if floor is None else floor
     out = []
     for i, o in enumerate(env.obstacles):
@@ -520,6 +521,16 @@ def obstacle_meshes(env, segments=MESH_SEGMENTS, floor=None):
             top = len(V) - 1
             F += [[top, ring(nv - 1, k), ring(nv - 1, k + 1)] for k in range(nu)]
             out.append((f"spheroid_{i}", V, F))
+        elif o.kind == "oriented_cylinder":
+            R = o.rotation                                     # columns: rotated x, y, axis
+            ang = 2 * np.pi * np.arange(segments) / segments
+            rim = o.radius * (np.cos(ang)[:, None] * R[:, 0] + np.sin(ang)[:, None] * R[:, 1])
+            bottom, top = o.endpoints()
+            V = np.vstack([bottom + rim, top + rim])
+            n = segments
+            F = [[k, (k + 1) % n, n + (k + 1) % n, n + k] for k in range(n)]
+            F += [list(range(n - 1, -1, -1)), list(range(n, 2 * n))]          # end caps
+            out.append((f"ocylinder_{i}", V, F))
         elif o.kind == "cylinder":
             ang = 2 * np.pi * np.arange(segments) / segments
             ring = np.c_[o.center_xy[0] + o.radius * np.cos(ang), o.center_xy[1] + o.radius * np.sin(ang)]
@@ -528,13 +539,16 @@ def obstacle_meshes(env, segments=MESH_SEGMENTS, floor=None):
             F = [[k, (k + 1) % n, n + (k + 1) % n, n + k] for k in range(n)]
             F += [list(range(n - 1, -1, -1)), list(range(n, 2 * n))]          # bottom, top caps
             out.append((f"cylinder_{i}", V, F))
-        elif o.kind == "box":
-            V, F = _box_mesh(o.center - o.half_extents, o.center + o.half_extents)
-            out.append((f"box_{i}", V, F))
-        elif o.kind == "wall":
-            for j, bx in enumerate(o.boxes):
-                V, F = _box_mesh(bx.center - bx.half_extents, bx.center + bx.half_extents)
-                out.append((f"wall_{i}_{j}", V, F))
+        elif o.kind in ("box", "wall"):
+            # boxes may be rotated and wall pieces reach far past the workspace, so
+            # mesh only the part inside it (down to `floor`, so walls meet the terrain)
+            lo = np.r_[env.bounds_lo[:2], min(floor, env.bounds_lo[2])]
+            parts = [(f"box_{i}", o)] if o.kind == "box" else \
+                    [(f"wall_{i}_{j}", bx) for j, bx in enumerate(o.boxes)]
+            for name, bx in parts:
+                mesh = clip_polytope(*bx.halfspaces(), lo, env.bounds_hi)
+                if mesh is not None:
+                    out.append((name, mesh[0], mesh[1]))
     return out
 
 
@@ -624,7 +638,8 @@ def export_flightgear_scenery(env, out_dir):
     if os.path.isdir(out_dir):
         shutil.rmtree(out_dir)
     colours = {"spheroid": (1.0, 0.55, 0.1), "cylinder": (0.2, 0.45, 0.85),
-               "box": (0.5, 0.5, 0.5), "wall": (0.5, 0.5, 0.5)}
+               "ocylinder": (0.55, 0.3, 0.8),
+               "box": (0.35, 0.65, 0.35), "wall": (0.55, 0.55, 0.55)}
     floor = env.bounds_lo[2] - FG_CYLINDER_EXTEND_DOWN_M
     stg = {}
     for name, V, F in obstacle_meshes(env, FG_OBSTACLE_SEGMENTS, floor=floor):

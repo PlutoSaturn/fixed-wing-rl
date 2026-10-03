@@ -290,17 +290,349 @@ class SolveResult:
 
 
 # --------------------------------------------------------------------------
-# solver
+# SCP engine (problem-independent)
 # --------------------------------------------------------------------------
-class AircraftSCP:
+class SCPSolver:
+    """Sequential convex programming for  x' = sigma f(x, u),  tau in [0, 1]:
+    multiple shooting with RK4 and sensitivities, first-order-hold controls,
+    free or fixed final time sigma, virtual control, and a PTR or SCvx trust
+    region (the ALGORITHM setting). This class is the algorithm only; it knows
+    nothing about aircraft.
+
+    A problem is a subclass that supplies:
+        self.model          object with f(x, u), jacobians(x, u), nx, nu
+        self.xs, self.us    state / control scales (the step dz is in these units)
+        initial_guesses(env)                -> iterable of (X, U, sigma)
+        subproblem_constraints(env, X, U, sig, X_bar, U_bar, s_bar, N)
+                                            -> list of cvxpy constraints: boundary
+                                               conditions, state/control limits,
+                                               bounds on sig (fixed time: sig == T)
+        cost(X, U, sigma)                   -> float, the true cost
+        cost_expr(X, U, sig, N)             -> cvxpy expression of that cost
+    and optionally:
+        nodes_for(env)                      -> number of nodes (default N_NODES)
+        uses_obstacles = True, with obstacle_eval(env, P) and check_points(X, prop),
+                         to enforce env's obstacles at every RK4 substep (the
+                         first three states must then be the position)
+    AircraftSCP below is one such problem; cartpole_scp.py is another.
+    """
+    name = "scp"
+    uses_obstacles = False
+
+    def __init__(self, model, xs, us, verbose=VERBOSE, n_starts=N_STARTS):
+        self.model = model
+        self.verbose, self.n_starts = verbose, n_starts
+        self.xs, self.us = np.asarray(xs, float), np.asarray(us, float)   # state / control scales
+        self.n_nodes = N_NODES
+
+    # ---- problem hooks ------------------------------------------------------
+    def nodes_for(self, env):
+        return N_NODES
+
+    def initial_guesses(self, env):
+        raise NotImplementedError
+
+    def subproblem_constraints(self, env, X, U, sig, X_bar, U_bar, s_bar, N):
+        raise NotImplementedError
+
+    def cost(self, X, U, sigma):
+        raise NotImplementedError
+
+    def cost_expr(self, X, U, sig, N):
+        raise NotImplementedError
+
+    # ---- propagation -------------------------------------------------------
+    def propagate(self, X, U, sigma, steps, sens=True):
+        """Integrate every interval from its start node (multiple shooting).
+        Returns end states, per-substep states (K, steps, nx) and, if sens,
+        sensitivities at every substep and at the end."""
+        nx, nu = self.model.nx, self.model.nu
+        K = len(X) - 1
+        dtau = 1.0 / K
+        h = 1.0 / steps
+        uk, uk1 = U[:-1], U[1:]
+        x = X[:-1].copy()
+        Phi = np.tile(np.eye(nx), (K, 1, 1))
+        Bm, Bp = np.zeros((K, nx, nu)), np.zeros((K, nx, nu))
+        S = np.zeros((K, nx))
+
+        def rhs(s, x, Phi, Bm, Bp, S):
+            u = (1 - s) * uk + s * uk1
+            fx = self.model.f(x, u)
+            dx = dtau * sigma * fx
+            if not sens:
+                return dx, None, None, None, None
+            A, B = self.model.jacobians(x, u)
+            A, B = dtau * sigma * A, dtau * sigma * B
+            return (dx, A @ Phi, A @ Bm + (1 - s) * B, A @ Bp + s * B,
+                    np.einsum("kij,kj->ki", A, S) + dtau * fx)
+
+        traj = {"x": [], "Phi": [], "Bm": [], "Bp": [], "S": []}
+        for j in range(steps):
+            s0 = j * h
+            traj["x"].append(x)
+            if sens:
+                traj["Phi"].append(Phi); traj["Bm"].append(Bm)
+                traj["Bp"].append(Bp); traj["S"].append(S)
+            state = (x, Phi, Bm, Bp, S)
+            k1 = rhs(s0, *state)
+            k2 = rhs(s0 + h / 2, *[a + h / 2 * b if b is not None else a for a, b in zip(state, k1)])
+            k3 = rhs(s0 + h / 2, *[a + h / 2 * b if b is not None else a for a, b in zip(state, k2)])
+            k4 = rhs(s0 + h, *[a + h * b if b is not None else a for a, b in zip(state, k3)])
+            new = []
+            for a, b1, b2, b3, b4 in zip(state, k1, k2, k3, k4):
+                new.append(a if b1 is None else a + h / 6 * (b1 + 2 * b2 + 2 * b3 + b4))
+            x, Phi, Bm, Bp, S = new
+        out = {"x_end": x, "x_sub": np.stack(traj["x"], axis=1)}
+        if sens:
+            out.update(Phi=Phi, Bm=Bm, Bp=Bp, S=S,
+                       Phi_sub=np.stack(traj["Phi"], 1), Bm_sub=np.stack(traj["Bm"], 1),
+                       Bp_sub=np.stack(traj["Bp"], 1), S_sub=np.stack(traj["S"], 1))
+        return out
+
+    # ---- merit ---------------------------------------------------------------
+    def merit(self, env, X, U, sigma):
+        """Nonlinear merit. If the dynamics blow up anywhere along the trajectory
+        (NaN/Inf), returns (inf, inf, inf) so the caller rejects the step."""
+        with np.errstate(all="ignore"):                  # a blown-up step is reported, not warned about
+            prop = self.propagate(X, U, sigma, RK4_STEPS, sens=False)
+            if not np.all(np.isfinite(prop["x_sub"])) or not np.all(np.isfinite(prop["x_end"])):
+                return np.inf, np.inf, np.inf
+            defect = np.abs((X[1:] - prop["x_end"]) / self.xs)
+            if self.uses_obstacles:
+                hn, _ = self.obstacle_eval(env, self.check_points(X, prop))
+                viol = np.maximum(0.0, -hn).max(axis=1)
+                J = self.cost(X, U, sigma) + LAMBDA_DYN * defect.sum() + LAMBDA_OBS * viol.sum() / POS_SCALE
+            else:
+                viol = np.zeros(1)
+                J = self.cost(X, U, sigma) + LAMBDA_DYN * defect.sum()
+        if not np.isfinite(J):
+            return np.inf, np.inf, np.inf
+        return J, float(defect.max()), float(viol.max())
+
+    # ---- main entry point --------------------------------------------------
+    def solve(self, env=None) -> SolveResult:
+        t0 = time.perf_counter()
+        self.n_nodes = self.nodes_for(env)
+        best, attempts = None, []
+        for guess in self.initial_guesses(env):
+            res = self._solve_from(env, guess)
+            attempts.append(res.status)
+            if best is None or res.success or \
+                    res.max_violation + res.max_defect < best.max_violation + best.max_defect:
+                best = res
+            if res.success:
+                break
+        best.attempts, best.solve_time = attempts, time.perf_counter() - t0
+        return best
+
+    def _solve_from(self, env, guess):
+        t0 = time.perf_counter()
+        N, nx, nu = self.n_nodes, self.model.nx, self.model.nu
+        nz = N * nx + N * nu + 1                     # z = [vec(X), vec(U), sigma]
+        ix = lambda k: k * nx
+        iu = lambda k: N * nx + k * nu
+        isg = nz - 1
+
+        X_bar, U_bar, s_bar = guess
+        J_bar, def_bar, viol_bar = self.merit(env, X_bar, U_bar, s_bar)
+        eta, history, status, converged = ETA_INIT, [], "max_iterations", False
+        cap = TRUST_CAP            # PTR step cap; halved when a step is rejected, regrows after accepted ones
+
+        it = 0
+        for it in range(1, MAX_ITERS + 1):
+            prop = self.propagate(X_bar, U_bar, s_bar, RK4_STEPS, sens=True)
+            zbar = np.r_[X_bar.ravel(), U_bar.ravel(), s_bar]
+            # The subproblem is solved for the scaled step dz = (z - zbar) / zs,
+            # which keeps the numbers the solver sees small and well conditioned.
+            zs = np.r_[np.tile(self.xs, N), np.tile(self.us, N), s_bar]
+            dz = cp.Variable(nz)
+            nu_v = cp.Variable((N - 1) * nx)                  # scaled virtual control
+            X = X_bar + cp.multiply(self.xs[None, :], cp.reshape(dz[:N * nx], (N, nx), order="C"))
+            U = U_bar + cp.multiply(self.us[None, :], cp.reshape(dz[N * nx:N * (nx + nu)], (N, nu), order="C"))
+            sig = s_bar * (1 + dz[isg])
+
+            cons = self.subproblem_constraints(env, X, U, sig, X_bar, U_bar, s_bar, N)
+            cons.append(cp.abs(dz) <= (cap if ALGORITHM == "ptr" else eta))     # trust region
+
+            # linearized dynamics in the step variables:
+            #   dx_{k+1} - Phi dx_k - Bm du_k - Bp du_{k+1} - S dsigma - nu = x_prop - x_bar_{k+1}
+            rows, cols, vals = [], [], []
+            def put(r0, c0, block):
+                r, c = np.nonzero(np.ones_like(block, dtype=bool))
+                rows.append(r0 + r); cols.append(c0 + c); vals.append(block.ravel())
+            for k in range(N - 1):
+                r0 = k * nx
+                put(r0, ix(k + 1), np.eye(nx))
+                put(r0, ix(k), -prop["Phi"][k])
+                put(r0, iu(k), -prop["Bm"][k])
+                put(r0, iu(k + 1), -prop["Bp"][k])
+                put(r0, isg, -prop["S"][k][:, None])
+            Dm = sp.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
+                               shape=((N - 1) * nx, nz))
+            xs_rep = np.tile(self.xs, N - 1)
+            Dm_s = sp.diags(1 / xs_rep) @ Dm @ sp.diags(zs)        # rows scaled by state scales
+            gap = ((prop["x_end"] - X_bar[1:]) / self.xs).ravel()   # minus the scaled defect
+            cons.append(Dm_s @ dz - nu_v == gap)
+
+            n_obstacle_rows = 0
+            L_expr = self.cost_expr(X, U, sig, N) + LAMBDA_DYN * cp.norm1(nu_v)
+            if self.uses_obstacles:
+                # obstacle constraints at every substep, linear in the step variables:
+                #   n . (dP/dz) zs dz + slack >= -h/||g||
+                P_bar = self.check_points(X_bar, prop)
+                C = len(P_bar)
+                hn, G = self.obstacle_eval(env, P_bar)
+                reach = np.sqrt(3) * (cap if ALGORITHM == "ptr" else eta) * POS_SCALE + PRUNE_BUFFER
+                rc, rm = np.nonzero(hn <= reach)
+                n_obstacle_rows = int(len(rc))
+                slack = cp.Variable(C, nonneg=True)
+                if len(rc):
+                    Kr = len(rc)
+                    n_rows = G[rc, rm]                                   # (Kr, 3) unit normals
+                    last = rc == C - 1                                   # final node rows
+                    mid = ~last
+                    k, j = np.divmod(rc[mid], RK4_STEPS)                 # interval, substep
+                    r_mid = np.nonzero(mid)[0]
+                    nm = n_rows[mid]
+                    cx = np.einsum("ri,rij->rj", nm, prop["Phi_sub"][k, j][:, :3])      # (R, nx)
+                    cm = np.einsum("ri,rij->rj", nm, prop["Bm_sub"][k, j][:, :3])       # (R, nu)
+                    cp_ = np.einsum("ri,rij->rj", nm, prop["Bp_sub"][k, j][:, :3])      # (R, nu)
+                    cs = np.einsum("ri,ri->r", nm, prop["S_sub"][k, j][:, :3])          # (R,)
+                    r_last = np.nonzero(last)[0]
+                    rows_ = np.concatenate([np.repeat(r_mid, nx), np.repeat(r_mid, nu), np.repeat(r_mid, nu),
+                                            r_mid, np.repeat(r_last, 3)])
+                    cols_ = np.concatenate([(ix(k)[:, None] + np.arange(nx)).ravel(),
+                                            (iu(k)[:, None] + np.arange(nu)).ravel(),
+                                            (iu(k + 1)[:, None] + np.arange(nu)).ravel(),
+                                            np.full(len(r_mid), isg),
+                                            (ix(N - 1) + np.arange(3)[None, :]).repeat(len(r_last), 0).ravel()])
+                    vals_ = np.concatenate([cx.ravel(), cm.ravel(), cp_.ravel(), cs, n_rows[last].ravel()])
+                    Gm = sp.csr_matrix((vals_, (rows_, cols_)), shape=(Kr, nz)) @ sp.diags(zs)
+                    Es = sp.csr_matrix((np.ones(Kr), (np.arange(Kr), rc)), shape=(Kr, C))
+                    cons.append(Gm @ dz + Es @ slack >= -hn[rc, rm])
+                L_expr = L_expr + LAMBDA_OBS * cp.sum(slack) / POS_SCALE
+
+            trust_pen = W_TRUST * cp.sum_squares(dz) if ALGORITHM == "ptr" else 0
+            prob = cp.Problem(cp.Minimize(L_expr + trust_pen), cons)
+            try:
+                prob.solve(solver=SOLVER, canon_backend=cp.SCIPY_CANON_BACKEND)
+                ok = prob.status in ("optimal", "optimal_inaccurate")
+            except (cp.error.SolverError, ValueError):      # ValueError: NaN/Inf in the problem data
+                ok = False
+            if not ok:
+                eta /= ETA_SHRINK
+                cap /= 2.0          # PTR: retry with a smaller step (it used to retry the identical subproblem)
+                history.append({"iter": it, "eta": eta, "cap": cap, "event": "subproblem_failed"})
+                if (cap if ALGORITHM == "ptr" else eta) < ETA_MIN:
+                    status = "solver_error"
+                    break
+                continue
+
+            zv = zbar + zs * dz.value
+            X_new = zv[:N * nx].reshape(N, nx)
+            U_new = zv[N * nx:N * (nx + nu)].reshape(N, nu)
+            s_new = float(zv[isg])
+            L_new = float(L_expr.value)
+            J_new, def_new, viol_new = self.merit(env, X_new, U_new, s_new)
+            if not np.isfinite(J_new):
+                # the nonlinear dynamics blew up along the proposed trajectory: keep the current
+                # iterate and try again with a smaller step
+                cap /= 2.0
+                eta /= ETA_SHRINK
+                history.append({"iter": it, "eta": eta, "cap": cap, "event": "rejected_nonfinite"})
+                if self.verbose:
+                    print(f"    it {it:2d}  step rejected: dynamics blew up (NaN/Inf); "
+                          f"step cap now {cap if ALGORITHM == 'ptr' else eta:.3g}")
+                if (cap if ALGORITHM == "ptr" else eta) < ETA_MIN:
+                    status = "nonfinite_step"
+                    break
+                continue
+            predicted, actual = J_bar - L_new, J_bar - J_new
+            rho = actual / predicted if predicted > 1e-12 else 1.0
+            rec = {"iter": it, "J": J_new, "L": L_new, "flight_time": s_new,
+                   "max_defect": def_new, "max_violation": viol_new,
+                   "rho": rho, "eta": eta, "n_obstacle_rows": n_obstacle_rows}
+
+            step = max(np.max(np.abs(X_new - X_bar) / self.xs), np.max(np.abs(U_new - U_bar) / self.us),
+                       abs(s_new - s_bar) / s_bar)
+            rec["step"] = float(step)
+            if ALGORITHM == "ptr":
+                cap = min(2.0 * cap, TRUST_CAP)              # regrow after a good step
+                improvement = J_bar - J_new
+                X_bar, U_bar, s_bar, J_bar, def_bar, viol_bar = X_new, U_new, s_new, J_new, def_new, viol_new
+                rec["event"] = "accepted"
+                history.append(rec)
+                if self.verbose:
+                    print(f"    it {it:2d}  J {J_new:10.3f}  tf {s_new:6.1f}s  defect {def_new:.1e}  "
+                          f"viol {viol_new:.1e}  step {step:.1e}")
+                small = step <= TOL_STEP or 0 <= improvement <= TOL_DECREASE_ABS + TOL_DECREASE_REL * abs(J_new)
+                if small and def_new <= TOL_DEFECT and viol_new <= TOL_VIOLATION:
+                    rec["event"] = "converged"
+                    converged = True
+                    break
+                continue
+
+            if predicted <= TOL_DECREASE_ABS + TOL_DECREASE_REL * abs(J_bar) or step <= TOL_STEP:
+                if J_new <= J_bar:
+                    X_bar, U_bar, s_bar, J_bar, def_bar, viol_bar = X_new, U_new, s_new, J_new, def_new, viol_new
+                rec["event"] = "converged"
+                history.append(rec)
+                converged = True
+                break
+            if rho < RHO_0:
+                eta /= ETA_SHRINK
+                rec["event"] = "rejected"
+            else:
+                X_bar, U_bar, s_bar, J_bar, def_bar, viol_bar = X_new, U_new, s_new, J_new, def_new, viol_new
+                if rho < RHO_1:
+                    eta /= ETA_SHRINK
+                elif rho >= RHO_2:
+                    eta = min(eta * ETA_GROW, ETA_MAX)
+                rec["event"] = "accepted"
+            history.append(rec)
+            if self.verbose:
+                print(f"    it {it:2d}  J {J_new:10.3f}  tf {s_new:6.1f}s  defect {def_new:.1e}  "
+                      f"viol {viol_new:.1e}  rho {rho:6.2f}  eta {eta:.3f}  {rec['event']}")
+            if eta < ETA_MIN:
+                status = "trust_region_collapsed"
+                break
+
+        # ---- classify and verify -------------------------------------------
+        feasible = def_bar <= TOL_DEFECT and viol_bar <= TOL_VIOLATION
+        if self.uses_obstacles:
+            dense = self.propagate(X_bar, U_bar, s_bar, DENSE_STEPS, sens=False)
+            margin = float(self.obstacle_eval(env, self.check_points(X_bar, dense))[0].min())
+            dense_tol = DENSE_TOLERANCE if DENSE_TOLERANCE is not None else 0.25 * env.margin
+        else:
+            margin, dense_tol = float("nan"), 0.0
+        if feasible and margin < -dense_tol:
+            status = "dense_check_failed"
+        elif feasible:
+            # a dynamically feasible, collision-free trajectory; if SCP stopped
+            # early (e.g. trust region collapsed) it may not be fully optimal
+            status = "feasible" if converged else "feasible_unconverged"
+        elif converged:
+            status = "converged_infeasible"
+        return SolveResult(status.startswith("feasible"), status, it, time.perf_counter() - t0, s_bar,
+                           self.cost(X_bar, U_bar, s_bar), def_bar, viol_bar, margin, X_bar, U_bar, history)
+
+
+# --------------------------------------------------------------------------
+# the aircraft problem
+# --------------------------------------------------------------------------
+class AircraftSCP(SCPSolver):
+    """The 3-DOF fixed-wing trajectory problem on an envgen environment, solved
+    by the SCP engine above. Supplies the aircraft model, its limits, the
+    boundary conditions, the cost and the obstacle constraints."""
     name = "aircraft_scp"
+    uses_obstacles = True
 
     def __init__(self, verbose=VERBOSE, n_starts=N_STARTS):
-        self.model = FixedWing3DOF()
-        self.verbose, self.n_starts = verbose, n_starts
-        self.xs = np.array([POS_SCALE] * 3 + [V_MAX - V_MIN, 1.0, 1.0])   # state scales
-        self.us = np.array([T_MAX + THRUST_SLOPE * V_MAX, N_MAX, N_MAX])   # control scales
-        self.n_nodes = N_NODES
+        super().__init__(FixedWing3DOF(),
+                         np.array([POS_SCALE] * 3 + [V_MAX - V_MIN, 1.0, 1.0]),    # state scales
+                         np.array([T_MAX + THRUST_SLOPE * V_MAX, N_MAX, N_MAX]),   # control scales
+                         verbose=verbose, n_starts=n_starts)
 
     def nodes_for(self, env):
         """N_NODES, raised for long flights so the straight-line flight time
@@ -349,55 +681,44 @@ class AircraftSCP:
         sigma = float(np.clip(s_pts[-1] / V_CRUISE, *SIGMA_BOUNDS))
         return x, u, sigma
 
-    # ---- propagation -------------------------------------------------------
-    def propagate(self, X, U, sigma, steps, sens=True):
-        """Integrate every interval from its start node (multiple shooting).
-        Returns end states, per-substep states (K, steps, 6) and, if sens,
-        sensitivities at every substep and at the end."""
-        K = len(X) - 1
-        dtau = 1.0 / K
-        h = 1.0 / steps
-        uk, uk1 = U[:-1], U[1:]
-        x = X[:-1].copy()
-        Phi = np.tile(np.eye(6), (K, 1, 1))
-        Bm, Bp = np.zeros((K, 6, 3)), np.zeros((K, 6, 3))
-        S = np.zeros((K, 6))
+    # ---- constraints and cost ----------------------------------------------
+    def subproblem_constraints(self, env, X, U, sig, X_bar, U_bar, s_bar, N):
+        x0, p_goal = self.boundary(env)
+        lo, hi = env.position_bounds()
+        tanb = np.tan(np.radians(BANK_MAX_DEG))
+        gmax = np.radians(GAMMA_MAX_DEG)
+        cons = [X[0] == x0, X[-1, :3] == p_goal,
+                X[:, :3] >= lo, X[:, :3] <= hi,
+                X[:, 3] >= V_MIN, X[:, 3] <= V_MAX,
+                cp.abs(X[:, 4]) <= gmax,
+                U[:, 0] >= 0,
+                U[:, 0] <= THRUST_PLAN_FRACTION * (T_MAX + THRUST_SLOPE * X[:, 3]),
+                cp.norm(U[:, 1:], 2, axis=1) <= N_MAX,
+                cp.abs(U[:, 2]) <= tanb * U[:, 1],
+                sig >= SIGMA_BOUNDS[0], sig <= SIGMA_BOUNDS[1]]
+        if FINAL_LEVEL:
+            cons.append(X[-1, 4] == 0)
+        # control rate limits: |u_{k+1} - u_k| <= rate * dt, with dt = sigma / (N - 1)
+        for col, rate in ((1, N_V_RATE_MAX), (2, N_H_RATE_MAX)):
+            if rate is not None:
+                cons.append(cp.abs(cp.diff(U[:, col])) <= rate * sig / (N - 1))
+        # stall: ||n|| <= c_stall * V^2, with V^2 replaced by its tangent (conservative)
+        cons.append(cp.norm(U[:, 1:], 2, axis=1) <=
+                    self.model.c_stall * (2 * cp.multiply(X_bar[:, 3], X[:, 3]) - X_bar[:, 3] ** 2))
+        return cons
 
-        def rhs(s, x, Phi, Bm, Bp, S):
-            u = (1 - s) * uk + s * uk1
-            fx = self.model.f(x, u)
-            dx = dtau * sigma * fx
-            if not sens:
-                return dx, None, None, None, None
-            A, B = self.model.jacobians(x, u)
-            A, B = dtau * sigma * A, dtau * sigma * B
-            return (dx, A @ Phi, A @ Bm + (1 - s) * B, A @ Bp + s * B,
-                    np.einsum("kij,kj->ki", A, S) + dtau * fx)
+    def cost(self, X, U, sigma):
+        return (W_TIME * sigma
+                + W_SPEED * float(np.mean(((X[:, 3] - V_CRUISE) / V_CRUISE) ** 2))
+                + W_SMOOTH * float(np.sum((np.diff(U, axis=0) / self.us) ** 2)))
 
-        traj = {"x": [], "Phi": [], "Bm": [], "Bp": [], "S": []}
-        for j in range(steps):
-            s0 = j * h
-            traj["x"].append(x)
-            if sens:
-                traj["Phi"].append(Phi); traj["Bm"].append(Bm)
-                traj["Bp"].append(Bp); traj["S"].append(S)
-            state = (x, Phi, Bm, Bp, S)
-            k1 = rhs(s0, *state)
-            k2 = rhs(s0 + h / 2, *[a + h / 2 * b if b is not None else a for a, b in zip(state, k1)])
-            k3 = rhs(s0 + h / 2, *[a + h / 2 * b if b is not None else a for a, b in zip(state, k2)])
-            k4 = rhs(s0 + h, *[a + h * b if b is not None else a for a, b in zip(state, k3)])
-            new = []
-            for a, b1, b2, b3, b4 in zip(state, k1, k2, k3, k4):
-                new.append(a if b1 is None else a + h / 6 * (b1 + 2 * b2 + 2 * b3 + b4))
-            x, Phi, Bm, Bp, S = new
-        out = {"x_end": x, "x_sub": np.stack(traj["x"], axis=1)}
-        if sens:
-            out.update(Phi=Phi, Bm=Bm, Bp=Bp, S=S,
-                       Phi_sub=np.stack(traj["Phi"], 1), Bm_sub=np.stack(traj["Bm"], 1),
-                       Bp_sub=np.stack(traj["Bp"], 1), S_sub=np.stack(traj["S"], 1))
-        return out
+    def cost_expr(self, X, U, sig, N):
+        us_row = self.us[None, :]
+        return (W_TIME * sig
+                + W_SPEED * cp.sum_squares((X[:, 3] - V_CRUISE) / V_CRUISE) / N
+                + W_SMOOTH * cp.sum_squares(cp.multiply(cp.diff(U, axis=0), 1 / us_row)))
 
-    # ---- merit ---------------------------------------------------------------
+    # ---- obstacles -----------------------------------------------------------
     def obstacle_eval(self, env, P):
         """Normalized constraint values h/||g|| (C, m) and unit normals (C, m, 3)."""
         A, b = env.linearized_constraints(P)
@@ -409,252 +730,6 @@ class AircraftSCP:
         """Positions at every substep of every interval, plus the final node."""
         P = prop["x_sub"][..., :3].reshape(-1, 3)
         return np.vstack([P, X[-1, :3]])
-
-    def cost(self, X, U, sigma):
-        return (W_TIME * sigma
-                + W_SPEED * float(np.mean(((X[:, 3] - V_CRUISE) / V_CRUISE) ** 2))
-                + W_SMOOTH * float(np.sum((np.diff(U, axis=0) / self.us) ** 2)))
-
-    def merit(self, env, X, U, sigma):
-        """Nonlinear merit. If the dynamics blow up anywhere along the trajectory
-        (NaN/Inf), returns (inf, inf, inf) so the caller rejects the step."""
-        with np.errstate(all="ignore"):                  # a blown-up step is reported, not warned about
-            prop = self.propagate(X, U, sigma, RK4_STEPS, sens=False)
-            if not np.all(np.isfinite(prop["x_sub"])) or not np.all(np.isfinite(prop["x_end"])):
-                return np.inf, np.inf, np.inf
-            defect = np.abs((X[1:] - prop["x_end"]) / self.xs)
-            hn, _ = self.obstacle_eval(env, self.check_points(X, prop))
-            viol = np.maximum(0.0, -hn).max(axis=1)
-            J = self.cost(X, U, sigma) + LAMBDA_DYN * defect.sum() + LAMBDA_OBS * viol.sum() / POS_SCALE
-        if not np.isfinite(J):
-            return np.inf, np.inf, np.inf
-        return J, float(defect.max()), float(viol.max())
-
-    # ---- main entry point --------------------------------------------------
-    def solve(self, env: Environment) -> SolveResult:
-        t0 = time.perf_counter()
-        self.n_nodes = self.nodes_for(env)
-        best, attempts = None, []
-        for guess in self.initial_guesses(env):
-            res = self._solve_from(env, guess)
-            attempts.append(res.status)
-            if best is None or res.success or \
-                    res.max_violation + res.max_defect < best.max_violation + best.max_defect:
-                best = res
-            if res.success:
-                break
-        best.attempts, best.solve_time = attempts, time.perf_counter() - t0
-        return best
-
-    def _solve_from(self, env, guess):
-        t0 = time.perf_counter()
-        N, nx, nu = self.n_nodes, 6, 3
-        nz = N * nx + N * nu + 1                     # z = [vec(X), vec(U), sigma]
-        ix = lambda k: k * nx
-        iu = lambda k: N * nx + k * nu
-        isg = nz - 1
-        x0, p_goal = self.boundary(env)
-        lo, hi = env.position_bounds()
-
-        X_bar, U_bar, s_bar = guess
-        J_bar, def_bar, viol_bar = self.merit(env, X_bar, U_bar, s_bar)
-        eta, history, status, converged = ETA_INIT, [], "max_iterations", False
-        cap = TRUST_CAP            # PTR step cap; halved when a step is rejected, regrows after accepted ones
-
-        tanb = np.tan(np.radians(BANK_MAX_DEG))
-        gmax = np.radians(GAMMA_MAX_DEG)
-        us_row = self.us[None, :]
-
-        it = 0
-        for it in range(1, MAX_ITERS + 1):
-            prop = self.propagate(X_bar, U_bar, s_bar, RK4_STEPS, sens=True)
-            zbar = np.r_[X_bar.ravel(), U_bar.ravel(), s_bar]
-            # The subproblem is solved for the scaled step dz = (z - zbar) / zs,
-            # which keeps the numbers the solver sees small and well conditioned.
-            zs = np.r_[np.tile(self.xs, N), np.tile(self.us, N), s_bar]
-            dz = cp.Variable(nz)
-            nu_v = cp.Variable((N - 1) * nx)                  # scaled virtual control
-            X = X_bar + cp.multiply(self.xs[None, :], cp.reshape(dz[:N * nx], (N, nx), order="C"))
-            U = U_bar + cp.multiply(us_row, cp.reshape(dz[N * nx:N * (nx + nu)], (N, nu), order="C"))
-            sig = s_bar * (1 + dz[isg])
-
-            cons = [X[0] == x0, X[-1, :3] == p_goal,
-                    X[:, :3] >= lo, X[:, :3] <= hi,
-                    X[:, 3] >= V_MIN, X[:, 3] <= V_MAX,
-                    cp.abs(X[:, 4]) <= gmax,
-                    U[:, 0] >= 0,
-                    U[:, 0] <= THRUST_PLAN_FRACTION * (T_MAX + THRUST_SLOPE * X[:, 3]),
-                    cp.norm(U[:, 1:], 2, axis=1) <= N_MAX,
-                    cp.abs(U[:, 2]) <= tanb * U[:, 1],
-                    sig >= SIGMA_BOUNDS[0], sig <= SIGMA_BOUNDS[1],
-                    cp.abs(dz) <= (cap if ALGORITHM == "ptr" else eta)]   # trust region
-            if FINAL_LEVEL:
-                cons.append(X[-1, 4] == 0)
-            # control rate limits: |u_{k+1} - u_k| <= rate * dt, with dt = sigma / (N - 1)
-            for col, rate in ((1, N_V_RATE_MAX), (2, N_H_RATE_MAX)):
-                if rate is not None:
-                    cons.append(cp.abs(cp.diff(U[:, col])) <= rate * sig / (N - 1))
-            # stall: ||n|| <= c_stall * V^2, with V^2 replaced by its tangent (conservative)
-            cons.append(cp.norm(U[:, 1:], 2, axis=1) <=
-                        self.model.c_stall * (2 * cp.multiply(X_bar[:, 3], X[:, 3]) - X_bar[:, 3] ** 2))
-
-            # linearized dynamics in the step variables:
-            #   dx_{k+1} - Phi dx_k - Bm du_k - Bp du_{k+1} - S dsigma - nu = x_prop - x_bar_{k+1}
-            rows, cols, vals = [], [], []
-            def put(r0, c0, block):
-                r, c = np.nonzero(np.ones_like(block, dtype=bool))
-                rows.append(r0 + r); cols.append(c0 + c); vals.append(block.ravel())
-            for k in range(N - 1):
-                r0 = k * nx
-                put(r0, ix(k + 1), np.eye(nx))
-                put(r0, ix(k), -prop["Phi"][k])
-                put(r0, iu(k), -prop["Bm"][k])
-                put(r0, iu(k + 1), -prop["Bp"][k])
-                put(r0, isg, -prop["S"][k][:, None])
-            Dm = sp.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
-                               shape=((N - 1) * nx, nz))
-            xs_rep = np.tile(self.xs, N - 1)
-            Dm_s = sp.diags(1 / xs_rep) @ Dm @ sp.diags(zs)        # rows scaled by state scales
-            gap = ((prop["x_end"] - X_bar[1:]) / self.xs).ravel()   # minus the scaled defect
-            cons.append(Dm_s @ dz - nu_v == gap)
-
-            # obstacle constraints at every substep, linear in the step variables:
-            #   n . (dP/dz) zs dz + slack >= -h/||g||
-            P_bar = self.check_points(X_bar, prop)
-            C = len(P_bar)
-            hn, G = self.obstacle_eval(env, P_bar)
-            reach = np.sqrt(3) * (cap if ALGORITHM == "ptr" else eta) * POS_SCALE + PRUNE_BUFFER
-            rc, rm = np.nonzero(hn <= reach)
-            slack = cp.Variable(C, nonneg=True)
-            if len(rc):
-                Kr = len(rc)
-                n_rows = G[rc, rm]                                   # (Kr, 3) unit normals
-                last = rc == C - 1                                   # final node rows
-                mid = ~last
-                k, j = np.divmod(rc[mid], RK4_STEPS)                 # interval, substep
-                r_mid = np.nonzero(mid)[0]
-                nm = n_rows[mid]
-                cx = np.einsum("ri,rij->rj", nm, prop["Phi_sub"][k, j][:, :3])      # (R, 6)
-                cm = np.einsum("ri,rij->rj", nm, prop["Bm_sub"][k, j][:, :3])       # (R, 3)
-                cp_ = np.einsum("ri,rij->rj", nm, prop["Bp_sub"][k, j][:, :3])      # (R, 3)
-                cs = np.einsum("ri,ri->r", nm, prop["S_sub"][k, j][:, :3])          # (R,)
-                r_last = np.nonzero(last)[0]
-                rows_ = np.concatenate([np.repeat(r_mid, nx), np.repeat(r_mid, nu), np.repeat(r_mid, nu),
-                                        r_mid, np.repeat(r_last, 3)])
-                cols_ = np.concatenate([(ix(k)[:, None] + np.arange(nx)).ravel(),
-                                        (iu(k)[:, None] + np.arange(nu)).ravel(),
-                                        (iu(k + 1)[:, None] + np.arange(nu)).ravel(),
-                                        np.full(len(r_mid), isg),
-                                        (ix(N - 1) + np.arange(3)[None, :]).repeat(len(r_last), 0).ravel()])
-                vals_ = np.concatenate([cx.ravel(), cm.ravel(), cp_.ravel(), cs, n_rows[last].ravel()])
-                Gm = sp.csr_matrix((vals_, (rows_, cols_)), shape=(Kr, nz)) @ sp.diags(zs)
-                Es = sp.csr_matrix((np.ones(Kr), (np.arange(Kr), rc)), shape=(Kr, C))
-                cons.append(Gm @ dz + Es @ slack >= -hn[rc, rm])
-
-            cost_expr = (W_TIME * sig
-                         + W_SPEED * cp.sum_squares((X[:, 3] - V_CRUISE) / V_CRUISE) / N
-                         + W_SMOOTH * cp.sum_squares(cp.multiply(cp.diff(U, axis=0), 1 / us_row)))
-            L_expr = cost_expr + LAMBDA_DYN * cp.norm1(nu_v) + LAMBDA_OBS * cp.sum(slack) / POS_SCALE
-            trust_pen = W_TRUST * cp.sum_squares(dz) if ALGORITHM == "ptr" else 0
-            prob = cp.Problem(cp.Minimize(L_expr + trust_pen), cons)
-            try:
-                prob.solve(solver=SOLVER, canon_backend=cp.SCIPY_CANON_BACKEND)
-                ok = prob.status in ("optimal", "optimal_inaccurate")
-            except (cp.error.SolverError, ValueError):      # ValueError: NaN/Inf in the problem data
-                ok = False
-            if not ok:
-                eta /= ETA_SHRINK
-                cap /= 2.0          # PTR: retry with a smaller step (it used to retry the identical subproblem)
-                history.append({"iter": it, "eta": eta, "cap": cap, "event": "subproblem_failed"})
-                if (cap if ALGORITHM == "ptr" else eta) < ETA_MIN:
-                    status = "solver_error"
-                    break
-                continue
-
-            zv = zbar + zs * dz.value
-            X_new = zv[:N * nx].reshape(N, nx)
-            U_new = zv[N * nx:N * (nx + nu)].reshape(N, nu)
-            s_new = float(zv[isg])
-            L_new = float(L_expr.value)
-            J_new, def_new, viol_new = self.merit(env, X_new, U_new, s_new)
-            if not np.isfinite(J_new):
-                # the nonlinear dynamics blew up along the proposed trajectory: keep the current
-                # iterate and try again with a smaller step
-                cap /= 2.0
-                eta /= ETA_SHRINK
-                history.append({"iter": it, "eta": eta, "cap": cap, "event": "rejected_nonfinite"})
-                if self.verbose:
-                    print(f"    it {it:2d}  step rejected: dynamics blew up (NaN/Inf); "
-                          f"step cap now {cap if ALGORITHM == 'ptr' else eta:.3g}")
-                if (cap if ALGORITHM == "ptr" else eta) < ETA_MIN:
-                    status = "nonfinite_step"
-                    break
-                continue
-            predicted, actual = J_bar - L_new, J_bar - J_new
-            rho = actual / predicted if predicted > 1e-12 else 1.0
-            rec = {"iter": it, "J": J_new, "L": L_new, "flight_time": s_new,
-                   "max_defect": def_new, "max_violation": viol_new,
-                   "rho": rho, "eta": eta, "n_obstacle_rows": int(len(rc))}
-
-            step = max(np.max(np.abs(X_new - X_bar) / self.xs), np.max(np.abs(U_new - U_bar) / self.us),
-                       abs(s_new - s_bar) / s_bar)
-            rec["step"] = float(step)
-            if ALGORITHM == "ptr":
-                cap = min(2.0 * cap, TRUST_CAP)              # regrow after a good step
-                improvement = J_bar - J_new
-                X_bar, U_bar, s_bar, J_bar, def_bar, viol_bar = X_new, U_new, s_new, J_new, def_new, viol_new
-                rec["event"] = "accepted"
-                history.append(rec)
-                if self.verbose:
-                    print(f"    it {it:2d}  J {J_new:10.3f}  tf {s_new:6.1f}s  defect {def_new:.1e}  "
-                          f"viol {viol_new:.1e}  step {step:.1e}")
-                small = step <= TOL_STEP or 0 <= improvement <= TOL_DECREASE_ABS + TOL_DECREASE_REL * abs(J_new)
-                if small and def_new <= TOL_DEFECT and viol_new <= TOL_VIOLATION:
-                    rec["event"] = "converged"
-                    converged = True
-                    break
-                continue
-
-            if predicted <= TOL_DECREASE_ABS + TOL_DECREASE_REL * abs(J_bar) or step <= TOL_STEP:
-                if J_new <= J_bar:
-                    X_bar, U_bar, s_bar, J_bar, def_bar, viol_bar = X_new, U_new, s_new, J_new, def_new, viol_new
-                rec["event"] = "converged"
-                history.append(rec)
-                converged = True
-                break
-            if rho < RHO_0:
-                eta /= ETA_SHRINK
-                rec["event"] = "rejected"
-            else:
-                X_bar, U_bar, s_bar, J_bar, def_bar, viol_bar = X_new, U_new, s_new, J_new, def_new, viol_new
-                if rho < RHO_1:
-                    eta /= ETA_SHRINK
-                elif rho >= RHO_2:
-                    eta = min(eta * ETA_GROW, ETA_MAX)
-                rec["event"] = "accepted"
-            history.append(rec)
-            if self.verbose:
-                print(f"    it {it:2d}  J {J_new:10.3f}  tf {s_new:6.1f}s  defect {def_new:.1e}  "
-                      f"viol {viol_new:.1e}  rho {rho:6.2f}  eta {eta:.3f}  {rec['event']}")
-            if eta < ETA_MIN:
-                status = "trust_region_collapsed"
-                break
-
-        # ---- classify and verify -------------------------------------------
-        dense = self.propagate(X_bar, U_bar, s_bar, DENSE_STEPS, sens=False)
-        margin = float(self.obstacle_eval(env, self.check_points(X_bar, dense))[0].min())
-        dense_tol = DENSE_TOLERANCE if DENSE_TOLERANCE is not None else 0.25 * env.margin
-        feasible = def_bar <= TOL_DEFECT and viol_bar <= TOL_VIOLATION
-        if feasible and margin < -dense_tol:
-            status = "dense_check_failed"
-        elif feasible:
-            # a dynamically feasible, collision-free trajectory; if SCP stopped
-            # early (e.g. trust region collapsed) it may not be fully optimal
-            status = "feasible" if converged else "feasible_unconverged"
-        elif converged:
-            status = "converged_infeasible"
-        return SolveResult(status.startswith("feasible"), status, it, time.perf_counter() - t0, s_bar,
-                           self.cost(X_bar, U_bar, s_bar), def_bar, viol_bar, margin, X_bar, U_bar, history)
 
 
 # --------------------------------------------------------------------------

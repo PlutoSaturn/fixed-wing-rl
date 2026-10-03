@@ -124,6 +124,12 @@ FINAL_LEVEL       = False                # require gamma = 0 at the goal
 
 # ---- discretization ------------------------------------------------------
 N_NODES           = 40
+MAX_INTERVAL_S    = 4.5                  # s; long flights get more nodes so no interval is longer
+                                         #   than this (None = always N_NODES). Inside an interval
+                                         #   only the controls are interpolated, and over ~8 s or
+                                         #   more a single solver step can make the climb angle and
+                                         #   speed run away (V -> 0, gamma -> 90 deg) between nodes,
+                                         #   which turns the dynamics into NaN/Inf.
 RK4_STEPS         = 6                    # integration substeps per interval;
                                          #   obstacles are checked at each one
 SIGMA_BOUNDS      = (1.0, 3600.0)        # flight time bounds, s
@@ -139,7 +145,7 @@ W_SMOOTH          = 1.0                  # on sum ||(u_{k+1} - u_k) / u_scale||^
 #         faster and more smoothly.
 # "scvx": hard trust region |dz| <= eta, with accept/reject ratio test.
 ALGORITHM         = "ptr"
-W_TRUST           = 1.0                  # ptr: weight on the squared scaled step
+W_TRUST           = 0.03                  # ptr: weight on the squared scaled step
 TRUST_CAP         = 0.5                  # ptr: hard cap on the scaled step
 
 # ---- SCvx parameters -----------------------------------------------------
@@ -153,10 +159,10 @@ ETA_MAX           = 2.0
 ETA_SHRINK        = 2.0
 ETA_GROW          = 2.0
 RHO_0, RHO_1, RHO_2 = 0.0, 0.25, 0.7
-MAX_ITERS         = 60
-TOL_DECREASE_ABS  = 1e-3
+MAX_ITERS         = 150
+TOL_DECREASE_ABS  = 1e-5
 TOL_DECREASE_REL  = 1e-3
-TOL_STEP          = 1e-3                 # also stop when the scaled step is this small
+TOL_STEP          = 1e-4                 # also stop when the scaled step is this small
 TOL_DEFECT        = 1e-3                 # max scaled dynamics defect for success
 TOL_VIOLATION     = 1e-2                 # max obstacle violation for success, m
 PRUNE_BUFFER      = None                 # m, extra reach when pruning (None = POS_SCALE / 4)
@@ -294,6 +300,15 @@ class AircraftSCP:
         self.verbose, self.n_starts = verbose, n_starts
         self.xs = np.array([POS_SCALE] * 3 + [V_MAX - V_MIN, 1.0, 1.0])   # state scales
         self.us = np.array([T_MAX + THRUST_SLOPE * V_MAX, N_MAX, N_MAX])   # control scales
+        self.n_nodes = N_NODES
+
+    def nodes_for(self, env):
+        """N_NODES, raised for long flights so the straight-line flight time
+        divided by the number of intervals stays at or below MAX_INTERVAL_S."""
+        if MAX_INTERVAL_S is None:
+            return N_NODES
+        t_est = np.linalg.norm(env.goal_pos - env.start_pos) / V_CRUISE
+        return max(N_NODES, int(np.ceil(t_est / MAX_INTERVAL_S)) + 1)
 
     # ---- boundary conditions and guesses ----------------------------------
     def boundary(self, env):
@@ -322,13 +337,13 @@ class AircraftSCP:
     def _polyline_guess(self, pts, env):
         seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
         s_pts = np.r_[0.0, np.cumsum(seg)]
-        s_new = np.linspace(0.0, s_pts[-1], N_NODES)
+        s_new = np.linspace(0.0, s_pts[-1], self.n_nodes)
         p = np.stack([np.interp(s_new, s_pts, pts[:, k]) for k in range(3)], axis=1)
         d = np.gradient(p, axis=0)
         gam = np.clip(np.arctan2(d[:, 2], np.linalg.norm(d[:, :2], axis=1)),
                       -np.radians(GAMMA_MAX_DEG), np.radians(GAMMA_MAX_DEG))
         chi = np.unwrap(np.arctan2(d[:, 1], d[:, 0]))
-        x = np.column_stack([p, np.full(N_NODES, V_CRUISE), gam, chi])
+        x = np.column_stack([p, np.full(self.n_nodes, V_CRUISE), gam, chi])
         x[0] = self.boundary(env)[0]
         u = self.model.trim_controls(x)
         sigma = float(np.clip(s_pts[-1] / V_CRUISE, *SIGMA_BOUNDS))
@@ -401,16 +416,24 @@ class AircraftSCP:
                 + W_SMOOTH * float(np.sum((np.diff(U, axis=0) / self.us) ** 2)))
 
     def merit(self, env, X, U, sigma):
-        prop = self.propagate(X, U, sigma, RK4_STEPS, sens=False)
-        defect = np.abs((X[1:] - prop["x_end"]) / self.xs)
-        hn, _ = self.obstacle_eval(env, self.check_points(X, prop))
-        viol = np.maximum(0.0, -hn).max(axis=1)
-        J = self.cost(X, U, sigma) + LAMBDA_DYN * defect.sum() + LAMBDA_OBS * viol.sum() / POS_SCALE
+        """Nonlinear merit. If the dynamics blow up anywhere along the trajectory
+        (NaN/Inf), returns (inf, inf, inf) so the caller rejects the step."""
+        with np.errstate(all="ignore"):                  # a blown-up step is reported, not warned about
+            prop = self.propagate(X, U, sigma, RK4_STEPS, sens=False)
+            if not np.all(np.isfinite(prop["x_sub"])) or not np.all(np.isfinite(prop["x_end"])):
+                return np.inf, np.inf, np.inf
+            defect = np.abs((X[1:] - prop["x_end"]) / self.xs)
+            hn, _ = self.obstacle_eval(env, self.check_points(X, prop))
+            viol = np.maximum(0.0, -hn).max(axis=1)
+            J = self.cost(X, U, sigma) + LAMBDA_DYN * defect.sum() + LAMBDA_OBS * viol.sum() / POS_SCALE
+        if not np.isfinite(J):
+            return np.inf, np.inf, np.inf
         return J, float(defect.max()), float(viol.max())
 
     # ---- main entry point --------------------------------------------------
     def solve(self, env: Environment) -> SolveResult:
         t0 = time.perf_counter()
+        self.n_nodes = self.nodes_for(env)
         best, attempts = None, []
         for guess in self.initial_guesses(env):
             res = self._solve_from(env, guess)
@@ -425,7 +448,7 @@ class AircraftSCP:
 
     def _solve_from(self, env, guess):
         t0 = time.perf_counter()
-        N, nx, nu = N_NODES, 6, 3
+        N, nx, nu = self.n_nodes, 6, 3
         nz = N * nx + N * nu + 1                     # z = [vec(X), vec(U), sigma]
         ix = lambda k: k * nx
         iu = lambda k: N * nx + k * nu
@@ -436,6 +459,7 @@ class AircraftSCP:
         X_bar, U_bar, s_bar = guess
         J_bar, def_bar, viol_bar = self.merit(env, X_bar, U_bar, s_bar)
         eta, history, status, converged = ETA_INIT, [], "max_iterations", False
+        cap = TRUST_CAP            # PTR step cap; halved when a step is rejected, regrows after accepted ones
 
         tanb = np.tan(np.radians(BANK_MAX_DEG))
         gmax = np.radians(GAMMA_MAX_DEG)
@@ -463,7 +487,7 @@ class AircraftSCP:
                     cp.norm(U[:, 1:], 2, axis=1) <= N_MAX,
                     cp.abs(U[:, 2]) <= tanb * U[:, 1],
                     sig >= SIGMA_BOUNDS[0], sig <= SIGMA_BOUNDS[1],
-                    cp.abs(dz) <= (TRUST_CAP if ALGORITHM == "ptr" else eta)]   # trust region
+                    cp.abs(dz) <= (cap if ALGORITHM == "ptr" else eta)]   # trust region
             if FINAL_LEVEL:
                 cons.append(X[-1, 4] == 0)
             # control rate limits: |u_{k+1} - u_k| <= rate * dt, with dt = sigma / (N - 1)
@@ -499,7 +523,7 @@ class AircraftSCP:
             P_bar = self.check_points(X_bar, prop)
             C = len(P_bar)
             hn, G = self.obstacle_eval(env, P_bar)
-            reach = np.sqrt(3) * (TRUST_CAP if ALGORITHM == "ptr" else eta) * POS_SCALE + PRUNE_BUFFER
+            reach = np.sqrt(3) * (cap if ALGORITHM == "ptr" else eta) * POS_SCALE + PRUNE_BUFFER
             rc, rm = np.nonzero(hn <= reach)
             slack = cp.Variable(C, nonneg=True)
             if len(rc):
@@ -536,12 +560,13 @@ class AircraftSCP:
             try:
                 prob.solve(solver=SOLVER, canon_backend=cp.SCIPY_CANON_BACKEND)
                 ok = prob.status in ("optimal", "optimal_inaccurate")
-            except cp.error.SolverError:
+            except (cp.error.SolverError, ValueError):      # ValueError: NaN/Inf in the problem data
                 ok = False
             if not ok:
                 eta /= ETA_SHRINK
-                history.append({"iter": it, "eta": eta, "event": "subproblem_failed"})
-                if eta < ETA_MIN:
+                cap /= 2.0          # PTR: retry with a smaller step (it used to retry the identical subproblem)
+                history.append({"iter": it, "eta": eta, "cap": cap, "event": "subproblem_failed"})
+                if (cap if ALGORITHM == "ptr" else eta) < ETA_MIN:
                     status = "solver_error"
                     break
                 continue
@@ -552,6 +577,19 @@ class AircraftSCP:
             s_new = float(zv[isg])
             L_new = float(L_expr.value)
             J_new, def_new, viol_new = self.merit(env, X_new, U_new, s_new)
+            if not np.isfinite(J_new):
+                # the nonlinear dynamics blew up along the proposed trajectory: keep the current
+                # iterate and try again with a smaller step
+                cap /= 2.0
+                eta /= ETA_SHRINK
+                history.append({"iter": it, "eta": eta, "cap": cap, "event": "rejected_nonfinite"})
+                if self.verbose:
+                    print(f"    it {it:2d}  step rejected: dynamics blew up (NaN/Inf); "
+                          f"step cap now {cap if ALGORITHM == 'ptr' else eta:.3g}")
+                if (cap if ALGORITHM == "ptr" else eta) < ETA_MIN:
+                    status = "nonfinite_step"
+                    break
+                continue
             predicted, actual = J_bar - L_new, J_bar - J_new
             rho = actual / predicted if predicted > 1e-12 else 1.0
             rec = {"iter": it, "J": J_new, "L": L_new, "flight_time": s_new,
@@ -562,6 +600,7 @@ class AircraftSCP:
                        abs(s_new - s_bar) / s_bar)
             rec["step"] = float(step)
             if ALGORITHM == "ptr":
+                cap = min(2.0 * cap, TRUST_CAP)              # regrow after a good step
                 improvement = J_bar - J_new
                 X_bar, U_bar, s_bar, J_bar, def_bar, viol_bar = X_new, U_new, s_new, J_new, def_new, viol_new
                 rec["event"] = "accepted"
@@ -711,7 +750,7 @@ def main():
           f"(up to {solver.n_starts} starts each)")
     for i, env in enumerate(envs):
         res = solver.solve(env)
-        print(f"  env {i:3d}  fill {env.metrics.get('occupancy_fraction', float('nan')):5.1%}  "
+        print(f"  env {i:3d}  nodes {len(res.x):3d}  fill {env.metrics.get('occupancy_fraction', float('nan')):5.1%}  "
               f"{res.status:24s} start {len(res.attempts)}  iters {res.iterations:2d}  "
               f"{res.solve_time:6.1f}s  flight {res.flight_time:6.1f}s  margin {res.dense_min_margin:+.2f}")
         results.append({"env_index": i, "env_file": args.envs, "env_fingerprint": env.fingerprint(),

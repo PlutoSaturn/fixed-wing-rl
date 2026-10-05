@@ -283,7 +283,7 @@ class Reference:
     """Dense, time-indexed reference from an scp_aircraft result."""
 
     def __init__(self, res, steps=20):
-        from scp_aircraft import AircraftSCP
+        from solvers.scp_aircraft import AircraftSCP
         solver = AircraftSCP()
         X, U, tf = np.array(res["x"]), np.array(res["u"]), res["flight_time"]
         dense = solver.propagate(X, U, tf, steps, sens=False)
@@ -424,7 +424,7 @@ def evaluate(env, log, t_plan):
 # --------------------------------------------------------------------------
 def plot_tracking(env, log, title=""):
     import matplotlib.pyplot as plt
-    from envgen import plot_environment
+    from benchmarks.envgen import plot_environment
 
     ax = plot_environment(env)
     ax.plot(*log["p_ref"].T, "k--", lw=1.5, label="plan (SCP)")
@@ -500,7 +500,7 @@ def _box_mesh(lo, hi):
 
 def obstacle_meshes(env, segments=MESH_SEGMENTS, floor=None):
     """(name, vertices, faces) for every obstacle, in the local ENU frame, metres."""
-    from envgen import clip_polytope
+    from benchmarks.envgen import clip_polytope
     floor = env.bounds_lo[2] if floor is None else floor
     out = []
     for i, o in enumerate(env.obstacles):
@@ -664,7 +664,7 @@ def export_flightgear_scenery(env, out_dir):
 def _load_checked(envs_file, results_file, index):
     """Load an environment and its SCP plan, verifying they belong together and
     that the plan itself is collision-free before anything is flown."""
-    from scp_aircraft import load_plan, plan_clearance
+    from solvers.scp_aircraft import load_plan, plan_clearance
     env, r, res = load_plan(envs_file, results_file, index)
     if not r["success"]:
         raise SystemExit(f"Environment {index} has no feasible SCP plan in {results_file} "
@@ -690,7 +690,7 @@ def flightgear_args(env, res):
 
 def fgview(args):
     """Fly one environment in JSBSim, in real time, displayed in FlightGear."""
-    from envgen import load_environments
+    from benchmarks.envgen import load_environments
     env, r = _load_checked(args.envs, args.results, args.index)
     envs = {args.index: env}
     fg_args = flightgear_args(envs[args.index], r)
@@ -726,7 +726,7 @@ def fgview(args):
 def record(args):
     """Fly one environment and export everything for external rendering."""
     import os
-    from envgen import load_environments
+    from benchmarks.envgen import load_environments
     env, r = _load_checked(args.envs, args.results, args.index)
     envs = {args.index: env}
     out_dir = args.out_dir or f"flight_env{args.index}"
@@ -795,7 +795,7 @@ def main():
         record(args)
         return
 
-    from envgen import load_environments
+    from benchmarks.envgen import load_environments
     envs = load_environments(args.envs)
     with open(args.results) as f:
         results = json.load(f)

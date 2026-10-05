@@ -42,7 +42,7 @@ import os
 
 import numpy as np
 
-from envgen import Cylinder, Environment, load_environments, save_environments
+from benchmarks.envgen import Cylinder, Environment, load_environments, save_environments
 
 NM = 1852.0                       # metres per nautical mile
 FT = 0.3048
@@ -178,7 +178,7 @@ def path_length(P):
 
 def scp_path(result, steps=40):
     """Dense positions of an SCP plan, integrated with the planner's own model."""
-    from scp_aircraft import AircraftSCP
+    from solvers.scp_aircraft import AircraftSCP
     solver = AircraftSCP()
     X, U = np.array(result["x"]), np.array(result["u"])
     dense = solver.propagate(X, U, result["flight_time"], steps, sens=False)

@@ -60,7 +60,7 @@ import cvxpy as cp
 import numpy as np
 from scipy.linalg import expm
 
-import scp_aircraft as scp
+import solvers.scp_aircraft as scp
 
 # ---- problem settings (Kelly 2017 / Dymos) -------------------------------------
 M_CART, M_POLE, L_POLE, GRAVITY = 1.0, 0.3, 0.5, 9.81

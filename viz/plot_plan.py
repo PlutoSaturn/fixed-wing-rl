@@ -1,8 +1,8 @@
 import json, sys
 from types import SimpleNamespace
 import numpy as np
-from envgen import load_environments
-from scp_aircraft import AircraftSCP, plot_result
+from benchmarks.envgen import load_environments
+from solvers.scp_aircraft import AircraftSCP, plot_result
 
 env_file = "c172_envs.json"
 results_file = "scp_aircraft_results.json"

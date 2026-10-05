@@ -81,7 +81,7 @@ import cvxpy as cp
 import numpy as np
 import scipy.sparse as sp
 
-from envgen import Environment, load_environments, save_environments
+from benchmarks.envgen import Environment, load_environments, save_environments
 
 
 # ==========================================================================
@@ -775,7 +775,7 @@ def plan_clearance(env, res, solver=None, steps=40):
 
 def plot_result(env, res, solver):
     import matplotlib.pyplot as plt
-    from envgen import plot_environment
+    from benchmarks.envgen import plot_environment
 
     dense = solver.propagate(res.x, res.u, res.flight_time, 20, sens=False)
     P = solver.check_points(res.x, dense)

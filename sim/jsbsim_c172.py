@@ -14,7 +14,7 @@ Four commands:
               closely the aircraft followed the plan and whether the flown
               path stayed clear of the obstacles.
 
-  record N    Flies environment N and writes, to flight_envN/, the JSBSim
+  record N    Flies environment N and writes, to localstore/flight_envN/, the JSBSim
               control commands and aircraft state (CSV), the SCP plan (CSV),
               and the environment as an OBJ mesh plus JSON, for rendering in
               an external program.
@@ -66,16 +66,25 @@ import time
 
 import numpy as np
 
+from environment.envgen import find_input, localstore_path, project_root
+
 
 # ==========================================================================
 # USER SETTINGS
 # ==========================================================================
 
 # ---- files ---------------------------------------------------------------
-PARAMS_FILE        = "c172_params.json"            # written by `calibrate`
+# Every file and folder below except the airframe parameters (PARAMS_DIR) is read
+# from / written to the project's localstore folder (fixed-wing-rl/localstore,
+# see LOCALSTORE_DIR in environment/envgen.py),
+# including record's flight_envN/ folders, the FlightGear .bat files and the
+# FlightGear obstacle scenery. Absolute paths are used as given.
+PARAMS_FILE        = "c172_params.json"            # written by `calibrate`, into PARAMS_DIR
+PARAMS_DIR         = "aircraftmodel"               # fixed-wing-rl/aircraftmodel, where scp_aircraft.py reads it
 ENV_FILE           = "c172_envs.json"
 SCP_RESULTS_FILE   = "scp_aircraft_results.json"
 TRACK_RESULTS_FILE = "c172_tracking.json"
+JSBSIM_LOG_DIR     = "jsbsim_logs"                  # JSBSim's own per-flight CSV log (overwritten each run)
 
 # ---- simulation ------------------------------------------------------------
 AIRCRAFT           = "c172x"
@@ -134,7 +143,7 @@ FG_PORT            = 5550              # UDP port FlightGear listens on
 FG_RATE_HZ         = 60                # packets per second sent to FlightGear
 FG_AIRCRAFT        = "c172p"           # FlightGear's Cessna 172 (visual model only)
 FG_EXE             = r"C:\Program Files\FlightGear 2024.1\bin\fgfs.exe"   # for the .bat file
-FG_SCENERY_DIR     = "fg_scenery"      # obstacle scenery is written here (one subfolder per environment)
+FG_SCENERY_DIR     = "fg_scenery"      # obstacle scenery folder in localstore (one subfolder per environment)
 FG_SHOW_OBSTACLES  = True
 FG_CYLINDER_EXTEND_DOWN_M = 400.0      # extend pillars below the workspace floor to reach the terrain
 FG_OBSTACLE_SEGMENTS = 24              # mesh resolution of curved obstacles
@@ -151,6 +160,10 @@ def make_fdm():
     import jsbsim
     fdm = jsbsim.FGFDMExec(None)
     fdm.set_debug_level(0)
+    # the c172x model logs every flight to JSBout172B.csv; keep that in localstore, not the cwd
+    log_dir = localstore_path(JSBSIM_LOG_DIR)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    fdm.set_output_path(str(log_dir))
     with contextlib.redirect_stdout(io.StringIO()):
         fdm.load_model(AIRCRAFT)
     return fdm
@@ -263,6 +276,12 @@ def calibrate(out_file=PARAMS_FILE):
                       "stall_speed_ms": float(v_stall), "trim_sweep": rows,
                       "thrust_sweep": {"V_ms": Vs, "T_N": Ts}},
     }
+    from pathlib import Path
+    out_file = Path(out_file)
+    if not out_file.is_absolute():
+        base = Path(PARAMS_DIR) if Path(PARAMS_DIR).is_absolute() else project_root() / PARAMS_DIR
+        out_file = base / out_file
+    out_file.parent.mkdir(parents=True, exist_ok=True)
     with open(out_file, "w") as f:
         json.dump(params, f, indent=2)
     R = params["V_CRUISE"] ** 2 / (9.81 * np.tan(np.radians(PLAN_BANK_MAX_DEG)))
@@ -424,7 +443,7 @@ def evaluate(env, log, t_plan):
 # --------------------------------------------------------------------------
 def plot_tracking(env, log, title=""):
     import matplotlib.pyplot as plt
-    from benchmarks.envgen import plot_environment
+    from environment.envgen import plot_environment
 
     ax = plot_environment(env)
     ax.plot(*log["p_ref"].T, "k--", lw=1.5, label="plan (SCP)")
@@ -500,7 +519,7 @@ def _box_mesh(lo, hi):
 
 def obstacle_meshes(env, segments=MESH_SEGMENTS, floor=None):
     """(name, vertices, faces) for every obstacle, in the local ENU frame, metres."""
-    from benchmarks.envgen import clip_polytope
+    from environment.envgen import clip_polytope
     floor = env.bounds_lo[2] if floor is None else floor
     out = []
     for i, o in enumerate(env.obstacles):
@@ -690,18 +709,19 @@ def flightgear_args(env, res):
 
 def fgview(args):
     """Fly one environment in JSBSim, in real time, displayed in FlightGear."""
-    from benchmarks.envgen import load_environments
+    from environment.envgen import load_environments
     env, r = _load_checked(args.envs, args.results, args.index)
     envs = {args.index: env}
     fg_args = flightgear_args(envs[args.index], r)
     if FG_SHOW_OBSTACLES:
         import os
         scen = export_flightgear_scenery(envs[args.index],
-                                         os.path.join(FG_SCENERY_DIR, f"env{args.index}"))
+                                         str(localstore_path(os.path.join(FG_SCENERY_DIR,
+                                                                          f"env{args.index}"))))
         fg_args.insert(0, f'--fg-scenery="{scen}"')
         print(f"Wrote {len(envs[args.index].obstacles)} obstacles as FlightGear scenery in {scen}\n")
-    bat = f"start_flightgear_env{args.index}.bat"
-    with open(bat, "w") as f:
+    bat = localstore_path(f"start_flightgear_env{args.index}.bat")
+    with open(bat, "w", newline="\r\n") as f:          # Windows line endings
         f.write(f'"{FG_EXE}" ' + " ".join(fg_args) + "\n")
     print("1. Start FlightGear with these options, either by running", bat)
     print("   (check FG_EXE points at your fgfs.exe), or by pasting them into the")
@@ -726,10 +746,10 @@ def fgview(args):
 def record(args):
     """Fly one environment and export everything for external rendering."""
     import os
-    from benchmarks.envgen import load_environments
+    from environment.envgen import load_environments
     env, r = _load_checked(args.envs, args.results, args.index)
     envs = {args.index: env}
-    out_dir = args.out_dir or f"flight_env{args.index}"
+    out_dir = str(localstore_path(args.out_dir or f"flight_env{args.index}"))
     env = envs[args.index]
     print(f"Flying environment {args.index} in JSBSim ...")
     log = fly(env, r)
@@ -743,7 +763,7 @@ def record(args):
           f"min clearance {ev['min_clearance_m']:.1f} m")
     export_obj(env, os.path.join(out_dir, "environment.obj"))
     export_plan_csv(r, os.path.join(out_dir, "scp_plan.csv"))
-    print(f"  wrote {out_dir}/")
+    print(f"  wrote {out_dir}")
     for name, what in (("jsbsim_commands.csv", "JSBSim control commands + aircraft state, 10 Hz"),
                        ("scp_plan.csv", "planned trajectory, densely sampled"),
                        ("environment.obj", "obstacle meshes + workspace box (metres, ENU, Z up)"),
@@ -795,9 +815,9 @@ def main():
         record(args)
         return
 
-    from benchmarks.envgen import load_environments
+    from environment.envgen import load_environments
     envs = load_environments(args.envs)
-    with open(args.results) as f:
+    with open(find_input(args.results)) as f:
         results = json.load(f)
     out = []
     print(f"Flying {sum(r['success'] for r in results)} feasible SCP trajectories in JSBSim ({AIRCRAFT})")
@@ -825,10 +845,11 @@ def main():
         out.append({"env_index": i, "status": "flown", **ev})
         if args.plot == i:
             plot_tracking(envs[i], log, f"environment {i}")
-    with open(args.out, "w") as f:
+    out_path = localstore_path(args.out)
+    with open(out_path, "w") as f:
         json.dump(out, f, indent=2)
     n_ok = sum(o.get("collision_free", False) for o in out)
-    print(f"\n{n_ok}/{len(out)} flown collision-free. Results -> {args.out}")
+    print(f"\n{n_ok}/{len(out)} flown collision-free. Results -> {out_path}")
 
 
 if __name__ == "__main__":

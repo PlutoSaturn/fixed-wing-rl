@@ -60,6 +60,12 @@ velocities are ignored.
 
 Cost: W_TIME * flight time + W_SMOOTH * sum ||(u_{k+1} - u_k) / u_scale||^2.
 
+Early stopping (PTR): a start is abandoned when it stays infeasible without
+meaningful progress for STALL_WINDOW iterations; a feasible trajectory is
+polished for at most POLISH_ITERS iterations, or until the cost stops
+improving over COST_WINDOW iterations. RK4 substeps scale with the interval
+length (MAX_SUBSTEP_S) so the propagation stays numerically stable.
+
 Environments must be at aircraft scale. For the default airframe (turn
 radius about 13 m) try:
     python envgen.py --size 400 400 120 --vehicle-radius 1 --margin 2 \
@@ -81,7 +87,8 @@ import cvxpy as cp
 import numpy as np
 import scipy.sparse as sp
 
-from benchmarks.envgen import Environment, load_environments, save_environments
+from environment.envgen import (Environment, find_input, load_environments, localstore_dir,
+                               localstore_path, project_root, save_environments)
 
 
 # ==========================================================================
@@ -89,6 +96,10 @@ from benchmarks.envgen import Environment, load_environments, save_environments
 # ==========================================================================
 
 # ---- files ---------------------------------------------------------------
+# Relative names are read from and written to the project's localstore folder
+# (fixed-wing-rl/localstore, see LOCALSTORE_DIR in environment/envgen.py), except
+# the airframe file, which is read from AIRFRAME_DIR below. Absolute paths are
+# used as given.
 ENV_FILE          = "c172_envs.json"       # same default as jsbsim_c172.py
 RESULTS_FILE      = "scp_aircraft_results.json"
 FEASIBLE_FILE     = "feasible_envs_aircraft.json"
@@ -100,7 +111,8 @@ VERBOSE           = False
 # If AIRFRAME_FILE exists, its values override the airframe and scale
 # settings below (e.g. the Cessna 172 file written by
 # `python jsbsim_c172.py calibrate`). Otherwise the generic UAV below is used.
-AIRFRAME_FILE     = "c172_params.json"
+AIRFRAME_FILE     = "c172_params.json"    # read from AIRFRAME_DIR
+AIRFRAME_DIR      = "aircraftmodel"       # folder in the project root (fixed-wing-rl/aircraftmodel)
 
 MASS              = 3.0                  # kg
 WING_AREA         = 0.5                  # m^2
@@ -130,8 +142,12 @@ MAX_INTERVAL_S    = 4.5                  # s; long flights get more nodes so no 
                                          #   more a single solver step can make the climb angle and
                                          #   speed run away (V -> 0, gamma -> 90 deg) between nodes,
                                          #   which turns the dynamics into NaN/Inf.
-RK4_STEPS         = 6                    # integration substeps per interval;
+RK4_STEPS         = 6                    # minimum integration substeps per interval;
                                          #   obstacles are checked at each one
+MAX_SUBSTEP_S     = 0.75                 # s; more substeps are used when an interval is long, so
+                                         #   one RK4 step never spans more than this (None = off).
+                                         #   Too-long RK4 steps are what make the dynamics blow up.
+MAX_RK4_STEPS     = 24                   # upper limit on substeps per interval
 SIGMA_BOUNDS      = (1.0, 3600.0)        # flight time bounds, s
 
 # ---- cost ------------------------------------------------------------------
@@ -160,9 +176,20 @@ ETA_SHRINK        = 2.0
 ETA_GROW          = 2.0
 RHO_0, RHO_1, RHO_2 = 0.0, 0.25, 0.7
 MAX_ITERS         = 150
-TOL_DECREASE_ABS  = 1e-5
-TOL_DECREASE_REL  = 1e-3
-TOL_STEP          = 1e-4                 # also stop when the scaled step is this small
+
+# ---- early stopping (avoid iterations that no longer pay off) -------------
+STALL_WINDOW      = 10                   # if still infeasible and the violation + defect hasn't
+STALL_IMPROVEMENT = 0.05                 #   dropped by this fraction over this many iterations,
+                                         #   give up on this start and try the next initial guess
+POLISH_ITERS      = None                 # once feasible, at most this many more iterations to
+                                         #   improve the cost (0 = stop at the first feasible
+                                         #   trajectory, None = no limit)
+COST_WINDOW       = 10                   # once feasible, also stop if the cost improved by less
+COST_IMPROVEMENT  = 1e-4                 #   than this fraction over the last COST_WINDOW iterations
+BLOWUP_DEFECT     = 1e4                  # scaled defect above this counts as a blow-up even if finite
+TOL_DECREASE_ABS  = 1e-6
+TOL_DECREASE_REL  = 1e-5                 # single-iteration relative improvement
+TOL_STEP          = 1e-5                 # also stop when the scaled step is this small
 TOL_DEFECT        = 1e-3                 # max scaled dynamics defect for success
 TOL_VIOLATION     = 1e-2                 # max obstacle violation for success, m
 PRUNE_BUFFER      = None                 # m, extra reach when pruning (None = POS_SCALE / 4)
@@ -170,7 +197,9 @@ PRUNE_BUFFER      = None                 # m, extra reach when pruning (None = P
                                          #    step into one is corrected next iteration)
 
 # ---- restarts ------------------------------------------------------------
-N_STARTS          = 5                    # 1 = straight-line guess only
+N_STARTS          = 10                   # 1 = straight-line guess only
+PICK_BEST_START   = True                 # True: run every start and keep the lowest-cost valid
+                                         #   trajectory; False: stop at the first valid one
 VIA_OFFSET        = (0.1, 0.4)           # via-point offset / start-goal distance
 RESTART_SEED      = 0
 
@@ -184,16 +213,29 @@ SOLVER            = "CLARABEL"
 def _load_airframe():
     """Apply AIRFRAME_FILE overrides, then fill in automatic scale settings."""
     import os
+    from pathlib import Path
     g = globals()
-    if AIRFRAME_FILE and os.path.exists(AIRFRAME_FILE):
-        with open(AIRFRAME_FILE) as f:
+    path = None
+    airframe_dir = Path(AIRFRAME_DIR) if Path(AIRFRAME_DIR).is_absolute() else project_root() / AIRFRAME_DIR
+    if AIRFRAME_FILE:
+        cand = Path(AIRFRAME_FILE)
+        if not cand.is_absolute():
+            cand = airframe_dir / AIRFRAME_FILE                # fixed-wing-rl/aircraftmodel/...
+        if cand.is_file():
+            path = str(cand)
+    if path:
+        with open(path) as f:
             params = json.load(f)
         for k, v in params.items():
             if k.isupper():
                 g[k] = tuple(v) if isinstance(v, list) else v
-        g["AIRFRAME_NAME"] = params.get("name", AIRFRAME_FILE)
+        g["AIRFRAME_NAME"] = params.get("name", path)
     else:
         g["AIRFRAME_NAME"] = "generic small UAV"
+        if AIRFRAME_FILE:
+            warnings.warn(f"AIRFRAME_FILE '{AIRFRAME_FILE}' not found in {airframe_dir}; "
+                          f"using the generic small UAV. "
+                          f"Results on C172-scale environments will be meaningless.", stacklevel=2)
     if g["POS_SCALE"] is None:
         g["POS_SCALE"] = g["V_CRUISE"] ** 2 / (g["GRAVITY"] * np.tan(np.radians(g["BANK_MAX_DEG"])))
     if g["PRUNE_BUFFER"] is None:
@@ -278,13 +320,15 @@ class SolveResult:
     x: np.ndarray
     u: np.ndarray
     history: list = field(default_factory=list)
-    attempts: list = field(default_factory=list)
+    attempts: list = field(default_factory=list)        # status of each start
+    attempt_costs: list = field(default_factory=list)   # cost of each start's result (None if invalid)
+    best_start: int = -1                                # index of the start that was returned
 
     def to_dict(self):
         d = {k: getattr(self, k) for k in ("success", "status", "iterations", "solve_time",
                                             "flight_time", "cost", "max_defect",
                                             "max_violation", "dense_min_margin",
-                                            "history", "attempts")}
+                                            "history", "attempts", "attempt_costs", "best_start")}
         d["x"], d["u"] = self.x.tolist(), self.u.tolist()
         return d
 
@@ -342,6 +386,15 @@ class SCPSolver:
         raise NotImplementedError
 
     # ---- propagation -------------------------------------------------------
+    @staticmethod
+    def substeps(sigma, N):
+        """RK4 substeps per interval: RK4_STEPS, or more when the interval
+        (sigma / (N - 1) seconds) is long, so no step exceeds MAX_SUBSTEP_S."""
+        if MAX_SUBSTEP_S is None:
+            return RK4_STEPS
+        need = int(np.ceil(sigma / (N - 1) / MAX_SUBSTEP_S))
+        return int(min(max(RK4_STEPS, need), MAX_RK4_STEPS))
+
     def propagate(self, X, U, sigma, steps, sens=True):
         """Integrate every interval from its start node (multiple shooting).
         Returns end states, per-substep states (K, steps, nx) and, if sens,
@@ -391,14 +444,18 @@ class SCPSolver:
         return out
 
     # ---- merit ---------------------------------------------------------------
-    def merit(self, env, X, U, sigma):
+    def merit(self, env, X, U, sigma, steps=None):
         """Nonlinear merit. If the dynamics blow up anywhere along the trajectory
-        (NaN/Inf), returns (inf, inf, inf) so the caller rejects the step."""
+        (NaN/Inf, or a defect so large it can only be a blow-up), returns
+        (inf, inf, inf) so the caller rejects the step."""
+        steps = steps or self.substeps(sigma, len(X))
         with np.errstate(all="ignore"):                  # a blown-up step is reported, not warned about
-            prop = self.propagate(X, U, sigma, RK4_STEPS, sens=False)
+            prop = self.propagate(X, U, sigma, steps, sens=False)
             if not np.all(np.isfinite(prop["x_sub"])) or not np.all(np.isfinite(prop["x_end"])):
                 return np.inf, np.inf, np.inf
             defect = np.abs((X[1:] - prop["x_end"]) / self.xs)
+            if defect.max() > BLOWUP_DEFECT:
+                return np.inf, np.inf, np.inf
             if self.uses_obstacles:
                 hn, _ = self.obstacle_eval(env, self.check_points(X, prop))
                 viol = np.maximum(0.0, -hn).max(axis=1)
@@ -414,16 +471,27 @@ class SCPSolver:
     def solve(self, env=None) -> SolveResult:
         t0 = time.perf_counter()
         self.n_nodes = self.nodes_for(env)
-        best, attempts = None, []
-        for guess in self.initial_guesses(env):
+        best, best_k, attempts, costs = None, -1, [], []
+        for k, guess in enumerate(self.initial_guesses(env)):
             res = self._solve_from(env, guess)
             attempts.append(res.status)
-            if best is None or res.success or \
-                    res.max_violation + res.max_defect < best.max_violation + best.max_defect:
-                best = res
-            if res.success:
+            costs.append(res.cost if res.success else None)
+            if self.verbose:
+                print(f"  start {k + 1}: {res.status}" + (f", cost {res.cost:.4f}" if res.success else ""))
+            if best is None:
+                better = True
+            elif res.success != best.success:
+                better = res.success                      # any valid result beats any invalid one
+            elif res.success:
+                better = res.cost < best.cost             # among valid ones: lowest cost
+            else:                                         # among invalid ones: least infeasible
+                better = res.max_violation + res.max_defect < best.max_violation + best.max_defect
+            if better:
+                best, best_k = res, k
+            if res.success and not PICK_BEST_START:
                 break
-        best.attempts, best.solve_time = attempts, time.perf_counter() - t0
+        best.attempts, best.attempt_costs, best.best_start = attempts, costs, best_k
+        best.solve_time = time.perf_counter() - t0
         return best
 
     def _solve_from(self, env, guess):
@@ -439,9 +507,15 @@ class SCPSolver:
         eta, history, status, converged = ETA_INIT, [], "max_iterations", False
         cap = TRUST_CAP            # PTR step cap; halved when a step is rejected, regrows after accepted ones
 
+        infeas_hist = []           # violation + defect per accepted iteration while infeasible
+        feasible_at = None         # iteration at which the trajectory first became feasible
+        cost_hist = []             # true cost per accepted feasible iteration
+        best_valid = None          # lowest-cost valid (feasible) iterate seen: (cost, X, U, sigma, defect, viol)
+
         it = 0
         for it in range(1, MAX_ITERS + 1):
-            prop = self.propagate(X_bar, U_bar, s_bar, RK4_STEPS, sens=True)
+            steps = self.substeps(s_bar, N)
+            prop = self.propagate(X_bar, U_bar, s_bar, steps, sens=True)
             zbar = np.r_[X_bar.ravel(), U_bar.ravel(), s_bar]
             # The subproblem is solved for the scaled step dz = (z - zbar) / zs,
             # which keeps the numbers the solver sees small and well conditioned.
@@ -492,7 +566,7 @@ class SCPSolver:
                     n_rows = G[rc, rm]                                   # (Kr, 3) unit normals
                     last = rc == C - 1                                   # final node rows
                     mid = ~last
-                    k, j = np.divmod(rc[mid], RK4_STEPS)                 # interval, substep
+                    k, j = np.divmod(rc[mid], steps)                     # interval, substep
                     r_mid = np.nonzero(mid)[0]
                     nm = n_rows[mid]
                     cx = np.einsum("ri,rij->rj", nm, prop["Phi_sub"][k, j][:, :3])      # (R, nx)
@@ -534,7 +608,7 @@ class SCPSolver:
             U_new = zv[N * nx:N * (nx + nu)].reshape(N, nu)
             s_new = float(zv[isg])
             L_new = float(L_expr.value)
-            J_new, def_new, viol_new = self.merit(env, X_new, U_new, s_new)
+            J_new, def_new, viol_new = self.merit(env, X_new, U_new, s_new, steps)
             if not np.isfinite(J_new):
                 # the nonlinear dynamics blew up along the proposed trajectory: keep the current
                 # iterate and try again with a smaller step
@@ -542,7 +616,7 @@ class SCPSolver:
                 eta /= ETA_SHRINK
                 history.append({"iter": it, "eta": eta, "cap": cap, "event": "rejected_nonfinite"})
                 if self.verbose:
-                    print(f"    it {it:2d}  step rejected: dynamics blew up (NaN/Inf); "
+                    print(f"    it {it:2d}  step rejected: dynamics blew up; "
                           f"step cap now {cap if ALGORITHM == 'ptr' else eta:.3g}")
                 if (cap if ALGORITHM == "ptr" else eta) < ETA_MIN:
                     status = "nonfinite_step"
@@ -567,10 +641,36 @@ class SCPSolver:
                     print(f"    it {it:2d}  J {J_new:10.3f}  tf {s_new:6.1f}s  defect {def_new:.1e}  "
                           f"viol {viol_new:.1e}  step {step:.1e}")
                 small = step <= TOL_STEP or 0 <= improvement <= TOL_DECREASE_ABS + TOL_DECREASE_REL * abs(J_new)
-                if small and def_new <= TOL_DEFECT and viol_new <= TOL_VIOLATION:
-                    rec["event"] = "converged"
-                    converged = True
-                    break
+                feas_now = def_new <= TOL_DEFECT and viol_new <= TOL_VIOLATION
+                if feas_now:
+                    if feasible_at is None:
+                        feasible_at = it
+                    infeas_hist = []           # stall detection only looks at the current infeasible stretch
+                    c_new = self.cost(X_new, U_new, s_new)
+                    if best_valid is None or c_new < best_valid[0]:
+                        best_valid = (c_new, X_new, U_new, s_new, def_new, viol_new)
+                    cost_hist.append(c_new)
+                    stalled_cost = (len(cost_hist) > COST_WINDOW and
+                                    cost_hist[-COST_WINDOW - 1] - cost_hist[-1]
+                                    <= COST_IMPROVEMENT * abs(cost_hist[-COST_WINDOW - 1]))
+                    polished = POLISH_ITERS is not None and it - feasible_at >= POLISH_ITERS
+                    if small or stalled_cost or polished:
+                        rec["event"] = "converged"
+                        converged = True
+                        break
+                else:
+                    cost_hist = []
+                    infeas_hist.append(def_new + viol_new / POS_SCALE)
+                    if len(infeas_hist) > STALL_WINDOW:
+                        old, new = infeas_hist[-STALL_WINDOW - 1], infeas_hist[-1]
+                        if new > (1 - STALL_IMPROVEMENT) * old:
+                            rec["event"] = "stalled"
+                            status = "stalled"
+                            if self.verbose:
+                                print(f"    stalled: violation + defect improved less than "
+                                      f"{STALL_IMPROVEMENT:.0%} over {STALL_WINDOW} iterations; "
+                                      f"moving to the next start")
+                            break
                 continue
 
             if predicted <= TOL_DECREASE_ABS + TOL_DECREASE_REL * abs(J_bar) or step <= TOL_STEP:
@@ -599,6 +699,15 @@ class SCPSolver:
                 break
 
         # ---- classify and verify -------------------------------------------
+        # Return the lowest-cost valid trajectory seen in this start, if it beats the last iterate
+        # (or the last iterate is invalid, e.g. after a stall or the iteration limit).
+        cur_valid = def_bar <= TOL_DEFECT and viol_bar <= TOL_VIOLATION
+        if best_valid is not None and (not cur_valid or best_valid[0] < self.cost(X_bar, U_bar, s_bar)):
+            # PTR accepts every step, so the last iterate isn't always the best one
+            _, X_bar, U_bar, s_bar, def_bar, viol_bar = best_valid
+            history.append({"iter": it, "event": "restored_best_valid"})
+            if self.verbose:
+                print(f"    returning the lowest-cost valid trajectory seen in this start")
         feasible = def_bar <= TOL_DEFECT and viol_bar <= TOL_VIOLATION
         if self.uses_obstacles:
             dense = self.propagate(X_bar, U_bar, s_bar, DENSE_STEPS, sens=False)
@@ -740,7 +849,7 @@ def load_plan(envs_file, results_file, index):
     plan with an environment it was not solved for."""
     from types import SimpleNamespace
     envs = load_environments(envs_file)
-    with open(results_file) as f:
+    with open(find_input(results_file)) as f:
         r = next((r for r in json.load(f) if r["env_index"] == index), None)
     if r is None:
         raise SystemExit(f"No result for environment {index} in {results_file}.")
@@ -775,7 +884,7 @@ def plan_clearance(env, res, solver=None, steps=40):
 
 def plot_result(env, res, solver):
     import matplotlib.pyplot as plt
-    from benchmarks.envgen import plot_environment
+    from environment.envgen import plot_environment
 
     dense = solver.propagate(res.x, res.u, res.flight_time, 20, sens=False)
     P = solver.check_points(res.x, dense)
@@ -826,18 +935,20 @@ def main():
     for i, env in enumerate(envs):
         res = solver.solve(env)
         print(f"  env {i:3d}  nodes {len(res.x):3d}  fill {env.metrics.get('occupancy_fraction', float('nan')):5.1%}  "
-              f"{res.status:24s} start {len(res.attempts)}  iters {res.iterations:2d}  "
+              f"{res.status:24s} best start {res.best_start + 1:2d}/{len(res.attempts)} "
+              f"({sum(c is not None for c in res.attempt_costs)} valid)  cost {res.cost:8.3f}  iters {res.iterations:3d}  "
               f"{res.solve_time:6.1f}s  flight {res.flight_time:6.1f}s  margin {res.dense_min_margin:+.2f}")
         results.append({"env_index": i, "env_file": args.envs, "env_fingerprint": env.fingerprint(),
                         "solver": solver.name, **res.to_dict()})
         if res.success:
             feasible.append(env)
 
-    with open(args.out, "w") as f:
+    out_path = localstore_path(args.out)
+    with open(out_path, "w") as f:
         json.dump(results, f)
-    save_environments(feasible, args.feasible_out)
-    print(f"\n{len(feasible)}/{len(envs)} feasible. Results -> {args.out}, "
-          f"feasible environments -> {args.feasible_out}")
+    feas_path = save_environments(feasible, args.feasible_out)
+    print(f"\n{len(feasible)}/{len(envs)} feasible.\n  results -> {out_path}\n"
+          f"  feasible environments -> {feas_path}")
     if args.plot is not None:
         plot_result(envs[args.plot], solver.solve(envs[args.plot]), solver)
 

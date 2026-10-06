@@ -2,3 +2,8 @@
 __pycache__/
 *.pyc
 .env
+*.env
+localstore/
+.json
+*.json
+.idea/

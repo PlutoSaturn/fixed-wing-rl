@@ -7,3 +7,4 @@ localstore/
 .json
 *.json
 .idea/
+supervised-learning-main/datasets/

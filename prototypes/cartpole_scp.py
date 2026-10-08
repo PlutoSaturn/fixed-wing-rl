@@ -44,12 +44,14 @@ Two baselines are printed:
            its convergence tolerance; J_N - J* is the discretization error,
            which shrinks as the node count grows.
 
-Usage (from the project folder)
-    python cartpole_scp.py                    # step 1: linear model vs exact solution
-    python cartpole_scp.py --plot             # ... and plot it (saves cartpole_check.png)
-    python cartpole_scp.py --nodes 81         # finer discretization
-    python cartpole_scp.py --model nonlinear  # step 2: full nonlinear equations
-    python cartpole_scp.py --reference        # print the exact solution only, no solve
+The swing-up (pendulum starting below the cart) is in cartpole_swingup.py.
+
+Usage (from the project root)
+    python -m prototypes.cartpole_scp                    # step 1: linear model vs exact solution
+    python -m prototypes.cartpole_scp --plot             # ... and plot it (saves localstore/cartpole_check.png)
+    python -m prototypes.cartpole_scp --nodes 81         # finer discretization
+    python -m prototypes.cartpole_scp --model nonlinear  # step 2: full nonlinear equations
+    python -m prototypes.cartpole_scp --reference        # print the exact solution only, no solve
 """
 from __future__ import annotations
 
@@ -300,8 +302,10 @@ def plot(t, X, U, ex, dc, res, args):
         a.set_xlabel("t [s]"); a.grid(alpha=0.3); a.legend(fontsize=8)
     fig.suptitle("Cart-pole: move 1 m in 2 s balanced upright. SCP vs. exact optimum")
     fig.tight_layout()
-    fig.savefig(args.save, dpi=130)
-    print(f"Plot saved to {args.save}")
+    from environment.envgen import localstore_path
+    path = localstore_path(args.save)                 # localstore/ is git-ignored
+    fig.savefig(path, dpi=130)
+    print(f"Plot saved to {path}")
     plt.show()
 
 

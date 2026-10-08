@@ -8,3 +8,4 @@ localstore/
 *.json
 .idea/
 supervised-learning-main/datasets/
+!aircraftmodel/c172_params.json

@@ -127,24 +127,17 @@ $$
 \sqrt{n_v^2 + n_h^2} \le c_{\text{stall}}\, V^2, \qquad c_{\text{stall}} = \frac{\rho S C_{L,\max}}{2mg}
 $$
  
-- **Thrust:** non-negative (no reverse thrust). Maximum thrust falls with speed, because the engine makes roughly constant power and power = thrust × speed.
-- **Load factor:** total lift at most 1.5 times the weight.
-- **Bank angle:** at most 30°; also forces $n_v \ge 0$ (lift never points down).
-- **Stall:** the lift requested cannot exceed what the wing can produce at the current speed.
-The stall constraint is nonconvex. At each iteration, $V^2$ is replaced by its tangent at the current speed $\bar V$:
- 
 $$
 \sqrt{n_v^2 + n_h^2} \le c_{\text{stall}}\,\big(2\bar V V - \bar V^2\big)
 $$
  
 **Approximations and reasoning:**
  
-- **Thrust is a straight-line fit:** measured at full throttle in JSBSim over 60–120 kt. Below 60 kt it's an extrapolation ($V_{\min}$ = 64 kt sits just inside the range).
-- **80% thrust:** the other 20% is held in reserve so the tracking autopilot can correct errors.
-- **Instant thrust response:** the real engine lags throttle changes, but the planner assumes thrust changes immediately and applies no rate limit to it.
-- **$n_{\max}$ and $\mu_{\max}$ are planning choices:** both are far inside the C172's real limits (3.8 g, and banks well beyond 30°). They keep maneuvers gentle and trackable.
-- **$C_{L,\max}$:** 85% of the highest trimmed lift coefficient measured, a margin below the true stall. It assumes flaps up.
-- **Stall linearization is conservative:** the tangent line lies below the parabola $V^2$, so the linearized limit is stricter than the true one. It can never allow a stall.
+- Thrust is a first order fit line, which needs to be changed to second order moving forward.
+- Thrust is limited at 80% of max, to leave room for the control system to make maneuvers, this can be optimized for later.
+- Control surface lag: Thrust can change instantly
+- $C_{L,\max}$ 85% of the highest trimmed lift coefficient measured, a margin below the true stall. It assumes flaps up.
+- Stall linearization is conservative - the tangent line lies below the parabola $V^2$, so the linearized limit is stricter than the true one. It can never allow a stall.
 ## 5. Control Rate Limits
  
 Between consecutive nodes $k$ and $k+1$, separated by $\Delta t = \sigma/(N-1)$:

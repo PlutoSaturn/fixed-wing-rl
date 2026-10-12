@@ -2,21 +2,35 @@ Base Rules
 
 Initialization
 
-Tracked Dynamic Constraints: For the duration:
+## State and Control:
 
-This solver uses a 3-DOF representation of the defined aircraft parameters
+This solver uses a 3-DOF representation of the aircraft, with the state matrix:
 
-Derived Dynamic Constraints:
+$$\mathbf{x} = [p_x,\ p_y,\ p_z,\ V,\ \gamma,\ \chi]^\top$$
 
-Modeling of Obstacles
+This state matrix defines a spherical velocity frame and a cartesian position frame,
 
-Method of Solution
+with $p_x,\ p_y,\ p_z$ the positions of the aircraft in the inertial coordinate system in which the box is defined,
 
-## Aircraft dynamics
+$\ V$ as the airspeed of the craft
 
-**State and control**
+$\ \gamma$ as the flight path angle,
 
-$$\mathbf{x} = [p_x,\ p_y,\ p_z,\ V,\ \gamma,\ \chi]^\top, \qquad \mathbf{u} = [T,\ n_v,\ n_h]^\top$$
+and $\ \chi$ as the heading angle, measured CCW from east.
+
+___
+
+The control matrix is:
+
+$$\qquad \mathbf{u} = [T,\ n_v,\ n_h]^\top$$
+
+where $T$ is the thrust of the aircraft
+
+$\ n_v$ the vertical acceleration,
+
+and $\ n_h$ the horizontal acceleration.
+
+## Equations of Motion
 
 **Constants**
 
@@ -36,50 +50,138 @@ $$\dot p_z = V\sin\gamma$$
 
 $$\dot V = \frac{T - D}{m} - g\sin\gamma$$
 
-$$\dot\gamma = \frac{g\,(n_v - \cos\gamma)}{V}$$
+$$\dot\gamma = \frac{g\(n_v - \cos\gamma)}{V}$$
 
-$$\dot\chi = \frac{g\,n_h}{V\cos\gamma}$$
+$$\dot\chi = \frac{g n_h}{V\cos\gamma}$$
 
-**Derived quantities**
-
-$$n = \sqrt{n_v^2 + n_h^2}, \qquad \mu = \operatorname{atan2}(n_h, n_v), \qquad R = \frac{V^2}{g\tan\mu}$$
-
-**Free final time**
-
-$$\frac{d\mathbf{x}}{d\tau} = \sigma f(\mathbf{x},\mathbf{u}), \qquad \tau \in [0,1]$$
-
-**Constraints**
-
-$$0 \le T \le f_T\,(T_0 + T_1 V)$$
-
-$$\sqrt{n_v^2 + n_h^2} \le N_{\max}$$
-
-$$|n_h| \le \tan(\mu_{\max})\, n_v$$
-
-$$\sqrt{n_v^2 + n_h^2} \le c_{\text{stall}} V^2 \quad \text{(linearized: } \le c_{\text{stall}}\,(2\bar V V - \bar V^2)\text{)}$$
-
-$$V_{\min} \le V \le V_{\max}, \qquad |\gamma| \le \gamma_{\max}$$
-
-$$|n_{h,k+1} - n_{h,k}| \le \dot n_{h,\max}\,\Delta t_k, \qquad |n_{v,k+1} - n_{v,k}| \le \dot n_{v,\max}\,\Delta t_k$$
-
-## Multiple shooting
-
-$$\mathbf{u}(s) = (1-s)\,\mathbf{u}_k + s\,\mathbf{u}_{k+1}$$
-
-$$\mathbf{x}_{k+1} = \mathbf{x}_k + \int_0^1 \Delta\tau\,\sigma\, f(\mathbf{x}(s),\mathbf{u}(s))\,ds$$
-
-$$\mathbf{x}_{k+1} = \bar F_k + \Phi_k\,\delta\mathbf{x}_k + B^-_k\,\delta\mathbf{u}_k + B^+_k\,\delta\mathbf{u}_{k+1} + S_k\,\delta\sigma + \boldsymbol{\nu}_k$$
-
-$$\frac{d\Phi}{ds} = \Delta\tau\,\sigma A\Phi, \qquad \frac{dB^-}{ds} = \Delta\tau\,\sigma\,(AB^- + (1-s)B)$$
-
-$$\frac{dB^+}{ds} = \Delta\tau\,\sigma\,(AB^+ + sB), \qquad \frac{dS}{ds} = \Delta\tau\,(\sigma AS + f)$$
-
-## Birkhoff
-
-$$\mathbf{x}_i = \mathbf{x}_0 + \sum_j B_{ij}\,\mathbf{V}_j, \qquad B_{ij} = \int_{-1}^{\tau_i} \ell_j(\tau)\,d\tau$$
-
-$$\mathbf{V}_i = \frac{\sigma}{2S}\, f(\mathbf{x}_i,\mathbf{u}_i)$$
-
-## Obstacles
-
-$$\hat{\mathbf{n}}_i^\top(\mathbf{p} - \bar{\mathbf{p}}) + s \ge -\frac{h_i(\bar{\mathbf{p}})}{\lVert\nabla h_i(\bar{\mathbf{p}})\rVert}, \qquad s \ge 0$$
+**Approximations:**
+ 
+- **Thrust along the velocity:** the angle of attack is assumed small, so $\cos\alpha \approx 1$ and the small upward thrust component is ignored.
+- **Drag polar fitted, not derived:** $C_{D_0}$ and $K$ come from a straight-line fit of JSBSim's trimmed $C_D$ against $C_L^2$ over 60–125 kt. The fitted $K$ implies an Oswald efficiency of about 1.5, which isn't physically possible. The fit absorbs trim drag and other effects the simple polar leaves out. It matches JSBSim's drag well in that speed range, but isn't a physical wing property.
+- **Measured at 1 g only:** the polar is fitted in level flight and assumed to hold in turns and pull-ups up to $n = 1.5$.
+## 2. Boundary Conditions
+ 
+Start fully specified; end at the goal position:
+ 
+$$
+x(0) = \big(p_{\text{start}},\ V_{\text{cruise}},\ 0,\ \chi_0\big), \qquad \chi_0 = \text{heading from start toward goal}
+$$
+ 
+$$
+p(\sigma) = p_{\text{goal}}
+$$
+ 
+The final speed, climb angle, and heading are free. Here $V_{\text{cruise}} = 48.9$ m/s (95 kt).
+ 
+**Simplification:** the initial speed, level flight and heading toward the goal are a convention chosen by the solver, not part of the environment. The start velocity stored in the environment file is ignored. Every problem therefore starts from the same kind of state.
+ 
+## 3. State Limits (Flight Envelope)
+ 
+Stay inside the workspace:
+ 
+$$
+p_{\min} + r \le p \le p_{\max} - r
+$$
+ 
+Speed band, with $V_{\min} = 33.0$ m/s and $V_{\max} = 59.2$ m/s:
+ 
+$$
+V_{\min} \le V \le V_{\max}
+$$
+ 
+Climb-angle limit, with $\gamma_{\max} = 6^\circ$:
+ 
+$$
+|\gamma| \le \gamma_{\max}
+$$
+ 
+**Reasoning:**
+ 
+- **Aircraft as a sphere:** clearance is computed as if the aircraft were a 6 m radius sphere. That covers the 11 m wingspan (5.5 m half-span), plus a separate 30 m safety margin around obstacles.
+- **$V_{\min}$:** set at 1.3× stall speed, a standard safety margin, not a physical limit.
+- **$V_{\max}$ (115 kt):** a planning choice, well below the C172's never-exceed speed.
+- **$\gamma_{\max}$ (6°):** a planning choice. It keeps climbs within what the C172 can sustain for short periods, and keeps $\cos\gamma$ far from zero in the heading equation.
+## 4. Control Limits
+ 
+Thrust, with $T_0 = 2218$ N and $k_T = -2.86$ N·s/m:
+ 
+$$
+0 \le T \le 0.8\,(T_0 + k_T V)
+$$
+ 
+Total load factor, with $n_{\max} = 1.5$:
+ 
+$$
+\sqrt{n_v^2 + n_h^2} \le n_{\max}
+$$
+ 
+Bank angle, with $\mu_{\max} = 30^\circ$:
+ 
+$$
+|n_h| \le \tan(\mu_{\max})\, n_v
+$$
+ 
+Stall:
+ 
+$$
+\sqrt{n_v^2 + n_h^2} \le c_{\text{stall}}\, V^2, \qquad c_{\text{stall}} = \frac{\rho S C_{L,\max}}{2mg}
+$$
+ 
+- **Thrust:** non-negative (no reverse thrust). Maximum thrust falls with speed, because the engine makes roughly constant power and power = thrust × speed.
+- **Load factor:** total lift at most 1.5 times the weight.
+- **Bank angle:** at most 30°; also forces $n_v \ge 0$ (lift never points down).
+- **Stall:** the lift requested cannot exceed what the wing can produce at the current speed.
+The stall constraint is nonconvex. At each iteration, $V^2$ is replaced by its tangent at the current speed $\bar V$:
+ 
+$$
+\sqrt{n_v^2 + n_h^2} \le c_{\text{stall}}\,\big(2\bar V V - \bar V^2\big)
+$$
+ 
+**Approximations and reasoning:**
+ 
+- **Thrust is a straight-line fit:** measured at full throttle in JSBSim over 60–120 kt. Below 60 kt it's an extrapolation ($V_{\min}$ = 64 kt sits just inside the range).
+- **80% thrust:** the other 20% is held in reserve so the tracking autopilot can correct errors.
+- **Instant thrust response:** the real engine lags throttle changes, but the planner assumes thrust changes immediately and applies no rate limit to it.
+- **$n_{\max}$ and $\mu_{\max}$ are planning choices:** both are far inside the C172's real limits (3.8 g, and banks well beyond 30°). They keep maneuvers gentle and trackable.
+- **$C_{L,\max}$:** 85% of the highest trimmed lift coefficient measured, a margin below the true stall. It assumes flaps up.
+- **Stall linearization is conservative:** the tangent line lies below the parabola $V^2$, so the linearized limit is stricter than the true one. It can never allow a stall.
+## 5. Control Rate Limits
+ 
+Between consecutive nodes $k$ and $k+1$, separated by $\Delta t = \sigma/(N-1)$:
+ 
+$$
+|n_{v,k+1} - n_{v,k}| \le \dot n_{v,\max}\,\Delta t, \qquad \dot n_{v,\max} = 0.15\ \mathrm{s^{-1}}
+$$
+ 
+$$
+|n_{h,k+1} - n_{h,k}| \le \dot n_{h,\max}\,\Delta t, \qquad \dot n_{h,\max} = 0.12\ \mathrm{s^{-1}}
+$$
+ 
+These keep the plan smooth enough for an autopilot to follow. Both are linear because $\sigma$ appears linearly.
+ 
+**Approximation: $n_h$ rate as a roll-rate proxy.** A true roll-rate limit, $|\dot\mu| \le p_{\max}$, is nonconvex in the controls. Near level flight $n_h \approx \tan\mu$, so
+ 
+$$
+\dot n_h = \sec^2\mu\;\dot\mu
+$$
+ 
+With $|\mu| \le 30^\circ$, the $n_h$ limit corresponds to a roll rate of about 6.9°/s wings-level and 5.2°/s at 30° bank, within about 25% of a true roll-rate limit. That is far slower than a C172 can roll; it's chosen for trackability, not to model the airframe.
+ 
+## 6. Flight Time
+ 
+The final time is free and chosen by the optimizer, within loose bounds:
+ 
+$$
+1\ \mathrm{s} \le \sigma \le 3600\ \mathrm{s}
+$$
+ 
+Time is normalized to $\tau = t/\sigma \in [0, 1]$, so the dynamics become
+ 
+$$
+\frac{dx}{d\tau} = \sigma\, f(x, u)
+$$
+ 
+This is an exact change of variables, not an approximation. It lets the solver treat flight time as just another variable on a fixed grid.
+ 
+**Note on all constraints:** limits are enforced at the discretization points (nodes, or check points for obstacles), not continuously. The final solution is re-checked on a dense grid, and with an independent RK4 simulation, to confirm nothing is violated between them.
+ 

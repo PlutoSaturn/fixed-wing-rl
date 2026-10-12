@@ -2,7 +2,7 @@ Base Rules
 
 Initialization
 
-## State and Control:
+## 1. State and Control:
 
 This solver uses a 3-DOF representation of the aircraft, with the state matrix:
 
@@ -30,7 +30,7 @@ $\ n_v$ the vertical acceleration,
 
 and $\ n_h$ the horizontal acceleration.
 
-## Equations of Motion
+## 2.  Equations of Motion
 
 **Constants**
 

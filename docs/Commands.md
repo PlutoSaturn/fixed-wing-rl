@@ -125,28 +125,7 @@ Options: `--envs`, `--results`, `--out` (track), `--out-dir` (record), `--speed`
 | `modal volume ls fixed-wing-rl-data /datasets` | List datasets mirrored to the Modal Volume. |
 | `modal volume get fixed-wing-rl-data /datasets/<dataset> .` | Download a dataset from the Volume. |
 
----
 
-## 8. Git
-
-| Command | What it does |
-|---|---|
-| `git status` | Shows changed, staged and untracked files, and any merge in progress. |
-| `git pull` | Downloads and merges other people's commits into your current branch. |
-| `git checkout -b my-branch` | Creates a new branch and switches to it (uncommitted changes come with you). |
-| `git add path/to/file` / `git add .` | Stages files for the next commit. |
-| `git restore --staged path/to/file` | Unstages a file. |
-| `git commit -m "message"` | Records the staged changes. |
-| `git push` / `git push -u origin my-branch` | Uploads commits (first push of a new branch needs `-u origin`). |
-| `git merge --abort` | Cancels an unfinished merge. |
-| `git commit --no-edit` | Finishes a merge after resolving conflicts. |
-| `git check-ignore -v path/to/file` | Shows which `.gitignore` rule is excluding a file. |
-| `git add -f path/to/file` | Adds a file even though it is ignored. |
-| `git log origin/main --oneline -3` | Shows the last three commits on GitHub's `main`. |
-
-In `.gitignore`, a line starting with `!` re-includes a file (e.g. `*.json` then `!aircraftmodel/c172_params.json`). Ignore a folder's contents (`localstore/*`), not the folder itself (`localstore/`), if you want to re-include files inside it.
-
----
 
 ## Typical workflow
 

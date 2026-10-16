@@ -25,14 +25,14 @@ BOUND for any path that avoids the circle, whatever the dynamics:
     nearly tight: the real optimum is longer only by a short turn at the
     start, because the planner starts pointed straight at the goal.
 
-Workflow (run in the project folder)
-------------------------------------
-    python tfr_benchmark.py make
-    python scp_aircraft.py --envs tfr_env.json --out tfr_results.json --feasible-out tfr_feasible.json --verbose
-    python tfr_benchmark.py check --plot
+Workflow (run from the project root; generated files go to localstore/)
+------------------------------------------------------------------------
+    python -m sim.tfr_benchmark make
+    python -m solvers.scp_aircraft --envs tfr_env.json --out tfr_results.json --feasible-out tfr_feasible.json --verbose
+    python -m sim.tfr_benchmark check --plot
   optional, fly it in JSBSim and check the flown path too:
-    python jsbsim_c172.py record 0 --envs tfr_env.json --results tfr_results.json --out-dir tfr_flight
-    python tfr_benchmark.py check --flight tfr_flight/jsbsim_commands.csv --plot
+    python -m sim.jsbsim_c172 record 0 --envs tfr_env.json --results tfr_results.json --out-dir tfr_flight
+    python -m sim.tfr_benchmark check --flight tfr_flight/jsbsim_commands.csv --plot
 """
 from __future__ import annotations
 
@@ -42,7 +42,8 @@ import os
 
 import numpy as np
 
-from benchmarks.envgen import Cylinder, Environment, load_environments, save_environments
+from environment.envgen import (Cylinder, Environment, find_input, load_environments, localstore_path,
+                               project_root, save_environments)
 
 NM = 1852.0                       # metres per nautical mile
 FT = 0.3048
@@ -122,8 +123,19 @@ def side_of(path_xy, A, B, C):
     return "left" if _cross2(np.asarray(B, float)[:2] - A, path_xy[k] - A) > 0 else "right"
 
 
-def turn_radius_m(params_file="c172_params.json"):
-    """Planning turn radius at cruise (V^2 / (g tan(bank_max))), for context."""
+def _existing_input(path):
+    """The file find_input would read (localstore first, then the current folder), or None."""
+    try:
+        return find_input(path)
+    except FileNotFoundError:
+        return None
+
+
+def turn_radius_m(params_file=None):
+    """Planning turn radius at cruise (V^2 / (g tan(bank_max))), for context.
+    Reads aircraftmodel/c172_params.json, the file scp_aircraft.py uses."""
+    if params_file is None:
+        params_file = project_root() / "aircraftmodel" / "c172_params.json"
     if not os.path.exists(params_file):
         return None
     p = json.load(open(params_file))
@@ -239,7 +251,7 @@ def assess(name, P, env, ref, extra="", is_plan=True):
 def check(args):
     env = load_environments(args.envs)[0]
     if len(env.obstacles) != 1 or env.obstacles[0].kind != "cylinder":
-        raise SystemExit(f"{args.envs} is not a TFR environment (run `python tfr_benchmark.py make`).")
+        raise SystemExit(f"{args.envs} is not a TFR environment (run `python -m sim.tfr_benchmark make`).")
     tfr = env.obstacles[0]
     R = tfr.radius + env.clearance
     ref = shortest_path_around_circle(env.start_pos, env.goal_pos, tfr.center_xy, R)
@@ -254,14 +266,16 @@ def check(args):
     print(f"  other side {ref['lengths']['left' if ref['side'] == 'right' else 'right'] / 1000:.3f} km\n")
 
     verdicts, plot_paths = [], []
-    if os.path.exists(args.results):
-        results = json.load(open(args.results))
+    results_path = _existing_input(args.results)
+    if results_path is not None:
+        with open(results_path) as f:
+            results = json.load(f)
         r = next((r for r in results if r["env_index"] == 0), None)
         if r is None:
             raise SystemExit(f"No result for environment 0 in {args.results}.")
         fp = r.get("env_fingerprint")
         if fp is not None and fp != env.fingerprint():
-            raise SystemExit(f"{args.results} was not solved on {args.envs}; re-run scp_aircraft.py with "
+            raise SystemExit(f"{args.results} was not solved on {args.envs}; re-run solvers.scp_aircraft with "
                              f"--envs {args.envs}.")
         print(f"SCP: status {r['status']}, {r['iterations']} iterations on the last start, "
               f"starts tried {len(r.get('attempts', []))}, solve time {r['solve_time']:.1f} s")
@@ -280,12 +294,12 @@ def check(args):
         verdicts.append(v)
         plot_paths.append(("SCP plan", P, "k"))
     else:
-        print(f"No SCP results yet ({args.results}). Run:\n  python scp_aircraft.py --envs {args.envs} "
+        print(f"No SCP results yet ({args.results}). Run:\n  python -m solvers.scp_aircraft --envs {args.envs} "
               f"--out {args.results} --feasible-out tfr_feasible.json --verbose\n")
 
     if args.flight:
         import csv
-        with open(args.flight) as f:
+        with open(find_input(args.flight)) as f:
             rows = list(csv.DictReader(f))
         F = np.array([[float(q["x_east_m"]), float(q["y_north_m"]), float(q["z_up_m"])] for q in rows])
         v, lines = assess("JSBSim flight", F, env, ref, f" ({args.flight})", is_plan=False)
@@ -323,6 +337,7 @@ def plot(env, ref, paths, save):
     ax.legend(loc="lower right", fontsize=8)
     ax.grid(alpha=0.3)
     fig.tight_layout()
+    save = localstore_path(save)
     fig.savefig(save, dpi=130)
     print(f"Plot saved to {save}")
     plt.show()
@@ -344,9 +359,9 @@ def main():
     c = sub.add_parser("check", help="compare an SCP plan (and optionally a JSBSim flight) to the optimum")
     c.add_argument("--envs", default="tfr_env.json")
     c.add_argument("--results", default="tfr_results.json")
-    c.add_argument("--flight", default=None, help="jsbsim_commands.csv from `jsbsim_c172.py record`")
+    c.add_argument("--flight", default=None, help="jsbsim_commands.csv from `python -m sim.jsbsim_c172 record`")
     c.add_argument("--plot", action="store_true")
-    c.add_argument("--save", default="tfr_check.png", help="where --plot saves its figure")
+    c.add_argument("--save", default="tfr_check.png", help="where --plot saves its figure (inside localstore/)")
     args = ap.parse_args()
 
     if args.command == "make":
@@ -365,7 +380,7 @@ def main():
         if rt and R < 3 * rt:
             print("  note: the circle is only a few turn radii wide, so the true optimum is noticeably "
                   "longer than this geometric bound (turns limit it). Expect a larger gap.")
-        print(f"\nNext:  python scp_aircraft.py --envs {args.out} --out tfr_results.json "
+        print(f"\nNext:  python -m solvers.scp_aircraft --envs {args.out} --out tfr_results.json "
               f"--feasible-out tfr_feasible.json --verbose")
         if args.plot:
             plot(env, ref, [], "tfr_env.png")

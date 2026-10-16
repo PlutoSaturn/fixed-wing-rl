@@ -358,6 +358,9 @@ class SCPSolver:
         uses_obstacles = True, with obstacle_eval(env, P) and check_points(X, prop),
                          to enforce env's obstacles at every RK4 substep (the
                          first three states must then be the position)
+        on_iterate(it, X, U, sigma, rec)    -> called with the initial guess (it = 0)
+                                               and every accepted iterate, e.g. to
+                                               record how the solution develops
     AircraftSCP below is one such problem; cartpole_scp.py is another.
     """
     name = "scp"
@@ -384,6 +387,9 @@ class SCPSolver:
 
     def cost_expr(self, X, U, sig, N):
         raise NotImplementedError
+
+    def on_iterate(self, it, X, U, sigma, rec):
+        """Optional observer hook; does nothing by default and never changes the solve."""
 
     # ---- propagation -------------------------------------------------------
     @staticmethod
@@ -505,6 +511,8 @@ class SCPSolver:
         X_bar, U_bar, s_bar = guess
         J_bar, def_bar, viol_bar = self.merit(env, X_bar, U_bar, s_bar)
         eta, history, status, converged = ETA_INIT, [], "max_iterations", False
+        self.on_iterate(0, X_bar, U_bar, s_bar, {"iter": 0, "J": J_bar, "max_defect": def_bar,
+                                                 "max_violation": viol_bar, "event": "initial_guess"})
         cap = TRUST_CAP            # PTR step cap; halved when a step is rejected, regrows after accepted ones
 
         infeas_hist = []           # violation + defect per accepted iteration while infeasible
@@ -637,6 +645,7 @@ class SCPSolver:
                 X_bar, U_bar, s_bar, J_bar, def_bar, viol_bar = X_new, U_new, s_new, J_new, def_new, viol_new
                 rec["event"] = "accepted"
                 history.append(rec)
+                self.on_iterate(it, X_bar, U_bar, s_bar, rec)
                 if self.verbose:
                     print(f"    it {it:2d}  J {J_new:10.3f}  tf {s_new:6.1f}s  defect {def_new:.1e}  "
                           f"viol {viol_new:.1e}  step {step:.1e}")
@@ -678,6 +687,7 @@ class SCPSolver:
                     X_bar, U_bar, s_bar, J_bar, def_bar, viol_bar = X_new, U_new, s_new, J_new, def_new, viol_new
                 rec["event"] = "converged"
                 history.append(rec)
+                self.on_iterate(it, X_bar, U_bar, s_bar, rec)
                 converged = True
                 break
             if rho < RHO_0:
@@ -690,6 +700,7 @@ class SCPSolver:
                 elif rho >= RHO_2:
                     eta = min(eta * ETA_GROW, ETA_MAX)
                 rec["event"] = "accepted"
+                self.on_iterate(it, X_bar, U_bar, s_bar, rec)
             history.append(rec)
             if self.verbose:
                 print(f"    it {it:2d}  J {J_new:10.3f}  tf {s_new:6.1f}s  defect {def_new:.1e}  "

@@ -320,6 +320,9 @@ class SolveResult:
     x: np.ndarray
     u: np.ndarray
     history: list = field(default_factory=list)
+    initial_guess_x: np.ndarray | None = None
+    initial_guess_u: np.ndarray | None = None
+    initial_guess_flight_time: float | None = None
     attempts: list = field(default_factory=list)        # status of each start
     attempt_costs: list = field(default_factory=list)   # cost of each start's result (None if invalid)
     best_start: int = -1                                # index of the start that was returned
@@ -330,6 +333,11 @@ class SolveResult:
                                             "max_violation", "dense_min_margin",
                                             "history", "attempts", "attempt_costs", "best_start")}
         d["x"], d["u"] = self.x.tolist(), self.u.tolist()
+        d["initial_guess"] = {
+            "x": self.initial_guess_x.tolist() if self.initial_guess_x is not None else None,
+            "u": self.initial_guess_u.tolist() if self.initial_guess_u is not None else None,
+            "flight_time": self.initial_guess_flight_time,
+        }
         return d
 
 
@@ -480,6 +488,9 @@ class SCPSolver:
         best, best_k, attempts, costs = None, -1, [], []
         for k, guess in enumerate(self.initial_guesses(env)):
             res = self._solve_from(env, guess)
+            res.initial_guess_x = np.asarray(guess[0], dtype=float).copy()
+            res.initial_guess_u = np.asarray(guess[1], dtype=float).copy()
+            res.initial_guess_flight_time = float(guess[2])
             attempts.append(res.status)
             costs.append(res.cost if res.success else None)
             if self.verbose:
@@ -762,6 +773,19 @@ class AircraftSCP(SCPSolver):
         t_est = np.linalg.norm(env.goal_pos - env.start_pos) / V_CRUISE
         return max(N_NODES, int(np.ceil(t_est / MAX_INTERVAL_S)) + 1)
 
+    @staticmethod
+    def configuration():
+        """Return the runtime aircraft limits and SCP settings for result metadata."""
+        names = (
+            "AIRFRAME_NAME", "MASS", "WING_AREA", "RHO", "C_D0", "K_INDUCED",
+            "C_L_MAX", "T_MAX", "THRUST_SLOPE", "THRUST_PLAN_FRACTION",
+            "V_MIN", "V_MAX", "V_CRUISE", "N_MAX", "BANK_MAX_DEG",
+            "GAMMA_MAX_DEG", "N_V_RATE_MAX", "N_H_RATE_MAX", "GRAVITY",
+            "FINAL_LEVEL", "N_NODES", "MAX_INTERVAL_S", "SIGMA_BOUNDS",
+            "ALGORITHM", "MAX_ITERS", "TOL_DEFECT", "TOL_VIOLATION", "SOLVER",
+        )
+        return {name: globals()[name] for name in names}
+
     # ---- boundary conditions and guesses ----------------------------------
     def boundary(self, env):
         d = env.goal_pos - env.start_pos
@@ -950,7 +974,8 @@ def main():
               f"({sum(c is not None for c in res.attempt_costs)} valid)  cost {res.cost:8.3f}  iters {res.iterations:3d}  "
               f"{res.solve_time:6.1f}s  flight {res.flight_time:6.1f}s  margin {res.dense_min_margin:+.2f}")
         results.append({"env_index": i, "env_file": args.envs, "env_fingerprint": env.fingerprint(),
-                        "solver": solver.name, **res.to_dict()})
+                        "solver": solver.name, "solver_config": solver.configuration(),
+                        **res.to_dict()})
         if res.success:
             feasible.append(env)
 

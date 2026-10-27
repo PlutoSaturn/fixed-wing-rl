@@ -64,7 +64,26 @@ def main() -> int:
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(args.output, index=False)
-    print(f"Saved {len(frame)} rows and {len(frame.columns)} columns to {args.output}")
+    features, targets, metadata = SCPAircraftDatasetParser(
+        node_count=args.nodes
+    ).to_ml_tables(frame)
+    feature_path = args.output.with_name(f"{args.output.stem}_features.csv")
+    target_path = args.output.with_name(f"{args.output.stem}_targets.csv")
+    metadata_path = args.output.with_name(f"{args.output.stem}_metadata.csv")
+    features.to_csv(feature_path, index=False)
+    targets.to_csv(target_path, index=False)
+    metadata.to_csv(metadata_path, index=False)
+
+    print(f"Saved {len(frame)} samples:")
+    print(f"  full inspection table: {args.output}")
+    print(f"  numeric model inputs X: {feature_path} ({features.shape[1]} columns)")
+    print(f"  prediction targets y: {target_path} ({targets.shape[1]} columns)")
+    print(f"  sample identifiers:    {metadata_path}")
+    if len(frame) < 100:
+        print(
+            "Warning: fewer than 100 solve samples; this is not enough to train "
+            "or evaluate a reliable ML model."
+        )
     return 0
 
 

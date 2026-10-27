@@ -85,6 +85,36 @@ class SCPAircraftDatasetParser:
         "rejected_nonfinite",
         "restored_best_valid",
     }
+    OBSTACLE_KINDS = ("spheroid", "oriented_cylinder", "cylinder", "box", "wall")
+    OCCUPANCY_RESOLUTION = (8, 8, 4)
+    STATE_NAMES = ("x", "y", "z", "speed", "gamma", "heading")
+    CONTROL_NAMES = ("thrust", "n_v", "n_h")
+    BASE_FEATURE_COLUMNS = (
+        "start_pos_x", "start_pos_y", "start_pos_z",
+        "goal_pos_x", "goal_pos_y", "goal_pos_z",
+        "start_vel_x", "start_vel_y", "start_vel_z",
+        "goal_vel_x", "goal_vel_y", "goal_vel_z",
+        "bounds_lo_x", "bounds_lo_y", "bounds_lo_z",
+        "bounds_hi_x", "bounds_hi_y", "bounds_hi_z",
+        "position_lo_x", "position_lo_y", "position_lo_z",
+        "position_hi_x", "position_hi_y", "position_hi_z",
+        "vehicle_radius", "margin", "clearance", "obstacle_count",
+        "route_distance_m", "initial_guess_available", "solver_start_speed",
+        "solver_start_gamma_rad", "solver_start_heading_rad",
+        "solver_start_x", "solver_start_y", "solver_start_z",
+        "solver_end_x", "solver_end_y", "solver_end_z",
+        "solver_end_speed_is_free", "solver_end_heading_is_free",
+        "solver_end_gamma_is_fixed",
+    )
+    TARGET_COLUMNS = (
+        "success", "status", "failure_category", "failure_constraint",
+        "stop_iteration", "stop_event", "iterations", "solve_time",
+        "flight_time", "cost", "max_defect", "max_violation", "dense_min_margin",
+    )
+    METADATA_COLUMNS = (
+        "source_file", "env_index", "env_file", "env_fingerprint", "solver",
+        "best_start", "attempt_count", "initial_guess_source", "raw_log_available",
+    )
 
     def __init__(
         self,
@@ -265,6 +295,25 @@ class SCPAircraftDatasetParser:
                 values[f"trajectory_{index:03d}_{axis}"] = float(value)
         return values
 
+    @staticmethod
+    def _resample_columns(
+        array: np.ndarray | None, node_count: int, names: tuple[str, ...], prefix: str
+    ) -> dict[str, float | None]:
+        fields = {
+            f"{prefix}_{index:03d}_{name}": None
+            for index in range(node_count)
+            for name in names
+        }
+        if array is None or array.shape[1] < len(names):
+            return fields
+        old_progress = np.linspace(0.0, 1.0, len(array))
+        new_progress = np.linspace(0.0, 1.0, node_count)
+        for column, name in enumerate(names):
+            samples = np.interp(new_progress, old_progress, array[:, column])
+            for index, value in enumerate(samples):
+                fields[f"{prefix}_{index:03d}_{name}"] = float(value)
+        return fields
+
     def _load_log(self, result_file: Path, result: dict[str, Any]) -> str | None:
         for key in ("raw_log", "log_text", "solver_log"):
             if isinstance(result.get(key), str):
@@ -392,6 +441,8 @@ class SCPAircraftDatasetParser:
         result["obstacle_count"] = len(obstacles) if isinstance(obstacles, list) else None
         result["obstacles_json"] = self._json_value(obstacles)
         result["environment_metrics_json"] = self._json_value(environment.get("metrics"))
+        for kind in self.OBSTACLE_KINDS:
+            result[f"obstacle_count_{kind}"] = 0
         for obstacle in obstacles if isinstance(obstacles, list) else []:
             if not isinstance(obstacle, dict):
                 continue
@@ -399,6 +450,22 @@ class SCPAircraftDatasetParser:
             if kind:
                 key = f"obstacle_count_{kind}"
                 result[key] = result.get(key, 0) + 1
+        try:
+            from environment.envgen import Environment
+
+            occupancy = Environment.from_dict(environment).occupancy_grid(
+                self.OCCUPANCY_RESOLUTION
+            ).reshape(-1)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Could not create occupancy features from environment: {exc}") from exc
+        for index, occupied in enumerate(occupancy):
+            result[f"occupancy_{index:03d}"] = int(occupied)
+        metrics = environment.get("metrics")
+        if isinstance(metrics, dict):
+            for key, value in metrics.items():
+                number = self._safe_number(value)
+                if number is not None:
+                    result[f"environment_metric_{key}"] = number
         return result
 
     def parse_result(self, result: dict[str, Any], result_file: str | Path = "result.json") -> dict[str, Any]:
@@ -482,7 +549,28 @@ class SCPAircraftDatasetParser:
         row["solver_end_speed_is_free"] = True
         row["solver_end_heading_is_free"] = True
         row["solver_end_gamma_is_fixed"] = bool(solver_config.get("FINAL_LEVEL", False))
+        if environment is not None:
+            start = np.asarray(environment["start_pos"], dtype=float)
+            goal = np.asarray(environment["goal_pos"], dtype=float)
+            row["route_distance_m"] = float(np.linalg.norm(goal - start))
         row.update(self._guess_differences(guess, final))
+        initial_guess = result.get("initial_guess")
+        guess_controls = self._as_array(
+            initial_guess.get("u") if isinstance(initial_guess, dict) else None,
+            columns=len(self.CONTROL_NAMES),
+        )
+        guess_flight_time = (
+            initial_guess.get("flight_time") if isinstance(initial_guess, dict) else None
+        )
+        row["initial_guess_flight_time"] = self._safe_number(guess_flight_time)
+        row.update(
+            self._resample_columns(guess, self.node_count, self.STATE_NAMES, "guess")
+        )
+        row.update(
+            self._resample_columns(
+                guess_controls, self.node_count, self.CONTROL_NAMES, "guess_control"
+            )
+        )
         row.update(self._resample_xyz(final, result.get("flight_time")) if success else
                    self._resample_xyz(None, None))
         for key, value in self.solver_constraints.items():
@@ -501,6 +589,59 @@ class SCPAircraftDatasetParser:
             }.items():
                 row[key] = value
         return row
+
+    def to_ml_tables(
+        self, frame: pd.DataFrame
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """Split parsed rows into numeric input features, targets, and metadata.
+
+        Post-solve trajectory, objective, status, and diagnostic fields are
+        deliberately excluded from X to prevent target leakage.
+        """
+        feature_columns = list(self.BASE_FEATURE_COLUMNS)
+        feature_columns.extend(f"obstacle_count_{kind}" for kind in self.OBSTACLE_KINDS)
+        feature_columns.extend(
+            f"occupancy_{index:03d}"
+            for index in range(int(np.prod(self.OCCUPANCY_RESOLUTION)))
+        )
+        feature_columns.extend(
+            f"guess_{index:03d}_{name}"
+            for index in range(self.node_count)
+            for name in self.STATE_NAMES
+        )
+        feature_columns.extend(
+            f"guess_control_{index:03d}_{name}"
+            for index in range(self.node_count)
+            for name in self.CONTROL_NAMES
+        )
+        feature_columns.append("initial_guess_flight_time")
+        if not frame.empty:
+            feature_columns.extend(
+                column for column in frame.columns
+                if column.startswith("solver_config_")
+                and not column.endswith("_json")
+                and pd.api.types.is_numeric_dtype(frame[column])
+            )
+            feature_columns.extend(
+                column for column in frame.columns
+                if column.startswith("environment_metric_")
+                and pd.api.types.is_numeric_dtype(frame[column])
+            )
+        feature_columns = list(dict.fromkeys(feature_columns))
+        present_features = [column for column in feature_columns if column in frame.columns]
+        X = frame.reindex(columns=present_features).copy()
+        for column in X.columns:
+            if X[column].dtype == bool:
+                X[column] = X[column].astype("int8")
+        X = X.apply(pd.to_numeric, errors="coerce")
+
+        present_targets = [column for column in self.TARGET_COLUMNS if column in frame.columns]
+        y = frame.reindex(columns=present_targets).copy()
+        if "success" in y:
+            y["success"] = y["success"].astype("int8")
+        metadata_columns = [column for column in self.METADATA_COLUMNS if column in frame.columns]
+        metadata = frame.reindex(columns=metadata_columns).copy()
+        return X, y, metadata
 
     def parse_file(self, path: str | Path) -> list[dict[str, Any]]:
         result_path = Path(path).resolve()

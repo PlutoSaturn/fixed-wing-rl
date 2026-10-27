@@ -79,6 +79,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import tempfile
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -938,6 +940,56 @@ def plot_result(env, res, solver):
     plt.show()
 
 
+def save_results_checkpoint(results, path):
+    """Atomically replace the results file with all completed environments."""
+    path = localstore_path(path)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary_path = stream.name
+            json.dump(results, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    except BaseException:
+        if temporary_path and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+        raise
+    return path
+
+
+def load_matching_results(path, envs, solver_config):
+    """Load completed results that match the current environments and settings."""
+    path = find_input(path)
+    with open(path, encoding="utf-8") as stream:
+        saved = json.load(stream)
+    if not isinstance(saved, list) or not all(isinstance(row, dict) for row in saved):
+        raise ValueError(f"Cannot resume: {path} must contain a JSON list of result objects")
+
+    matching = {}
+    for row in saved:
+        index = row.get("env_index")
+        if not isinstance(index, int) or not 0 <= index < len(envs):
+            continue
+        if row.get("env_fingerprint") != envs[index].fingerprint():
+            continue
+        saved_config = json.dumps(row.get("solver_config"), sort_keys=True)
+        current_config = json.dumps(solver_config, sort_keys=True)
+        if saved_config != current_config:
+            continue
+        if row.get("solver") != AircraftSCP.name:
+            continue
+        matching[index] = row
+    return matching
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
@@ -951,6 +1003,8 @@ def main():
                     help="solve, then re-solve and plot this environment")
     ap.add_argument("--show", type=int, default=None, metavar="INDEX",
                     help="plot a SAVED result (from --out) without solving anything")
+    ap.add_argument("--resume", action="store_true",
+                    help="reuse completed results matching the current environments and settings")
     ap.add_argument("--verbose", action=argparse.BooleanOptionalAction, default=VERBOSE)
     args = ap.parse_args()
     warnings.filterwarnings("ignore", category=UserWarning, module="cvxpy")
@@ -964,30 +1018,55 @@ def main():
 
     envs = load_environments(args.envs)[: args.max_envs]
     solver = AircraftSCP(verbose=args.verbose)
-    results, feasible = [], []
-    print(f"Solving {len(envs)} environments with {solver.name} [{AIRFRAME_NAME}] "
-          f"(up to {solver.n_starts} starts each)")
-    for i, env in enumerate(envs):
-        res = solver.solve(env)
-        print(f"  env {i:3d}  nodes {len(res.x):3d}  fill {env.metrics.get('occupancy_fraction', float('nan')):5.1%}  "
-              f"{res.status:24s} best start {res.best_start + 1:2d}/{len(res.attempts)} "
-              f"({sum(c is not None for c in res.attempt_costs)} valid)  cost {res.cost:8.3f}  iters {res.iterations:3d}  "
-              f"{res.solve_time:6.1f}s  flight {res.flight_time:6.1f}s  margin {res.dense_min_margin:+.2f}")
-        results.append({"env_index": i, "env_file": args.envs, "env_fingerprint": env.fingerprint(),
-                        "solver": solver.name, "solver_config": solver.configuration(),
-                        **res.to_dict()})
-        if res.success:
-            feasible.append(env)
-
     out_path = localstore_path(args.out)
-    with open(out_path, "w") as f:
-        json.dump(results, f)
+    solver_config = json.loads(json.dumps(solver.configuration()))
+    if args.resume and out_path.exists():
+        results_by_index = load_matching_results(
+            out_path, envs, solver_config
+        )
+    else:
+        results_by_index = {}
+    results = [results_by_index[i] for i in sorted(results_by_index)]
+    feasible = [env for i, env in enumerate(envs)
+                if i in results_by_index and results_by_index[i].get("success")]
+    print(f"Solving {len(envs)} environments with {solver.name} [{AIRFRAME_NAME}] "
+          f"(up to {solver.n_starts} starts each; {len(results_by_index)} already complete)")
+    interrupted = False
+    try:
+        for i, env in enumerate(envs):
+            if i in results_by_index:
+                continue
+            res = solver.solve(env)
+            print(f"  env {i:3d}  nodes {len(res.x):3d}  fill {env.metrics.get('occupancy_fraction', float('nan')):5.1%}  "
+                  f"{res.status:24s} best start {res.best_start + 1:2d}/{len(res.attempts)} "
+                  f"({sum(c is not None for c in res.attempt_costs)} valid)  cost {res.cost:8.3f}  iters {res.iterations:3d}  "
+                  f"{res.solve_time:6.1f}s  flight {res.flight_time:6.1f}s  margin {res.dense_min_margin:+.2f}")
+            results_by_index[i] = {
+                "env_index": i, "env_file": args.envs,
+                "env_fingerprint": env.fingerprint(),
+                "solver": solver.name, "solver_config": solver_config,
+                **res.to_dict(),
+            }
+            results = [results_by_index[index] for index in sorted(results_by_index)]
+            out_path = save_results_checkpoint(results, args.out)
+            if res.success:
+                feasible.append(env)
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nInterrupted. All previously completed environments are saved.")
+
+    results = [results_by_index[index] for index in sorted(results_by_index)]
+    out_path = save_results_checkpoint(results, args.out)
     feas_path = save_environments(feasible, args.feasible_out)
-    print(f"\n{len(feasible)}/{len(envs)} feasible.\n  results -> {out_path}\n"
+    print(f"\n{len(results)}/{len(envs)} completed; {len(feasible)} feasible.\n  results -> {out_path}\n"
           f"  feasible environments -> {feas_path}")
+    if interrupted:
+        print("Rerun the same command with --resume to continue the remaining environments.")
+        return 130
     if args.plot is not None:
         plot_result(envs[args.plot], solver.solve(envs[args.plot]), solver)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

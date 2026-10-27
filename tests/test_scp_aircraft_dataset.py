@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 from solvers.scp_aircraft_dataset import SCPAircraftDatasetParser
 
@@ -67,7 +68,7 @@ class SCPAircraftDatasetParserTests(unittest.TestCase):
             "bounds_hi": [20, 21, 22],
             "vehicle_radius": 1,
             "margin": 2,
-            "obstacles": [{"kind": "box"}],
+            "obstacles": [{"type": "box", "center": [5, 5, 5], "half_extents": [1, 1, 1]}],
             "metrics": {"occupancy_fraction": 0.2},
         }
         result = {
@@ -99,6 +100,19 @@ class SCPAircraftDatasetParserTests(unittest.TestCase):
         self.assertEqual(frame.loc[0, "trajectory_002_x"], 10.0)
         self.assertEqual(frame.loc[0, "solver_config_v_cruise"], 15.0)
         self.assertEqual(frame.loc[0, "solver_start_heading_rad"], np.arctan2(10, 10))
+
+        features, targets, metadata = SCPAircraftDatasetParser(
+            node_count=3
+        ).to_ml_tables(frame)
+        self.assertNotIn("success", features.columns)
+        self.assertNotIn("status", features.columns)
+        self.assertNotIn("trajectory_000_x", features.columns)
+        self.assertTrue(all(pd.api.types.is_numeric_dtype(dtype) for dtype in features.dtypes))
+        self.assertEqual(targets.loc[0, "success"], 1)
+        self.assertEqual(targets.loc[0, "failure_category"], "success")
+        self.assertEqual(metadata.loc[0, "env_index"], 0)
+        self.assertIn("occupancy_000", features.columns)
+        self.assertIn("obstacle_count_box", features.columns)
 
 
 if __name__ == "__main__":

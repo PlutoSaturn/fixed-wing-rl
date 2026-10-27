@@ -73,17 +73,16 @@ ENV_FILE          = "c172_envs.json"
 RESULTS_FILE      = "scp_birkhoff_results.json"
 FEASIBLE_FILE     = "feasible_envs_birkhoff.json"
 
-BK_DEGREE         = 12        # polynomial degree per segment (nodes per segment = BK_DEGREE + 1)
-BK_SEGMENTS       = None      # fixed number of segments; None = choose from BK_SEGMENT_S
-BK_SEGMENT_S      = 40.0      # target segment length in seconds (estimated flight time / this)
-                              #   1 segment = a single global polynomial (classic Birkhoff PS)
-BK_CHECK_DT_S     = 0.5       # spacing of obstacle check points, s (uniform in time)
+BK_NODES          = None      # override adaptive LGL node count; None = choose from flight distance
+MAX_NODES_BK      = 100       # upper bound, including refinement
+OBS_SUBDIV        = 4         # obstacle check points per node interval
+LEBESGUE_FACTOR   = 2.0       # extra pruning reach for polynomial interpolation overshoot
+SHOOT_TOL         = 0.05      # largest scaled RK4 shooting defect accepted as feasible
+REFINE            = True
+REFINE_FACTOR     = 1.5
 BK_DENSE_DT_S     = 0.05      # spacing for the final dense obstacle check, s
-FLIGHT_TIME_PAD   = 1.3       # flight time assumed for spacing = straight-line time x this
+FLIGHT_TIME_PAD   = 1.3       # estimated flight time padding for check-grid sizing
 OUTPUT_NODES      = 241       # uniform nodes in the saved result (for tracking / plotting)
-VERIFY_INTERVALS  = 120       # the plan is re-checked over this many equal intervals with RK4 ...
-VERIFY_SUBSTEPS   = 8         #   ... and this many substeps each, using the plan's own polynomial controls
-VERIFY_DEFECT_TOL = 2e-3      # max scaled RK4 defect over those intervals for "feasible"
 VERIFY_DT         = 0.1       # s, step of the open-loop verification simulation
 
 # ---- speed --------------------------------------------------------------------
@@ -91,7 +90,7 @@ BK_MAX_OBS_PER_CHECK = 3      # obstacle constraints per check point: only its K
                               #   (None = every obstacle within reach). Skipped ones still count in
                               #   the merit, so one that becomes close is added next iteration.
 BK_ADAPTIVE_REACH = True      # shrink the obstacle search radius as SCP steps get small
-DIRECT_CLARABEL   = True      # build the subproblem matrices directly and call Clarabel, instead of
+DIRECT_CLARABEL   = False     # optionally assemble the subproblem directly for Clarabel, instead of
                               #   rebuilding a cvxpy model every iteration (same problem, less overhead)
 SOLVER_OPTS       = {}        # extra cvxpy/Clarabel settings, e.g. {"tol_gap_rel": 1e-6}
 
@@ -148,43 +147,48 @@ class BirkhoffAircraftSCP(AircraftSCP):
     interpolation on LGL nodes (optionally in several segments)."""
     name = "birkhoff_scp"
 
-    def __init__(self, verbose=base.VERBOSE, n_starts=base.N_STARTS):
+    def __init__(self, verbose=base.VERBOSE, n_starts=base.N_STARTS, nodes=BK_NODES):
         super().__init__(verbose=verbose, n_starts=n_starts)
-        self.bb = BirkhoffBasis(BK_DEGREE)
-        self.setup_segments(1)
+        self.node_override = nodes
+        self.bb = BirkhoffBasis(max(1, base.N_NODES - 1))
+        self.setup_grid(max(2, base.N_NODES), 200.0)
 
     # ---- grid ----------------------------------------------------------------
-    def setup_segments(self, S, t_est=200.0):
-        n = self.bb.n
-        self.S = S
-        self.G = S * n + 1                                         # global nodes (shared ends)
-        self.idx = np.arange(S)[:, None] * n + np.arange(n + 1)[None, :]     # (S, n+1)
-        # normalized time [0, 1] of every global node
-        self.r = np.r_[np.concatenate([(s + (self.bb.tau[:-1] + 1) / 2) / S for s in range(S)]), 1.0]
-        self.dr = np.diff(self.r)                                  # normalized node spacing
-        self.hloc = 2.0 / n                                        # mean local spacing (for scaling)
-        # quadrature weights over normalized time [0, 1]
-        self.q = np.zeros(self.G)
-        for s in range(S):
-            self.q[self.idx[s]] += self.bb.w / (2 * S)
-        # obstacle check points: uniform in time within each segment, plus the very end
-        seg_s = t_est * FLIGHT_TIME_PAD / S
-        self.c_seg, self.c_B = self._check_grid(max(8, int(np.ceil(seg_s / BK_CHECK_DT_S))))
-        self.d_seg, self.d_B = self._check_grid(max(40, int(np.ceil(seg_s / BK_DENSE_DT_S))))
-        self.n_nodes = self.G
+    def setup_grid(self, nodes, t_est):
+        """Configure one global LGL polynomial and its obstacle-check grids."""
+        if nodes < 2:
+            raise ValueError("Birkhoff transcription requires at least two LGL nodes.")
+        self.bb = BirkhoffBasis(nodes - 1)
+        self.S = 1
+        self.G = nodes
+        self.idx = np.arange(nodes)[None, :]
+        self.r = (self.bb.tau + 1.0) / 2.0
+        self.dr = np.diff(self.r)
+        self.hloc = 2.0 / (nodes - 1)
+        self.q = self.bb.w / 2.0
+        padded_time = max(float(t_est), 1.0) * FLIGHT_TIME_PAD
+        check_intervals = max(nodes - 1, int(np.ceil(padded_time / BK_DENSE_DT_S)))
+        self.c_seg, self.c_B = self._check_grid((nodes - 1) * OBS_SUBDIV)
+        self.d_seg, self.d_B = self._check_grid(check_intervals)
+        self.n_nodes = nodes
 
     def _check_grid(self, m):
-        """m points per segment, uniform in time, plus the final point."""
-        t = -1 + 2 * np.arange(m) / m
-        seg = np.r_[np.repeat(np.arange(self.S), m), self.S - 1]
-        Brows = np.vstack([np.tile(self.bb.integral(t), (self.S, 1)), self.bb.B[-1:]])
-        return seg, Brows
+        """Uniform check points on [0, 1], including both endpoints."""
+        r = np.linspace(0.0, 1.0, m + 1)
+        seg = np.zeros(len(r), dtype=int)
+        return seg, self.bb.integral(2.0 * r - 1.0)
 
     def nodes_for(self, env):
         t_est = np.linalg.norm(env.goal_pos - env.start_pos) / base.V_CRUISE
-        S = int(BK_SEGMENTS) if BK_SEGMENTS is not None else max(1, int(np.ceil(t_est / BK_SEGMENT_S)))
-        self.setup_segments(S, t_est)
-        return self.G
+        if self.node_override is not None:
+            nodes = int(self.node_override)
+        elif base.MAX_INTERVAL_S is None:
+            nodes = base.N_NODES
+        else:
+            nodes = max(base.N_NODES, int(np.ceil(0.5 * np.pi * t_est / base.MAX_INTERVAL_S)) + 1)
+        nodes = min(max(nodes, 2), MAX_NODES_BK)
+        self.setup_grid(nodes, t_est)
+        return nodes
 
     def positions(self, X, V, seg, Brows):
         """Positions at check points: p = p_0(seg) + Brows @ V_pos(seg)."""
@@ -193,18 +197,12 @@ class BirkhoffAircraftSCP(AircraftSCP):
         return p0 + np.einsum("cj,cjk->ck", Brows, Vp)
 
     def integrate_segments(self, X0, V):
-        """X at every node from the start state and V (chained segment by segment)."""
-        X = np.zeros((self.G, 6))
-        X[0] = X0
-        for s in range(self.S):
-            i = self.idx[s]
-            X[i[1:]] = X[i[0]] + self.bb.B[1:] @ V[i]
-        return X
+        """Integrate the derivative polynomial from the initial state."""
+        return X0 + self.bb.B @ V
 
     # ---- initial guesses ---------------------------------------------------
     def _polyline_guess(self, pts, env):
-        """A polyline flown at cruise speed, sampled at the LGL node times, with
-        V chosen so the guess satisfies X = X_0 + B V exactly."""
+        """Sample a polyline at the LGL times and construct its Birkhoff derivative."""
         seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
         s_pts = np.r_[0.0, np.cumsum(seg)]
         p = np.stack([np.interp(self.r * s_pts[-1], s_pts, pts[:, k]) for k in range(3)], axis=1)
@@ -217,21 +215,14 @@ class BirkhoffAircraftSCP(AircraftSCP):
         X[0] = x0
         X[0, 5] = chi[0] + np.angle(np.exp(1j * (x0[5] - chi[0])))      # keep heading continuous
         sigma = float(np.clip(s_pts[-1] / base.V_CRUISE, *base.SIGMA_BOUNDS))
-        # V from differentiating each segment's polynomial; shared nodes averaged
+        # Differentiate the global LGL interpolant to initialize V.
         D = self.bb.derivative()
-        V = np.zeros_like(X)
-        cnt = np.zeros(self.G)
-        for s in range(self.S):
-            i = self.idx[s]
-            V[i] += D @ X[i]
-            cnt[i] += 1
-        V /= cnt[:, None]
-        # re-integrate so X = X_0 + B V holds exactly, then shift V so the end is at the goal
+        V = D @ X
         X = self.integrate_segments(X[0], V)
-        V[:, :3] += (p_goal - X[-1, :3]) / (2 * self.S)                 # each segment integrates a constant to 2c
+        V[:, :3] += (p_goal - X[-1, :3]) / 2.0
         X = self.integrate_segments(X[0], V)
         # controls that roughly produce the guessed climb and turn rates
-        k = sigma / (2 * self.S)
+        k = sigma / 2.0
         U = self.model.trim_controls(X)
         g, Vv, cg = base.GRAVITY, X[:, 3], np.cos(X[:, 4])
         U[:, 1] = cg + Vv * (V[:, 4] / k) / g
@@ -296,7 +287,7 @@ class BirkhoffAircraftSCP(AircraftSCP):
             P = self.positions(X, V, self.c_seg, self.c_B)
             hn, Gn = self.obstacle_eval(env, P)
             self._obs_cache = (P, hn, Gn)              # reused by the next subproblem
-            viol = np.maximum(0.0, -hn).max(axis=1)
+            viol = np.maximum(0.0, -hn).max(axis=1) if hn.shape[1] else np.zeros(len(P))
             J = (self.cost(X, U, sigma) + base.LAMBDA_DYN * defect.sum()
                  + base.LAMBDA_OBS * viol.sum() / base.POS_SCALE)
         if not np.isfinite(J):
@@ -394,12 +385,13 @@ class BirkhoffAircraftSCP(AircraftSCP):
             n_in += nr
         raw_rows(np.concatenate(r), np.concatenate(c), np.concatenate(v), np.concatenate(kconst),
                  n_in, "ineq")
-        # trust region |dz| <= cap
-        I_dz = sp.eye(nzv, format="csr")
-        pad = sp.csr_matrix((nzv, ny - nzv))
-        A_blocks += [sp.hstack([I_dz, pad]), sp.hstack([-I_dz, pad])]
-        b_parts += [np.full(nzv, cap), np.full(nzv, cap)]
-        n_in += 2 * nzv
+        # Trust region covers states, controls, and flight time, not derivatives.
+        trusted = np.r_[np.arange(oV), np.arange(oU, nzv)]
+        I_trust = sp.eye(nzv, format="csr")[trusted]
+        pad = sp.csr_matrix((len(trusted), ny - nzv))
+        A_blocks += [sp.hstack([I_trust, pad]), sp.hstack([-I_trust, pad])]
+        b_parts += [np.full(len(trusted), cap), np.full(len(trusted), cap)]
+        n_in += 2 * len(trusted)
         # obstacles: -(Gm dz + Es slack) <= h
         if Gm is not None:
             A_blocks.append(sp.hstack([-Gm, sp.csr_matrix((Gm.shape[0], 2 * Nn)), -Es]))
@@ -463,6 +455,66 @@ class BirkhoffAircraftSCP(AircraftSCP):
         y = np.asarray(sol.x)
         nu_l1 = float(np.sum(y[nzv:nzv + 2 * Nn]))
         return y[:nzv], nu_l1, float(np.sum(y[nzv + 2 * Nn:]))
+
+    # ---- solve / refinement -------------------------------------------------------
+    def solve(self, env=None) -> SolveResult:
+        started = time.perf_counter()
+        initial_nodes = self.nodes_for(env)
+        t_est = np.linalg.norm(env.goal_pos - env.start_pos) / base.V_CRUISE
+        guesses = list(self.initial_guesses(env))
+        best, best_index = None, -1
+        attempts, costs = [], []
+
+        for start_index, initial_guess in enumerate(guesses):
+            self.setup_grid(initial_nodes, t_est)
+            guess = initial_guess
+            refinements = 0
+            result = self._solve_from(env, guess)
+            while REFINE and result.status in ("shooting_mismatch", "dense_check_failed"):
+                old_nodes = self.G
+                new_nodes = min(MAX_NODES_BK,
+                                max(old_nodes + 4, int(np.ceil(old_nodes * REFINE_FACTOR))))
+                if new_nodes <= old_nodes:
+                    break
+                guess = self._refined_guess(result, new_nodes, t_est)
+                result = self._solve_from(env, guess)
+                refinements += 1
+            result.birkhoff["refinements"] = refinements
+            attempts.append(result.status)
+            costs.append(result.cost if result.success else None)
+
+            if self.verbose:
+                print(f"  start {start_index + 1}: {result.status}" +
+                      (f", cost {result.cost:.4f}" if result.success else ""))
+            if best is None:
+                better = True
+            elif result.success != best.success:
+                better = result.success
+            elif result.success:
+                better = result.cost < best.cost
+            else:
+                better = result.max_violation + result.max_defect < best.max_violation + best.max_defect
+            if better:
+                best, best_index = result, start_index
+            if result.success and not base.PICK_BEST_START:
+                break
+
+        best.attempts, best.attempt_costs, best.best_start = attempts, costs, best_index
+        best.solve_time = time.perf_counter() - started
+        return best
+
+    def _refined_guess(self, result, nodes, t_est):
+        """Interpolate the previous polynomial onto a larger LGL grid."""
+        old_basis = self.bb
+        data = result.birkhoff
+        X_old, V_old, U_old = (np.asarray(data[name], float) for name in ("X", "V", "U"))
+        sigma = float(result.flight_time)
+        self.setup_grid(nodes, t_est)
+        tau = 2.0 * self.r - 1.0
+        V = old_basis.lagrange(tau) @ V_old
+        U = old_basis.lagrange(tau) @ U_old
+        X = X_old[0] + old_basis.integral(tau) @ V_old
+        return X, V, U, sigma
 
     # ---- one start ---------------------------------------------------------------
     def _solve_from(self, env, guess):
@@ -534,7 +586,8 @@ class BirkhoffAircraftSCP(AircraftSCP):
             else:
                 hn, Gn = self.obstacle_eval(env, P_bar)
             step_bound = min(cap, max(2.0 * last_step, 0.02)) if BK_ADAPTIVE_REACH else cap
-            reach = np.sqrt(3) * step_bound * base.POS_SCALE + base.PRUNE_BUFFER
+            reach = (LEBESGUE_FACTOR * np.sqrt(3) * step_bound * base.POS_SCALE
+                     + base.PRUNE_BUFFER)
             near = hn <= reach
             if BK_MAX_OBS_PER_CHECK is not None and hn.shape[1] > BK_MAX_OBS_PER_CHECK:
                 K = BK_MAX_OBS_PER_CHECK
@@ -556,24 +609,28 @@ class BirkhoffAircraftSCP(AircraftSCP):
                 Gm = (sp.csr_matrix((vals, (rows, cols)), shape=(R, nz)) @ sp.diags(zs)).tocsr()
                 Es = sp.csr_matrix((np.ones(R), (np.arange(R), rc)), shape=(R, C))
 
+            ok = False
             if DIRECT_CLARABEL and base.SOLVER == "CLARABEL":
                 try:
                     out = self._direct_subproblem(env, X_bar, V_bar, U_bar, s_bar, zbar, zs, cap,
                                                   Mc_s, rhs, Mi_s, rhs_i, Gm, Es,
                                                   hn[rc, rm] if Gm is not None else None)
-                except Exception:
+                except (ImportError, ValueError, np.linalg.LinAlgError) as exc:
                     out = None
+                    if self.verbose:
+                        print(f"    direct Clarabel setup failed ({exc}); retrying through CVXPY")
                 ok = out is not None
                 if ok:
                     dz_val = out[0]
-            else:
+            if not ok:
                 dz = cp.Variable(nz)
                 nu_v = cp.Variable(G * nx)
                 X = X_bar + cp.multiply(xs[None, :], cp.reshape(dz[oX:oV], (G, nx), order="C"))
                 U = U_bar + cp.multiply(us[None, :], cp.reshape(dz[oU:isg], (G, nu), order="C"))
                 sig = s_bar * (1 + dz[isg])
                 cons = self.subproblem_constraints(env, X, U, sig, X_bar, U_bar, s_bar, G)
-                cons += [cp.abs(dz) <= cap, Mc_s @ dz - nu_v == rhs, Mi_s @ dz == rhs_i]
+                trusted = np.r_[np.arange(oV), np.arange(oU, nz)]
+                cons += [cp.abs(dz[trusted]) <= cap, Mc_s @ dz - nu_v == rhs, Mi_s @ dz == rhs_i]
                 L_expr = self.cost_expr(X, U, sig, G) + base.LAMBDA_DYN * cp.norm1(nu_v)
                 if Gm is not None:
                     slack = cp.Variable(C, nonneg=True)
@@ -677,25 +734,22 @@ class BirkhoffAircraftSCP(AircraftSCP):
         return np.einsum("cj,cjk->ck", self.bb.lagrange(tl), U[self.idx[seg]])
 
     def verify_rk4(self, X, V, U, sigma):
-        """Multiple-shooting check of the plan with its true (polynomial) controls:
-        from each of VERIFY_INTERVALS uniform points, integrate the real dynamics with
-        RK4 to the next point and compare. Returns the max scaled defect."""
-        M, m = VERIFY_INTERVALS, VERIFY_SUBSTEPS
-        Xo, _ = self.resample(X, V, U, M + 1)
-        r0 = np.linspace(0, 1, M + 1)[:-1]
-        h = 1.0 / (M * m)                                   # normalized substep
-        x = Xo[:-1].copy()
+        """Integrate each LGL interval with RK4 and return its largest scaled defect."""
+        m = base.DENSE_STEPS
+        r0, h = self.r[:-1], self.dr / m
+        x = X[:-1].copy()
         with np.errstate(all="ignore"):
             for j in range(m):
                 t = r0 + j * h
                 u0, um, u1 = (self.controls_at(U, t), self.controls_at(U, t + h / 2),
                               self.controls_at(U, t + h))
+                dt = sigma * h
                 k1 = self.model.f(x, u0)
-                k2 = self.model.f(x + sigma * h / 2 * k1, um)
-                k3 = self.model.f(x + sigma * h / 2 * k2, um)
-                k4 = self.model.f(x + sigma * h * k3, u1)
-                x = x + sigma * h / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
-            d = np.abs((Xo[1:] - x) / self.xs)
+                k2 = self.model.f(x + dt[:, None] / 2 * k1, um)
+                k3 = self.model.f(x + dt[:, None] / 2 * k2, um)
+                k4 = self.model.f(x + dt[:, None] * k3, u1)
+                x = x + dt[:, None] / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+            d = np.abs((X[1:] - x) / self.xs)
         return float(d.max()) if np.all(np.isfinite(d)) else float("inf")
 
     def open_loop(self, X, U, sigma):
@@ -722,7 +776,8 @@ class BirkhoffAircraftSCP(AircraftSCP):
     def _finish(self, env, X, V, U, sigma, defect, viol, converged, status, it, history, elapsed):
         # dense obstacle check on the polynomial path
         Pd = self.positions(X, V, self.d_seg, self.d_B)
-        margin = float(self.obstacle_eval(env, Pd)[0].min())
+        dense_h = self.obstacle_eval(env, Pd)[0]
+        margin = float(dense_h.min()) if dense_h.size else float("inf")
         dense_tol = base.DENSE_TOLERANCE if base.DENSE_TOLERANCE is not None else 0.25 * env.margin
         # RK4 re-check of the plan with its own polynomial controls; then the uniform resampling
         verify_defect = self.verify_rk4(X, V, U, sigma)
@@ -736,18 +791,19 @@ class BirkhoffAircraftSCP(AircraftSCP):
         feasible = defect <= base.TOL_DEFECT and viol <= base.TOL_VIOLATION
         if feasible and margin < -dense_tol:
             status = "dense_check_failed"
-        elif feasible and verify_defect > VERIFY_DEFECT_TOL:
-            status = "verify_failed"
+        elif feasible and verify_defect > SHOOT_TOL:
+            status = "shooting_mismatch"
         elif feasible:
             status = "feasible" if converged else "feasible_unconverged"
         elif converged:
             status = "converged_infeasible"
         res = SolveResult(status.startswith("feasible"), status, it, elapsed, sigma,
-                          self.cost(X, U, sigma), defect, viol, margin, Xo, Uo, history)
+                          self.cost(X, U, sigma), verify_defect, viol, margin, Xo, Uo, history)
         res.birkhoff = {"segments": self.S, "degree": self.bb.n, "nodes": self.G,
                         "node_times_normalized": self.r.tolist(),
                         "X": X.tolist(), "V": V.tolist(), "U": U.tolist(),
-                        "verify_defect": verify_defect, "open_loop_max_dev_m": ol_max,
+                        "verify_defect": verify_defect, "collocation_defect": defect,
+                        "open_loop_max_dev_m": ol_max,
                         "open_loop_end_error_m": float(dev[-1]) if np.isfinite(dev[-1]) else None}
         return res
 
@@ -761,11 +817,20 @@ def main():
     ap.add_argument("--out", default=RESULTS_FILE)
     ap.add_argument("--feasible-out", default=FEASIBLE_FILE)
     ap.add_argument("--max-envs", type=int, default=None)
+    ap.add_argument("--nodes", type=int, default=BK_NODES,
+                    help="LGL node count (default: adaptive from flight distance)")
+    ap.add_argument("--plot", type=int, default=None, metavar="INDEX",
+                    help="solve all environments, then plot this environment")
     ap.add_argument("--show", type=int, default=None, metavar="INDEX",
                     help="plot a SAVED result without solving anything")
+    ap.add_argument("--selftest", action="store_true", help="check the Birkhoff operators")
     ap.add_argument("--verbose", action=argparse.BooleanOptionalAction, default=base.VERBOSE)
     args = ap.parse_args()
     warnings.filterwarnings("ignore", category=UserWarning, module="cvxpy")
+
+    if args.selftest:
+        selftest()
+        return
 
     if args.show is not None:
         env, r, res = load_plan(args.envs, args.out, args.show)
@@ -775,21 +840,21 @@ def main():
         return
 
     envs = load_environments(args.envs)[: args.max_envs]
-    solver = BirkhoffAircraftSCP(verbose=args.verbose)
+    solver = BirkhoffAircraftSCP(verbose=args.verbose, nodes=args.nodes)
     results, feasible = [], []
     print(f"Solving {len(envs)} environments with {solver.name} [{base.AIRFRAME_NAME}] "
-          f"(degree {BK_DEGREE} per segment, up to {solver.n_starts} starts each)")
+          f"(up to {solver.n_starts} starts each)")
     for i, env in enumerate(envs):
         res = solver.solve(env)
         bk = res.birkhoff
-        print(f"  env {i:3d}  {bk['segments']:2d} seg / {bk['nodes']:3d} nodes  "
+        print(f"  env {i:3d}  nodes {bk['nodes']:3d}  "
               f"{res.status:22s} best start {res.best_start + 1:2d}/{len(res.attempts)} "
               f"({sum(c is not None for c in res.attempt_costs)} valid)  cost {res.cost:8.3f}  "
               f"iters {res.iterations:3d}  {res.solve_time:6.1f}s  flight {res.flight_time:6.1f}s  "
               f"margin {res.dense_min_margin:+.2f}  RK4 check {bk['verify_defect']:.1e}  "
               f"open-loop drift {bk['open_loop_max_dev_m']:.1f} m")
         results.append({"env_index": i, "env_file": args.envs, "env_fingerprint": env.fingerprint(),
-                        "solver": solver.name, **res.to_dict(), "birkhoff": bk})
+                        "solver": solver.name, "method": "birkhoff", **res.to_dict(), "birkhoff": bk})
         if res.success:
             feasible.append(env)
 
@@ -799,6 +864,26 @@ def main():
     feas_path = save_environments(feasible, args.feasible_out)
     print(f"\n{len(feasible)}/{len(envs)} feasible.\n  results -> {out_path}\n"
           f"  feasible environments -> {feas_path}")
+    if args.plot is not None:
+        if not 0 <= args.plot < len(envs):
+            raise SystemExit(f"--plot index must be between 0 and {len(envs) - 1}.")
+        plot_result(envs[args.plot], solver.solve(envs[args.plot]), AircraftSCP())
+
+
+def selftest():
+    """Check the LGL interpolation and Birkhoff integration identities."""
+    for nodes in (4, 8, 16):
+        basis = BirkhoffBasis(nodes - 1)
+        identity_error = np.max(np.abs(basis.lagrange(basis.tau) - np.eye(nodes)))
+        endpoint_error = np.max(np.abs(basis.B[0]))
+        quadrature_error = abs(np.sum(basis.w) - 2.0)
+        derivative_error = np.max(np.abs(basis.B @ basis.derivative() - np.eye(nodes) +
+                                         np.ones((nodes, 1)) @ np.eye(nodes)[0:1]))
+        if max(identity_error, endpoint_error, quadrature_error, derivative_error) > 1e-8:
+            raise RuntimeError(f"Birkhoff operator self-test failed at {nodes} nodes.")
+        print(f"{nodes:2d} nodes: interpolation {identity_error:.1e}, "
+              f"integration {endpoint_error:.1e}, quadrature {quadrature_error:.1e}, "
+              f"derivative {derivative_error:.1e}")
 
 
 if __name__ == "__main__":

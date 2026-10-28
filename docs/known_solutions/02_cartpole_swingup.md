@@ -6,8 +6,7 @@
 
 ## 1. The problem
 
-The same cart-pole as in [test 1](01_cartpole_balanced_move.md), with the same parameters, but now the pendulum starts **hanging straight down** at rest. In 2 s the cart must swing it up to balance upright, ending 1 m along the track at rest, with minimum control effort. This is the example problem of Kelly (2017), Section 6:
-https://epubs.siam.org/doi/10.1137/16M1062569
+The same cart-pole as in [test 1](01_cartpole_balanced_move.md), with the same parameters, but now the pendulum starts **hanging straight down** at rest. In 2 s the cart must swing it up to balance upright, ending 1 m along the track at rest, with minimum control effort. This is the example problem of Kelly (2017), Section 6 (see the [Kelly 2017 reference page](../references/kelly2017.md)):
 
 ```math
 \min_{u(\cdot)}\ J = \int_0^{2} u(t)^2\,dt \qquad\qquad \text{(6.3)}

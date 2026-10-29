@@ -1,0 +1,132 @@
+# c172_sitl.parm - ArduPlane settings for the JSBSim Cessna 172 (c172x) in SITL.
+#
+# Load it when starting SITL (from WSL, in ~/ardupilot/ArduPlane):
+#     sim_vehicle.py -v ArduPlane -f jsbsim:c172x --add-param-file=<project>/ardupilot/c172_sitl.parm ...
+# (or, inside MAVProxy:  param load <project>/ardupilot/c172_sitl.parm)
+#
+# Part 1 is ArduPilot's own SITL plane defaults. Recent ArduPilot versions only
+# load them automatically for "-f jsbsim" (the Rascal), not for "-f jsbsim:c172x",
+# so they are repeated here; older versions load them anyway, and the values are
+# identical, so the result is the same either way. They include the pitch/yaw
+# reversals every JSBSim model needs in ArduPilot SITL.
+#
+# Part 2 matches the autopilot to the planner's C172 (aircraftmodel/c172_params.json):
+#   planner speeds 33.0 / 48.9 / 59.2 m/s (V_MIN / V_CRUISE / V_MAX), bank <= 30 deg,
+#   flight-path angle <= 6 deg (about 5 m/s at cruise).
+# The autopilot is allowed a little more (45 deg bank) so it can correct errors,
+# the same split jsbsim_c172.py uses (planner 30 deg, BANK_CMD_MAX_DEG 45 deg).
+
+# ==== Part 1: ArduPilot SITL plane defaults (Tools/autotest/models/plane.parm and
+#      plane-reverse-servo-pitch-yaw.parm / plane-reverse-rc-pitch-yaw.parm) ======
+BATT_MONITOR      4
+LOG_BITMASK       65535
+PTCH_TRIM_DEG     0.00
+LAND_PITCH_DEG    1.00
+LAND_FLARE_SEC    3
+LAND_DISARMDELAY  3
+KFF_RDDRMIX       0.5
+RC1_MAX           2000
+RC1_MIN           1000
+RC1_TRIM          1500
+RC2_MAX           2000
+RC2_MIN           1000
+RC2_TRIM          1500
+RC3_MAX           2000
+RC3_MIN           1000
+SERVO3_MIN        1000
+SERVO3_MAX        2000
+RC3_TRIM          1000
+RC4_MAX           2000
+RC4_MIN           1000
+RC4_TRIM          1500
+RC5_MAX           2000
+RC5_MIN           1000
+RC5_TRIM          1500
+RC6_MAX           2000
+RC6_MIN           1000
+RC6_TRIM          1500
+RC7_MAX           2000
+RC7_MIN           1000
+RC7_TRIM          1500
+RC8_MAX           2000
+RC8_MIN           1000
+RC8_TRIM          1500
+FLTMODE1          10
+FLTMODE2          11
+FLTMODE3          12
+FLTMODE4          5
+FLTMODE5          2
+FLTMODE6          0
+FLTMODE_CH        8
+RLL2SRV_TCONST    0.250000
+RLL_RATE_D        0.017430
+RLL_RATE_FF       0.237212
+RLL_RATE_I        0.25
+RLL_RATE_P        0.3
+PTCH2SRV_TCONST   0.25
+PTCH_RATE_D       0.007265
+PTCH_RATE_FF      0.595723
+PTCH_RATE_I       0.11
+PTCH_RATE_P       0.15
+PTCH2SRV_RLL      1
+ACRO_LOCKING      1
+# we need small INS_ACC offsets so INS is recognised as being calibrated
+INS_ACCOFFS_X     0.001
+INS_ACCOFFS_Y     0.001
+INS_ACCOFFS_Z     0.001
+INS_ACCSCAL_X     1.001
+INS_ACCSCAL_Y     1.001
+INS_ACCSCAL_Z     1.001
+INS_ACC2OFFS_X    0.001
+INS_ACC2OFFS_Y    0.001
+INS_ACC2OFFS_Z    0.001
+INS_ACC2SCAL_X    1.001
+INS_ACC2SCAL_Y    1.001
+INS_ACC2SCAL_Z    1.001
+INS_GYR_CAL       0
+# JSBSim models: pitch and yaw reversed
+SERVO2_REVERSED   1
+SERVO4_REVERSED   1
+RC2_REVERSED      1
+RC4_REVERSED      1
+
+# ==== Part 2: Cessna 172 ======================================================
+
+# ---- speeds (m/s) ----------------------------------------------------------------
+AIRSPEED_CRUISE   48.9
+AIRSPEED_MIN      33
+AIRSPEED_MAX      59
+AIRSPEED_STALL    25
+ARSPD_USE         1
+SCALING_SPEED     45        # control gains are defined at this airspeed (default 15 is for small UAVs)
+
+# ---- attitude limits ----------------------------------------------------------------
+ROLL_LIMIT_DEG    45
+PTCH_LIM_MAX_DEG  15
+PTCH_LIM_MIN_DEG  -15
+RLL2SRV_RMAX      45        # deg/s, a C172-like roll rate
+PTCH2SRV_RMAX_UP  30
+PTCH2SRV_RMAX_DN  30
+
+# ---- throttle and energy (TECS) ---------------------------------------------------------
+THR_MAX           100
+TRIM_THROTTLE     71        # % for level cruise at 48.9 m/s, measured in the box test flight (was 55)
+TECS_CLMB_MAX     5.0       # m/s, = the planner's 6 deg at cruise (full throttle, may trade speed)
+TECS_SINK_MIN     1.5
+TECS_SINK_MAX     6.0       # m/s, = the planner's 6 deg descent at its top speed
+
+# ---- navigation -------------------------------------------------------------------
+NAVL1_PERIOD      20        # s; larger = smoother, slower path convergence (larger aircraft)
+WP_RADIUS         120       # m
+WP_LOITER_RAD     600       # m; must exceed the turn radius (about 420 m at 30 deg, 49 m/s)
+
+# ---- takeoff (tricycle gear) --------------------------------------------------------
+TKOFF_ROTATE_SPD  28        # m/s, about 55 kt
+TKOFF_THR_MAX     100
+TKOFF_TDRAG_ELEV  0         # not a tail-dragger
+TKOFF_TDRAG_SPD1  0
+TKOFF_ALT         150
+GROUND_STEER_ALT  5
+
+# ---- misc ---------------------------------------------------------------------------
+RTL_AUTOLAND      0

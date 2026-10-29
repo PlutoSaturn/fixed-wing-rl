@@ -182,7 +182,7 @@ def make_environment(radius_nm=TFR_RADIUS_NM, distance_km=DISTANCE_KM, offset_m=
 
 
 # --------------------------------------------------------------------------
-# check: SCP plan (and optionally a JSBSim flight) against the reference
+# check: SCP plan (and optionally a flown path, JSBSim or ArduPilot) against the reference
 # --------------------------------------------------------------------------
 def path_length(P):
     return float(np.sum(np.linalg.norm(np.diff(P, axis=0), axis=1)))
@@ -302,12 +302,12 @@ def check(args):
         with open(find_input(args.flight)) as f:
             rows = list(csv.DictReader(f))
         F = np.array([[float(q["x_east_m"]), float(q["y_north_m"]), float(q["z_up_m"])] for q in rows])
-        v, lines = assess("JSBSim flight", F, env, ref, f" ({args.flight})", is_plan=False)
+        v, lines = assess("Flown path", F, env, ref, f" ({args.flight})", is_plan=False)
         print("\n".join(lines))
         print(f"  verdict: {v}  (a flown path may be a little shorter or longer than the plan;\n"
               f"           what matters most here is that it stays out of the TFR)\n")
         verdicts.append(v)
-        plot_paths.append(("JSBSim flight", F, "m"))
+        plot_paths.append(("Flown path", F, "m"))
 
     if verdicts:
         overall = "FAIL" if "FAIL" in verdicts else ("WARN" if "WARN" in verdicts else "PASS")
@@ -356,10 +356,10 @@ def main():
     m.add_argument("--offset-m", type=float, default=GOAL_OFFSET_M)
     m.add_argument("--altitude-m", type=float, default=ALTITUDE_M)
     m.add_argument("--plot", action="store_true", help="plot the environment and the optimum")
-    c = sub.add_parser("check", help="compare an SCP plan (and optionally a JSBSim flight) to the optimum")
+    c = sub.add_parser("check", help="compare an SCP plan (and optionally a flown path) to the optimum")
     c.add_argument("--envs", default="tfr_env.json")
     c.add_argument("--results", default="tfr_results.json")
-    c.add_argument("--flight", default=None, help="jsbsim_commands.csv from `python -m sim.jsbsim_c172 record`")
+    c.add_argument("--flight", default=None, help="flown path CSV: jsbsim_commands.csv from `python -m sim.jsbsim_c172 record`, or <log>_flight.csv from `python -m ardupilot.ardupilot_mission analyze`")
     c.add_argument("--plot", action="store_true")
     c.add_argument("--save", default="tfr_check.png", help="where --plot saves its figure (inside localstore/)")
     args = ap.parse_args()

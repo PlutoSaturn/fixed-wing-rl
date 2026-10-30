@@ -19,6 +19,13 @@ the TFR plan has been solved):
   * every analyzed flight is archived once in runs/, a different flight saved
     under an old name gets its own run folder, and runs.csv lists the runs in
     the order flown with the parameters changed between them.
+Tier 3 (batches of generated environments):
+  * the expected autopilot path cuts corners by the right amount and flags
+    corners whose legs are too short for the turn;
+  * the pass/fail rules (evaluate_flight) catch each kind of failure;
+  * with the TFR plan: build_mission rejects a plan when the required clearance
+    is raised above what the waypoint path keeps, and a whole batch (batch-make,
+    a flown log, batch-analyze) gives PASS / NOT_SOLVED / NOT_FLOWN as expected.
 
 Synthetic flights are written as .tlog files exactly as MAVProxy records them
 (8-byte big-endian microsecond timestamp + raw MAVLink packet).
@@ -161,7 +168,8 @@ def tier2_mission_structure_and_geometry():
     d = P[0][:2] - xy(items[4])
     assert abs(np.degrees(np.arctan2(d[1], d[0]) - xs[0, 5])) < 0.5
     # plan waypoints: first = start, last = goal, altitudes = z + floor, spacing
-    plan = items[meta["first_plan_item"]:meta["first_plan_item"] + meta["n_plan_waypoints"]]
+    plan = [items[i] for i in meta["plan_items"]]                         # speed commands sit between them
+    assert len(plan) == meta["n_plan_waypoints"] and all(it["cmd"] == 16 for it in plan)
     W = np.array([np.r_[xy(it), it["alt"] - meta["floor_agl_m"]] for it in plan])
     assert np.linalg.norm(W[0] - P[0]) < 0.01 and np.linalg.norm(W[-1] - P[-1]) < 0.01
     gaps = np.linalg.norm(np.diff(W, axis=0), axis=1)
@@ -468,6 +476,125 @@ def tier2_analyze_archives_runs():
     assert rows[1]["changed_since_previous_run"] == "TECS_TIME_CONST 5->8"     # STAT_ ignored
 
 
+def test_autopilot_path_cuts_corners():
+    """A 90 deg corner between long legs is cut by R (1/cos 45 - 1); with legs too
+    short for the turn, the turn tightens and needs more bank than allowed."""
+    R, V = 500.0, 50.0
+    W = np.array([[0, 0, 300], [2000, 0, 300], [2000, 2000, 300]], float)
+    path, bank = M.autopilot_path(W, R, 45.0, V)
+    cut = np.linalg.norm(path[:, :2] - W[1, :2], axis=1).min()
+    assert abs(cut - R * (1 / np.cos(np.radians(45)) - 1)) < 2.0, cut
+    assert abs(bank - np.degrees(np.arctan(V**2 / (9.81 * R)))) < 0.5
+    short = np.array([[0, 0, 300], [300, 0, 300], [300, 300, 300]], float)
+    _, bank_short = M.autopilot_path(short, R, 45.0, V)
+    assert bank_short > 45.0, bank_short                                    # 150 m turn radius at 50 m/s
+
+
+def test_param_overrides_parsing():
+    assert M.parse_param_overrides(["TECS_SINK_MAX=7", "navl1_period = 15"]) == \
+        {"TECS_SINK_MAX": 7.0, "NAVL1_PERIOD": 15.0}
+    for bad in ("TECS_SINK_MAX", "TECS_SINK_MAX=fast", "=3"):
+        try:
+            M.parse_param_overrides([bad])
+        except SystemExit:
+            continue
+        raise AssertionError(f"accepted {bad!r}")
+
+
+def test_evaluate_flight_rules():
+    good = {"samples_in_collision": 0, "min_clearance_m": 25.0, "left_workspace_m": 0.0, "goal_miss_m": 8.0,
+            "max_error_m": 18.0, "rms_error_m": 4.0, "reached_goal": True, "flight_time_s": 470.0,
+            "plan_flight_time_s": 458.0}
+    ok, why, near = M.evaluate_flight(good, 30.0)
+    assert ok and not why and not near
+    bad = dict(good, samples_in_collision=3, min_clearance_m=-2.0, goal_miss_m=120.0, max_error_m=35.0,
+               rms_error_m=12.0, flight_time_s=560.0)
+    ok, why, near = M.evaluate_flight(bad, 30.0)
+    assert not ok and near and len(why) == 5, why
+    _, _, near = M.evaluate_flight(dict(good, min_clearance_m=10.0), 30.0)
+    assert near                                                             # below half the margin
+
+
+def tier2_speed_commands_follow_the_plan():
+    """"plan" profile: after each plan waypoint W[k] (k >= 1) the speed command, when there is one, is the
+    plan's mean airspeed over the leg W[k-1] -> W[k] (ArduPilot applies it while flying to W[k]);
+    "constant": a single speed command."""
+    from solvers.scp_aircraft import load_plan
+    env, r, _ = load_plan(*CASE)
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "p.waypoints")
+        m = M.build_mission(env, r, 1.0, "plan")
+        M.write_mission(m, out, CASE[0], CASE[1], CASE[2], 1.0, r["flight_time"])
+        items = read_waypoints(out)
+        m_c = M.build_mission(env, r, 1.0, "constant")
+    p = M.load_airframe()
+    speeds = [it["p"][1] for it in items if it["cmd"] == 178]
+    assert len(speeds) > 3 and all(p["V_MIN"] + 2 - 1e-6 <= v <= p["V_MAX"] - M.SPEED_HEADROOM_MS + 1e-6 for v in speeds)
+    pi = m["plan_items"]
+    checked = 0
+    for k in range(1, len(pi)):
+        nxt = items[pi[k] + 1] if pi[k] + 1 < len(items) else None
+        if nxt is not None and nxt["cmd"] == 178:
+            assert abs(nxt["p"][1] - m["leg_speeds"][k - 1]) < 1e-3
+            checked += 1
+    assert checked == len(speeds) - 1                                     # all but the one before takeoff
+    assert sum(it[1] == 178 for it in m_c["items"]) == 1
+
+
+def tier2_build_mission_rejects_unsafe_waypoint_path():
+    from solvers.scp_aircraft import load_plan
+    env, r, _ = load_plan(*CASE)
+    m = M.build_mission(env, r, 1.0)
+    assert not m["rejects"], m["rejects"]
+    assert m["checks"]["est_min_clearance_m"] > 0.5 * env.margin
+    old = M.FLY_MIN_CLEARANCE_FRAC
+    try:
+        M.FLY_MIN_CLEARANCE_FRAC = 1.5                                      # demand more than the path keeps
+        m = M.build_mission(env, r, 1.0)
+    finally:
+        M.FLY_MIN_CLEARANCE_FRAC = old
+    assert m["rejects"] and "passes" in m["rejects"][0], m["rejects"]
+
+
+def tier2_batch_end_to_end():
+    """batch-make on two copies of the TFR plus an unsolved one, a synthetic flight for
+    the first, a failed arm for the second; batch-analyze scores them."""
+    import csv
+    env_list = json.load(open(find_input(CASE[0])))
+    res = [x for x in json.load(open(find_input(CASE[1]))) if x["env_index"] == 0][0]
+    with tempfile.TemporaryDirectory() as tmp:
+        envs_f, res_f = os.path.join(tmp, "envs.json"), os.path.join(tmp, "res.json")
+        json.dump([env_list[0]] * 3, open(envs_f, "w"))
+        json.dump([dict(res, env_index=0), dict(res, env_index=1),
+                   dict(res, env_index=2, success=False, status="infeasible")], open(res_f, "w"))
+        old = M.BATCH_DIR
+        M.BATCH_DIR = os.path.join(tmp, "batches")
+        try:
+            M.batch_make(SimpleNamespace(name="t", pair=[[envs_f, res_f]], chord_tol=1.0, speedup=5,
+                                         note="test", overwrite=False, param=["tecs_sink_max=7"]))
+            man = json.load(open(os.path.join(M.BATCH_DIR, "t", "manifest.json")))
+            assert man["param_overrides"] == {"TECS_SINK_MAX": 7.0} and man["speed_profile"] == "constant"
+            st = {i["id"]: i for i in man["instances"]}
+            assert [st[k]["status"] for k in ("envs_0", "envs_1", "envs_2")] == ["flyable", "flyable", "not_solved"]
+            env, r, F, t = synthetic_flight(lateral=5.0, vertical=0.0)
+            write_tlog(st["envs_0"]["log"], F, t)
+            json.dump({"status": "completed"}, open(st["envs_0"]["log"].replace(".tlog", ".run.json"), "w"))
+            json.dump({"status": "arm_failed", "detail": "PreArm: test"},
+                      open(st["envs_1"]["log"].replace(".tlog", ".run.json"), "w"))
+            M.batch_analyze(SimpleNamespace(name="t", plot=False))
+            rows = {x["id"]: x for x in csv.DictReader(open(os.path.join(M.BATCH_DIR, "t", "results.csv")))}
+            summ = json.load(open(os.path.join(M.BATCH_DIR, "t", "summary.json")))
+            assert os.path.exists(os.path.join(M.BATCH_DIR, "t", "summary.png"))
+            assert os.path.exists(os.path.join(M.BATCH_DIR, "t", "runs", "envs_0", "flight.tlog"))
+        finally:
+            M.BATCH_DIR = old
+    assert rows["envs_0"]["outcome"] == "PASS", rows["envs_0"]
+    assert abs(float(rows["envs_0"]["rms_error_m"]) - 5.0) < 1.0
+    assert rows["envs_1"]["outcome"] == "NOT_FLOWN" and "PreArm" in rows["envs_1"]["reasons"]
+    assert rows["envs_2"]["outcome"] == "NOT_SOLVED"
+    assert summ["pass"] == 1 and summ["not_flown"] == 1 and summ["not_solved"] == 1 and summ["pass_rate_of_flown"] == 1.0
+
+
 def tier2_log_with_two_sessions_uses_latest():
     """An older session with a bad flight, then a good one: the good one is analyzed."""
     env, r, F, t = synthetic_flight(lateral=15.0, vertical=-8.0)
@@ -483,6 +610,27 @@ def tier2_log_with_two_sessions_uses_latest():
         M.analyze(SimpleNamespace(mission=mission, log=log, plot=False))
         s = json.load(open(os.path.join(tmp, "both_summary.json")))
     assert s["collision_free"] and abs(s["max_horizontal_error_m"] - 15.0) < 1.5
+
+
+def tier2_analyze_ignores_low_pass_under_the_start():
+    """The takeoff passes 270 m directly below the plan's start, then the aircraft
+    loiters far away before flying the plan: the plan segment must start at the real
+    pass, not the low one (this happened in the Tier 3 pilot batch)."""
+    env, r, F, t = synthetic_flight(lateral=5.0, vertical=0.0)
+    _, xs = M.dense_plan(r)
+    P, chi = xs[:, :3], xs[:, 5]
+    u0 = np.r_[np.cos(chi[0]), np.sin(chi[0]), 0]
+    low = P[0] - [0, 0, 270] + np.linspace(-1500, 1500, 60)[:, None] * u0          # under the start
+    away = P[0] - 4000 * u0 + 600 * np.c_[np.cos(np.linspace(0, 6.3, 120)), np.sin(np.linspace(0, 6.3, 120)),
+                                         np.zeros(120)]
+    F2 = np.vstack([low, away, F])
+    with tempfile.TemporaryDirectory() as tmp:
+        mission = make_mission(tmp)
+        log = os.path.join(tmp, "low.tlog")
+        write_tlog(log, F2, np.arange(len(F2)) * 0.5)
+        M.analyze(SimpleNamespace(mission=mission, log=log, plot=False))
+        s = json.load(open(os.path.join(tmp, "low_summary.json")))
+    assert s["max_horizontal_error_m"] < 6.5 and s["rms_error_m"] < 6.0, s
 
 
 def tier2_analyze_detects_collision():

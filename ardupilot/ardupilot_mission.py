@@ -94,6 +94,19 @@ LEG_END_M            = 300.0
 # analyze: the plan segment of the flight starts/ends where the aircraft passes
 # within this distance of the plan's start/goal
 PASS_TOL_M           = 300.0
+# analyze: oscillation (weaving) of roll, pitch and altitude. Each signal minus its
+# moving average over OSC_WINDOW_S leaves the fast wobble; its RMS and dominant
+# period are reported. The first OSC_SKIP_S of the plan (the turn onto the first
+# leg) are left out so the start transient does not count as oscillation.
+OSC_WINDOW_S         = 20.0
+OSC_SKIP_S           = 30.0
+# analyze: every analyzed flight is archived in localstore/runs/<log name>/ (log, results,
+# plot, and the autopilot parameters it flew with), and localstore/runs/runs.csv lists all
+# runs in the order they were flown with the parameters changed since the previous run.
+# Parameters that change by themselves (statistics, barometer calibration, telemetry
+# rates) are left out of that comparison.
+RUNS_DIR             = "runs"
+PARAM_IGNORE         = ("STAT_", "BARO", "MAV", "SR0_", "SR1_", "SR2_", "SR3_", "MIS_")
 
 R_EARTH = fly.R_EARTH
 GRAVITY = 9.81
@@ -184,11 +197,11 @@ def chord_deviation(P, i, k):
     return float(np.linalg.norm(q - t[:, None] * ab, axis=1).max())
 
 
-def resample(P, chi):
+def resample(P, chi, chord_tol=CHORD_TOL_M):
     """Indices of dense plan points to use as waypoints. A new waypoint is placed
     when the leg from the last one reaches MAX_WP_SPACING_M, when the heading has
     turned MAX_WP_TURN_DEG, or when the straight leg would stray more than
-    CHORD_TOL_M from the plan; never closer than MIN_WP_SPACING_M (so the
+    chord_tol (default CHORD_TOL_M) from the plan; never closer than MIN_WP_SPACING_M (so the
     autopilot cannot skip one)."""
     keep, last, s = [0], 0, 0.0
     seg = np.linalg.norm(np.diff(P, axis=0), axis=1)
@@ -200,12 +213,12 @@ def resample(P, chi):
         turned = abs(np.degrees(chi[k] - chi[last]))
         if s >= MAX_WP_SPACING_M or turned >= MAX_WP_TURN_DEG:
             keep.append(k); last, s = k, 0.0
-        elif chord_deviation(P, last, k) > CHORD_TOL_M:
+        elif chord_deviation(P, last, k) > chord_tol:
             j = k - 1 if cum[k - 1] - cum[last] >= MIN_WP_SPACING_M else k   # the last point still within tolerance
             keep.append(j); last, s = j, cum[k] - cum[j]
     end = len(P) - 1
     if cum[end] - cum[keep[-1]] < MIN_WP_SPACING_M and len(keep) > 1 \
-            and chord_deviation(P, keep[-2], end) <= CHORD_TOL_M:
+            and chord_deviation(P, keep[-2], end) <= chord_tol:
         keep.pop()                                   # do not crowd the goal, if the merged leg still fits
     keep.append(end)
     return keep
@@ -320,7 +333,8 @@ def make(args):
     warnings_ = []
 
     # ---- plan waypoints
-    idx = resample(P, chi)
+    chord_tol = CHORD_TOL_M if getattr(args, "chord_tol", None) is None else args.chord_tol
+    idx = resample(P, chi, chord_tol)
     W = P[idx]
     chord, _ = point_to_polyline(P, W)
 
@@ -381,7 +395,7 @@ def make(args):
     meta = {"envs": args.envs, "results": args.results, "index": args.index,
             "floor_agl_m": FLOOR_AGL_M, "origin": [fly.ORIGIN_LAT_DEG, fly.ORIGIN_LON_DEG],
             "home_lat_lon": [float(hlat), float(hlon)], "home_heading_deg": home_heading,
-            "first_plan_item": first_plan_item, "n_plan_waypoints": len(W),
+            "first_plan_item": first_plan_item, "n_plan_waypoints": len(W), "chord_tol_m": chord_tol,
             "commanded_airspeed_ms": speed, "plan_flight_time_s": r["flight_time"]}
     meta["kind"] = "scp_plan"
     with open(f"{out}.json", "w") as f:
@@ -477,8 +491,12 @@ then in PyCharm's terminal:
 # --------------------------------------------------------------------------
 # telemetry log reading (no extra packages needed)
 # --------------------------------------------------------------------------
-_CRC_EXTRA = {33: 104, 74: 20}       # GLOBAL_POSITION_INT, VFR_HUD
-_LEN = {33: 28, 74: 20}
+# GLOBAL_POSITION_INT, VFR_HUD, ATTITUDE, NAV_CONTROLLER_OUTPUT, PARAM_VALUE, HEARTBEAT
+_CRC_EXTRA = {33: 104, 74: 20, 30: 39, 62: 183, 22: 220, 0: 50}
+_LEN = {33: 28, 74: 20, 30: 28, 62: 26, 22: 25, 0: 9}
+# ArduPlane flight modes (HEARTBEAT custom_mode)
+PLANE_MODES = {0: "MANUAL", 1: "CIRCLE", 2: "STABILIZE", 3: "TRAINING", 4: "ACRO", 5: "FBWA", 6: "FBWB",
+               7: "CRUISE", 8: "AUTOTUNE", 10: "AUTO", 11: "RTL", 12: "LOITER", 13: "TAKEOFF", 15: "GUIDED"}
 
 
 def _crc(data, extra):
@@ -491,10 +509,16 @@ def _crc(data, extra):
 
 
 def read_tlog(path, sysid=1):
-    """GLOBAL_POSITION_INT and VFR_HUD from a MAVProxy .tlog (8-byte timestamp +
-    MAVLink 1/2 packet per record), CRC-checked. Returns dicts of arrays."""
+    """GLOBAL_POSITION_INT, VFR_HUD, ATTITUDE, NAV_CONTROLLER_OUTPUT and
+    PARAM_VALUE from a MAVProxy .tlog (8-byte timestamp + MAVLink 1/2 packet per
+    record), CRC-checked. Returns a dict of arrays; "attitude" (t, roll, pitch in deg)
+    and "nav" (t, commanded roll, commanded pitch in deg, altitude error in m) are on
+    the same clock as "t" when the log has them. "params" holds the autopilot's
+    parameters (the last value of each in the log: MAVProxy fetches them all when it
+    connects, so with several sessions the latest one's values win), "log_start" the
+    log (wall-clock) time of the first position, in seconds since 1970."""
     data = open(path, "rb").read()
-    pos, hud = [], []
+    pos, hud, att, nav, params, modes, pchanges = [], [], [], [], {}, [], []
     i, n = 0, len(data)
     while i + 8 < n:
         t_us = int.from_bytes(data[i:i + 8], "big")
@@ -523,9 +547,24 @@ def read_tlog(path, sysid=1):
                 if mid == 33:
                     tb, lat, lon, a_msl, a_rel, vx, vy, vz, hdg = struct.unpack("<IiiiihhhH", pl[:28])
                     pos.append((t_us * 1e-6, tb * 1e-3, lat * 1e-7, lon * 1e-7, a_rel * 1e-3))
-                else:
+                elif mid == 74:
                     aspd, gspd, a, climb, hdg, thr = struct.unpack("<ffffhH", pl[:20])
                     hud.append((t_us * 1e-6, aspd, thr, climb))
+                elif mid == 30:
+                    roll, pitch = struct.unpack("<ff", pl[4:12])     # rad
+                    att.append((t_us * 1e-6, np.degrees(roll), np.degrees(pitch)))
+                elif mid == 0:
+                    if pl[4] == 1:                                   # MAV_TYPE_FIXED_WING (not a GCS or camera)
+                        modes.append((t_us * 1e-6, struct.unpack("<I", pl[:4])[0]))
+                elif mid == 22:
+                    value = struct.unpack("<f", pl[:4])[0]
+                    pname = pl[8:24].split(b"\0")[0].decode("ascii", "replace")
+                    if pname in params and params[pname] != value and not pname.startswith(PARAM_IGNORE):
+                        pchanges.append((t_us * 1e-6, pname, params[pname], value))   # e.g. a param set in flight
+                    params[pname] = value
+                else:
+                    nav_roll, nav_pitch, alt_err = struct.unpack("<fff", pl[:12])  # deg, deg, m
+                    nav.append((t_us * 1e-6, nav_roll, nav_pitch, alt_err))
         i = end
     if not pos:
         raise SystemExit(f"No GLOBAL_POSITION_INT messages from system {sysid} in {path}.")
@@ -542,13 +581,64 @@ def read_tlog(path, sysid=1):
         pos = pos[keep]
         if hud:
             hud = [h for h in hud if h[0] >= pos[0, 0]]
-    out = {"t": pos[:, 1] - pos[0, 1], "lat": pos[:, 2], "lon": pos[:, 3], "alt_rel": pos[:, 4]}
+    out = {"t": pos[:, 1] - pos[0, 1], "lat": pos[:, 2], "lon": pos[:, 3], "alt_rel": pos[:, 4],
+           "params": params, "log_start": float(pos[0, 0]),
+           # parameters changed during this session: (time on the clock of "t", name, old, new)
+           "param_changes": [(float(np.interp(c[0], pos[:, 0], pos[:, 1]) - pos[0, 1]),) + c[1:]
+                             for c in pchanges if pos[0, 0] <= c[0] <= pos[-1, 0]]}
     if hud:
         hud = np.array(hud)
         out["airspeed"] = np.interp(pos[:, 0], hud[:, 0], hud[:, 1])
         out["throttle"] = np.interp(pos[:, 0], hud[:, 0], hud[:, 2])
         out["climb"] = np.interp(pos[:, 0], hud[:, 0], hud[:, 3])
+    for key, rows in (("attitude", att), ("nav", nav), ("mode", modes)):
+        if not rows:
+            continue
+        a = np.array(rows)
+        a = a[(a[:, 0] >= pos[0, 0]) & (a[:, 0] <= pos[-1, 0])]   # this session only
+        if len(a):                                  # log time -> the autopilot clock used for "t"
+            a[:, 0] = np.interp(a[:, 0], pos[:, 0], pos[:, 1]) - pos[0, 1]
+            out[key] = a
     return out
+
+
+def oscillation(t, y, window=OSC_WINDOW_S):
+    """RMS and dominant period of the fast part of y(t): y minus its moving average
+    over `window` seconds. Returns (None, None) if the record is too short."""
+    if len(t) < 4:
+        return None, None
+    dt = float(np.median(np.diff(t)))
+    tu = np.arange(t[0], t[-1], dt)
+    w = int(round(window / dt))
+    if w < 2 or len(tu) < 4 * w:
+        return None, None
+    yu = np.interp(tu, t, y)
+    fast = (yu - np.convolve(yu, np.ones(w) / w, "same"))[w:-w]   # drop the edges of the average
+    freq = np.fft.rfftfreq(len(fast), dt)
+    power = np.abs(np.fft.rfft(fast))
+    power[freq < 1.0 / window] = 0.0
+    rms = float(np.sqrt(np.mean(fast ** 2)))
+    if not power.any():
+        return rms, None                                 # a constant signal has no period
+    return rms, float(1.0 / freq[np.argmax(power)])
+
+
+def follow_lag(t_cmd, cmd, t_out, out, window=OSC_WINDOW_S, max_lag=2.0):
+    """How far `out` trails `cmd` (s) and how big its fast part is relative to the
+    command's: the delay that maximizes the correlation of the two fast parts."""
+    t0, t1 = max(t_cmd[0], t_out[0]), min(t_cmd[-1], t_out[-1])
+    dt = 0.05
+    tu = np.arange(t0, t1, dt)
+    w = int(round(window / dt))
+    if len(tu) < 4 * w:
+        return None, None
+    hp = lambda t, y: (np.interp(tu, t, y) - np.convolve(np.interp(tu, t, y), np.ones(w) / w, "same"))[w:-w]
+    c, o = hp(t_cmd, cmd), hp(t_out, out)
+    if c.std() == 0 or o.std() == 0:
+        return None, None
+    lags = np.arange(0, int(max_lag / dt) + 1)
+    corr = [np.corrcoef(c[:len(c) - L], o[L:])[0, 1] for L in lags]
+    return float(lags[int(np.argmax(corr))] * dt), float(o.std() / c.std())
 
 
 def read_bin(path):
@@ -633,6 +723,28 @@ def analyze(args):
     if "airspeed" in f:
         summary["mean_airspeed_ms"] = float(np.mean(f["airspeed"][seg]))
 
+    # ---- oscillation (weaving), after the first OSC_SKIP_S of the plan
+    osc = {}
+    k = ts >= OSC_SKIP_S
+    osc["altitude"] = oscillation(ts[k], (Fs - near)[k, 2])          # height above/below the plan
+    t_from, t_to = t[i0] + OSC_SKIP_S, t[i1]
+    if "attitude" in f:
+        A = f["attitude"][(f["attitude"][:, 0] >= t_from) & (f["attitude"][:, 0] <= t_to)]
+        osc["roll"] = oscillation(A[:, 0], A[:, 1])
+        osc["pitch"] = oscillation(A[:, 0], A[:, 2])
+        if len(A):
+            summary["max_abs_roll_deg"] = float(np.abs(A[:, 1]).max())
+        if "nav" in f:
+            Nv = f["nav"][(f["nav"][:, 0] >= t_from) & (f["nav"][:, 0] <= t_to)]
+            osc["commanded_roll"] = oscillation(Nv[:, 0], Nv[:, 1])
+            if len(A) and len(Nv) > 1:                             # how closely roll follows the autopilot's command
+                cmd = np.interp(A[:, 0], Nv[:, 0], Nv[:, 1])
+                summary["roll_minus_command_rms_deg"] = float(np.sqrt(np.mean((A[:, 1] - cmd) ** 2)))
+    for name, (rms, period) in osc.items():
+        unit = "m" if name == "altitude" else "deg"
+        summary[f"{name}_oscillation_{unit}"] = rms
+        summary[f"{name}_oscillation_period_s"] = period
+
     print(f"Flight log {args.log}: {len(t)} samples, plan segment {ts[-1]:.0f} s "
           f"(plan {r['flight_time']:.0f} s){'' if reached else '  -- goal NOT reached'}")
     print(f"  distance from the planned path: max {summary['max_error_m']:.1f} m, "
@@ -642,10 +754,27 @@ def analyze(args):
           f"planned {summary['plan_min_clearance_m']:.1f} m (plan keeps {env.margin:.0f} m + vehicle radius)")
     if "mean_airspeed_ms" in summary:
         print(f"  mean airspeed {summary['mean_airspeed_ms']:.1f} m/s (commanded {meta['commanded_airspeed_ms']:.1f})")
+    def osc_text(name, label, unit):
+        rms, period = osc.get(name, (None, None))
+        return f"{label} {rms:.1f} {unit} rms, period {period:.1f} s" if rms is not None else f"{label} n/a"
+    print(f"  oscillation after the first {OSC_SKIP_S:.0f} s (part faster than {OSC_WINDOW_S:.0f} s):")
+    print(f"    {osc_text('roll', 'roll', 'deg')}; {osc_text('commanded_roll', 'commanded roll', 'deg')}"
+          + (f"; max |roll| {summary['max_abs_roll_deg']:.1f} deg" if "max_abs_roll_deg" in summary else ""))
+    print(f"    {osc_text('pitch', 'pitch', 'deg')}; {osc_text('altitude', 'altitude', 'm')}"
+          + (f"; roll vs command {summary['roll_minus_command_rms_deg']:.1f} deg rms"
+             if "roll_minus_command_rms_deg" in summary else ""))
     print(f"  {'COLLISION-FREE' if summary['collision_free'] else 'COLLISION or left the workspace'}"
           + (f"  ({summary['samples_in_collision']} samples inside an obstacle)" if summary['samples_in_collision'] else ""))
 
-    base = os.path.splitext(str(find_input(args.log)))[0]           # outputs go next to the log
+    if "log_start" in f:
+        import datetime
+        summary["flown_at"] = datetime.datetime.fromtimestamp(f["log_start"]).isoformat(timespec="seconds")
+    if getattr(args, "note", None):
+        summary["note"] = args.note
+    summary["n_plan_waypoints"] = meta.get("n_plan_waypoints")
+    summary["chord_tol_m"] = meta.get("chord_tol_m", 3.0)        # missions made before this was recorded used 3 m
+    log_path = str(find_input(args.log))
+    base = os.path.splitext(log_path)[0]                              # outputs go next to the log
     with open(base + "_summary.json", "w") as fh:
         json.dump(summary, fh, indent=2)
     import csv
@@ -658,18 +787,124 @@ def analyze(args):
             w.writerow([f"{v:.8g}" for v in (ts[k], *Fs[k], lat[k], lon[k], f["alt_rel"][seg][k])]
                        + ([f"{f['airspeed'][seg][k]:.4g}"] if "airspeed" in f else []))
     print(f"  wrote {base}_summary.json and {base}_flight.csv")
+    plot(env, Pp, F, Fs, err, ts, base, f.get("attitude"), f.get("nav"), t[i0], ts[-1],
+         (t, f["throttle"]) if "throttle" in f else None, summary)
+    archive_run(log_path, base, summary, f.get("params", {}), str(find_input(args.mission)))
+    import matplotlib.pyplot as plt
     if args.plot:
-        plot(env, Pp, F, Fs, err, ts, base)
+        plt.show()
+    plt.close("all")
 
 
-def plot(env, Pp, F, Fs, err, ts, base):
+# --------------------------------------------------------------------------
+# run archive (analyze)
+# --------------------------------------------------------------------------
+def _file_hash(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def write_params(path, params):
+    with open(path, "w") as fh:
+        for k in sorted(params):
+            fh.write(f"{k:<17} {params[k]:.7g}\n")
+
+
+def read_params(path):
+    out = {}
+    if os.path.exists(path):
+        for line in open(path):
+            parts = line.split()
+            if len(parts) >= 2 and not parts[0].startswith("#"):
+                out[parts[0]] = float(parts[1])
+    return out
+
+
+def param_changes(old, new):
+    "'NAME old->new' for every parameter that differs, leaving out PARAM_IGNORE."
+    keys = sorted(k for k in set(old) | set(new)
+                  if not k.startswith(PARAM_IGNORE) and old.get(k) != new.get(k))
+    fmt = lambda v: "-" if v is None else f"{v:.6g}"
+    return [f"{k} {fmt(old.get(k))}->{fmt(new.get(k))}" for k in keys]
+
+
+def archive_run(log_path, base, summary, params, mission_path=None):
+    "Copy this flight's log, results, parameters and mission to <log folder>/runs/<log name>/."
+    import shutil
+    name = os.path.basename(base)
+    root = os.path.join(os.path.dirname(log_path), RUNS_DIR)
+    os.makedirs(root, exist_ok=True)
+    digest = _file_hash(log_path)
+    run, k = os.path.join(root, name), 1
+    while os.path.exists(os.path.join(run, "log_sha256.txt")) and \
+            open(os.path.join(run, "log_sha256.txt")).read().strip() != digest:
+        k += 1                                  # a different flight was already archived under this name
+        run = os.path.join(root, f"{name}_{k}")
+    if k > 1 and not os.path.exists(run):
+        print(f"  NOTE: a different flight is already archived as runs/{name}; was {os.path.basename(log_path)} "
+              f"overwritten? This one is archived as runs/{os.path.basename(run)}.")
+    os.makedirs(run, exist_ok=True)
+    ext = os.path.splitext(log_path)[1]
+    if not os.path.exists(os.path.join(run, "flight" + ext)):
+        shutil.copy2(log_path, os.path.join(run, "flight" + ext))
+    open(os.path.join(run, "log_sha256.txt"), "w").write(digest + "\n")
+    for suffix in ("_summary.json", "_flight.csv", "_check.png"):
+        if os.path.exists(base + suffix):
+            shutil.copy2(base + suffix, os.path.join(run, suffix[1:]))
+    if params:
+        write_params(os.path.join(run, "params.parm"), params)
+    if mission_path:
+        shutil.copy2(mission_path, os.path.join(run, "mission.waypoints"))
+    write_runs_table(root)
+    print(f"  archived in {run} (all runs: {os.path.join(root, 'runs.csv')})")
+
+
+def write_runs_table(root):
+    "runs.csv: one row per archived run, in the order flown, with the parameters changed since the previous run."
+    import csv
+    runs = []
+    for d in sorted(os.listdir(root)):
+        sp = os.path.join(root, d, "summary.json")
+        if os.path.exists(sp):
+            s = json.load(open(sp))
+            runs.append((s.get("flown_at", ""), d, s, read_params(os.path.join(root, d, "params.parm"))))
+    runs.sort(key=lambda r: (r[0], r[1]))
+    cols = [("rms_error_m", 1), ("max_error_m", 1), ("min_clearance_m", 1), ("collision_free", None),
+            ("reached_goal", None), ("roll_oscillation_deg", 2), ("commanded_roll_oscillation_deg", 2),
+            ("pitch_oscillation_deg", 2), ("altitude_oscillation_m", 2), ("roll_oscillation_period_s", 1),
+            ("max_abs_roll_deg", 1), ("mean_airspeed_ms", 1)]
+    with open(os.path.join(root, "runs.csv"), "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["run", "flown_at", "mission", "n_plan_waypoints", "chord_tol_m"] + [c for c, _ in cols]
+                   + ["changed_since_previous_run", "note"])
+        prev = None
+        for flown, d, s, p in runs:
+            v = [s.get(c) for c, _ in cols]
+            v = ["" if x is None else (f"{x:.{nd}f}" if nd is not None else x) for x, (_, nd) in zip(v, cols)]
+            changed = "; ".join(param_changes(prev, p)) if prev is not None and p else ""
+            w.writerow([d, flown, os.path.basename(str(s.get("mission", ""))), s.get("n_plan_waypoints", ""),
+                        s.get("chord_tol_m", "")] + v + [changed, s.get("note", "")])
+            prev = p if p else prev
+
+
+def plot(env, Pp, F, Fs, err, ts, base, att=None, nav=None, t0=0.0, t_end=None, thr=None, summary=None):
     import matplotlib.pyplot as plt
     from environment.envgen import plot_environment
     ax = plot_environment(env)
     ax.plot(*Pp.T, "k--", lw=1.5, label="SCP plan")
     ax.plot(*Fs.T, "m-", lw=1.5, label="ArduPilot SITL")
     ax.legend(loc="upper left")
-    fig, axs = plt.subplots(1, 3, figsize=(16, 4.5))
+    fig, axs = plt.subplots(2, 3, figsize=(19, 9))
+    axs = axs.ravel()
+    summary = summary or {}
+
+    def osc_title(name, key, unit):
+        v = summary.get(key)
+        return name if v is None else f"{name}: oscillation {v:.2f} {unit} rms (after {OSC_SKIP_S:.0f} s)"
     axs[0].plot(F[:, 0], F[:, 1], "-", color="0.75", lw=1, label="whole flight")
     axs[0].plot(Pp[:, 0], Pp[:, 1], "k--", lw=1.5, label="plan")
     axs[0].plot(Fs[:, 0], Fs[:, 1], "m-", lw=1.2, label="flown (plan segment)")
@@ -686,12 +921,35 @@ def plot(env, Pp, F, Fs, err, ts, base):
     axs[2].plot(ts, err, "m-")
     axs[2].set_xlabel("time since plan start [s]"); axs[2].set_ylabel("distance from planned path [m]")
     axs[2].set_title("tracking error"); axs[2].set_ylim(bottom=0)
+    if att is not None:                                        # roll and pitch over the plan segment
+        A = att[(att[:, 0] >= t0) & (att[:, 0] <= t0 + t_end)]
+        Nv = None if nav is None else nav[(nav[:, 0] >= t0) & (nav[:, 0] <= t0 + t_end)]
+        for k, (col, name, key) in enumerate(((1, "roll", "roll_oscillation_deg"),
+                                               (2, "pitch", "pitch_oscillation_deg"))):
+            a = axs[3 + k]
+            a.plot(A[:, 0] - t0, A[:, col], "m-", lw=0.8, label=name)
+            if Nv is not None:
+                a.plot(Nv[:, 0] - t0, Nv[:, col], "k-", lw=0.6, alpha=0.6, label=f"commanded {name}")
+            a.axvline(OSC_SKIP_S, color="0.6", ls=":", lw=1)
+            a.set_xlabel("time since plan start [s]"); a.set_ylabel(f"{name} [deg]")
+            a.set_title(osc_title(name, key, "deg"), fontsize=10); a.legend(fontsize=8)
+    else:
+        axs[3].set_visible(False); axs[4].set_visible(False)
+    if thr is not None:
+        k = (thr[0] >= t0) & (thr[0] <= t0 + t_end)
+        axs[5].plot(thr[0][k] - t0, thr[1][k], "r-", lw=0.8)
+        axs[5].set_xlabel("time since plan start [s]"); axs[5].set_ylabel("throttle [%]")
+        axs[5].set_title("throttle")
+    else:
+        axs[5].set_visible(False)
+    v = summary.get("altitude_oscillation_m")
+    if v is not None:
+        axs[1].set_title(f"altitude: oscillation {v:.2f} m rms")
     for a in axs:
         a.grid(alpha=0.3)
     fig.tight_layout()
     fig.savefig(base + "_check.png", dpi=130)
     print(f"  plot saved to {base}_check.png")
-    plt.show()
 
 
 # --------------------------------------------------------------------------
@@ -849,6 +1107,74 @@ def plot_box(P, z, t, f, settled, corners, meta, base):
 
 
 # --------------------------------------------------------------------------
+# wobble: oscillation in each flight-mode segment of any flight
+# --------------------------------------------------------------------------
+WOBBLE_MIN_S         = 40.0             # report flight-mode segments at least this long ...
+WOBBLE_SETTLE_S      = 10.0             # ... leaving out this much after each mode change
+
+
+def wobble(args):
+    """Roll, pitch, altitude and throttle oscillation (same measure as analyze) for
+    every stretch of the flight spent in one flight mode with the same parameters:
+    e.g. FBWA with the sticks centred against AUTO, or several values of a parameter
+    tried in flight with `param set` while circling in the final loiter."""
+    f = read_tlog(str(find_input(args.log)))
+    if "mode" not in f or "attitude" not in f:
+        raise SystemExit("This log has no HEARTBEAT or ATTITUDE messages.")
+    md, A = f["mode"], f["attitude"]
+    # segment boundaries: every mode change and every parameter change
+    cuts = [(float(md[0, 0]), "")]
+    cuts += [(float(md[k, 0]), "") for k in np.nonzero(np.diff(md[:, 1]) != 0)[0] + 1]
+    for tc, pname, old, new in f.get("param_changes", []):
+        cuts.append((tc, f"{pname} {old:g}->{new:g}"))
+    cuts.sort(key=lambda c: c[0])
+    merged = []                                          # changes within a few seconds form one boundary
+    for tc, label in cuts:
+        if merged and tc - merged[-1][0] < 3.0:
+            merged[-1] = (merged[-1][0], "; ".join(x for x in (merged[-1][1], label) if x))
+        else:
+            merged.append((tc, label))
+    print(f"Flight log {args.log}: oscillation = rms of the part faster than {OSC_WINDOW_S:.0f} s "
+          f"(first {WOBBLE_SETTLE_S:.0f} s after each mode or parameter change left out)")
+    print(f"  {'mode':<9} {'from':>7} {'length':>7} | {'roll':>9} {'pitch':>9} {'altitude':>9} "
+          f"{'throttle':>9} | mean roll, throttle | pitch lag behind command, size | parameters changed at the start")
+    rows = []
+    for (ta, label), tb in zip(merged, [c[0] for c in merged[1:]] + [float(f["t"][-1])]):
+        t0, t1 = ta + WOBBLE_SETTLE_S, tb
+        if t1 - t0 < WOBBLE_MIN_S - WOBBLE_SETTLE_S:
+            continue
+        mode_now = md[max(0, np.searchsorted(md[:, 0], t0) - 1), 1]           # the mode after the settle time
+        name = PLANE_MODES.get(int(mode_now), str(int(mode_now)))
+        sa = (A[:, 0] >= t0) & (A[:, 0] <= t1)
+        sp = (f["t"] >= t0) & (f["t"] <= t1)
+        if "airspeed" in f and sp.any() and np.mean(f["airspeed"][sp]) < 15.0:
+            continue                                     # still on the ground
+        osc = {"roll": oscillation(A[sa, 0], A[sa, 1]), "pitch": oscillation(A[sa, 0], A[sa, 2]),
+               "altitude": oscillation(f["t"][sp], f["alt_rel"][sp])}
+        if "throttle" in f:
+            osc["throttle"] = oscillation(f["t"][sp], f["throttle"][sp])
+        lag, ratio = (None, None)
+        if "nav" in f:                                   # how closely pitch follows the autopilot's pitch command
+            Nv = f["nav"][(f["nav"][:, 0] >= t0) & (f["nav"][:, 0] <= t1)]
+            if len(Nv) > 10 and np.ptp(Nv[:, 2]) > 0.2:
+                lag, ratio = follow_lag(Nv[:, 0], Nv[:, 2], A[sa, 0], A[sa, 2])
+        cell = lambda k, u: (f"{osc[k][0]:.2f}{u}" if k in osc and osc[k][0] is not None else "n/a")
+        thr = f"{np.mean(f['throttle'][sp]):.0f}%" if "throttle" in f else "n/a"
+        print(f"  {name:<9} {t0 - WOBBLE_SETTLE_S:6.0f}s {t1 - t0 + WOBBLE_SETTLE_S:6.0f}s | {cell('roll', ' deg'):>9} "
+              f"{cell('pitch', ' deg'):>9} {cell('altitude', ' m'):>9} {cell('throttle', ' %'):>9} | "
+              f"{np.mean(A[sa, 1]):+.1f} deg, {thr} | "
+              + (f"{lag:.2f} s x{ratio:.2f}" if lag is not None else "-") + f" | {label}")
+        rows.append({"mode": name, "start_s": float(t0 - WOBBLE_SETTLE_S), "length_s": float(t1 - t0 + WOBBLE_SETTLE_S),
+                     "params_changed": label, "pitch_lag_s": lag, "pitch_vs_command": ratio,
+                     **{f"{k}_oscillation": v[0] for k, v in osc.items()},
+                     **{f"{k}_period_s": v[1] for k, v in osc.items()}})
+    base = os.path.splitext(str(find_input(args.log)))[0]
+    with open(base + "_wobble.json", "w") as fh:
+        json.dump(rows, fh, indent=2)
+    print(f"  wrote {base}_wobble.json")
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 def main():
@@ -871,12 +1197,17 @@ def main():
     m.add_argument("--results", default="tfr_results.json")
     m.add_argument("--index", type=int, default=0)
     m.add_argument("--out", default=None, help="mission file name (default <envs><index>.waypoints)")
+    m.add_argument("--chord-tol", type=float, default=None,
+                   help=f"how far a straight leg may stray from the plan, m (default CHORD_TOL_M = {CHORD_TOL_M:g})")
     a = sub.add_parser("analyze", help="Tier 2: check a flown SCP mission against the plan and the obstacles")
     a.add_argument("--mission", required=True, help="the .waypoints file written by make")
     a.add_argument("--log", required=True, help="MAVProxy .tlog (or DataFlash .BIN with pymavlink)")
-    a.add_argument("--plot", action="store_true")
+    a.add_argument("--plot", action="store_true", help="show the plots (they are saved either way)")
+    a.add_argument("--note", default=None, help='what was different about this run, e.g. "TECS_TIME_CONST 8"')
+    w_ = sub.add_parser("wobble", help="oscillation in each flight mode of any flight (e.g. an FBWA test)")
+    w_.add_argument("--log", required=True, help="MAVProxy .tlog")
     args = ap.parse_args()
-    {"box": box, "summary": summary, "make": make, "analyze": analyze}[args.command](args)
+    {"box": box, "summary": summary, "make": make, "analyze": analyze, "wobble": wobble}[args.command](args)
 
 
 if __name__ == "__main__":

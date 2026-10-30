@@ -58,16 +58,29 @@ FLTMODE4          5
 FLTMODE5          2
 FLTMODE6          0
 FLTMODE_CH        8
+# tuning run 1 (tfr_env0_roll1) tried RLL2SRV_TCONST 0.5: aileron activity fell 40% but the
+# roll/pitch weaving did not change, so it is back at the default
 RLL2SRV_TCONST    0.250000
-RLL_RATE_D        0.017430
-RLL_RATE_FF       0.237212
-RLL_RATE_I        0.25
-RLL_RATE_P        0.3
+# roll-rate gains from AUTOTUNE (localstore/autotune3.tlog, AUTOTUNE_LEVEL 0, 55 m/s).
+# Defaults were D 0.01743, FF 0.237212, I 0.25, P 0.3 (tuned for the small Rascal). With these,
+# CRUISE roll weave 0.96 -> 0.26 deg rms
+RLL_RATE_D        0.018923
+RLL_RATE_FF       0.939158
+RLL_RATE_I        0.939158
+RLL_RATE_P        0.940540
+RLL_RATE_FLTT     6.366198
+RLL_RATE_FLTD     10
 PTCH2SRV_TCONST   0.25
-PTCH_RATE_D       0.007265
-PTCH_RATE_FF      0.595723
-PTCH_RATE_I       0.11
-PTCH_RATE_P       0.15
+# pitch-rate gains from AUTOTUNE (localstore/autotune2.tlog, AUTOTUNE_LEVEL 0, 55 m/s).
+# Defaults were D 0.007265, FF 0.595723, I 0.11, P 0.15 (tuned for the small Rascal): pitch then
+# followed TECS's commands ~1.3 s late and the aircraft weaved every ~5 s. With these, that weave
+# is gone (CRUISE: pitch 1.65 -> 0.73 deg, altitude 1.25 -> 0.24 m rms)
+PTCH_RATE_D       0.012946
+PTCH_RATE_FF      1.058398
+PTCH_RATE_I       1.058398
+PTCH_RATE_P       0.638946
+PTCH_RATE_FLTT    6.366198
+PTCH_RATE_FLTD    10
 PTCH2SRV_RLL      1
 ACRO_LOCKING      1
 # we need small INS_ACC offsets so INS is recognised as being calibrated
@@ -114,8 +127,11 @@ TRIM_THROTTLE     71        # % for level cruise at 48.9 m/s, measured in the bo
 TECS_CLMB_MAX     5.0       # m/s, = the planner's 6 deg at cruise (full throttle, may trade speed)
 TECS_SINK_MIN     1.5
 TECS_SINK_MAX     6.0       # m/s, = the planner's 6 deg descent at its top speed
+TECS_TIME_CONST   8         # s (default 5). Tuning run 2: throttle swung 58-100% every ~5 s on the TFR
 
 # ---- navigation -------------------------------------------------------------------
+# tuning run 3 (tfr_env0_nav1) tried NAVL1_DAMPING 0.85 (default 0.75): the arc's roll swings did not
+# shrink; they come from the waypoint corners (a bank pulse at every waypoint, one per ~6.3 s leg)
 NAVL1_PERIOD      20        # s; larger = smoother, slower path convergence (larger aircraft)
 WP_RADIUS         120       # m
 WP_LOITER_RAD     600       # m; must exceed the turn radius (about 420 m at 30 deg, 49 m/s)

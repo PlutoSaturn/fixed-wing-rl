@@ -102,9 +102,46 @@ PyCharm:
 
 python -m ardupilot.ardupilot_mission analyze --mission tfr_env0.waypoints --log tfr_env0.tlog --plot
 
-Distance of the flight from the planned path (max and rms, horizontal and vertical), closest approach to the TFR, and whether it stayed collision-free. Saves tfr_env0_summary.json, tfr_env0_flight.csv and tfr_env0_check.png in localstore.
+Distance of the flight from the planned path (max and rms, horizontal and vertical), closest approach to the TFR, whether it stayed collision-free, and how much the roll, commanded roll, pitch and altitude oscillate (rms and period, leaving out the first 30 s). Saves tfr_env0_summary.json, tfr_env0_flight.csv and tfr_env0_check.png in localstore (--plot also shows the plots).
+
+Every analyzed flight is also archived in localstore/runs/<log name>/: a copy of the log (flight.tlog), the summary, the flown path, the plot, and params.parm, every autopilot parameter the flight actually used (read from the log). localstore/runs/runs.csv lists all runs in the order they were flown, with the main results and the parameters that changed since the previous run. Add --note "what changed" to record why a run was flown. Analyzing the same log again updates its run; if a different flight was saved under a log name already archived (an overwritten log), it is archived as <log name>_2 and analyze says so.
 
 python -m sim.tfr_benchmark check --flight tfr_env0_flight.csv --plot
 
 Compares the flown path with the analytic optimum and the SCP plan: flown length vs 26.610 km, which side, and clearance from the TFR (the flown path may dip into the 36 m planning clearance; it must stay out of the TFR itself).
 
+____
+
+**Tuning the autopilot (TFR mission)**
+
+Change one setting at a time in ardupilot/c172_sitl.parm (with a comment saying why), fly the same mission, and give each flight's log its own name so the comparison stays clean. SITL can run faster than real time: add --speedup 5 to the sim_vehicle.py command (JSBSim may manage only about 2x).
+
+MAVProxy, before arming (check the change was loaded):
+
+param show TECS_TIME_CONST
+
+WSL (a second Ubuntu terminal), with a new name for each run:
+
+cp ~/ardupilot/ArduPlane/mav.tlog /mnt/c/Users/isaia/fixed-wing-rl/localstore/tfr_env0_nav1.tlog
+
+PyCharm:
+
+python -m ardupilot.ardupilot_mission analyze --mission tfr_env0.waypoints --log tfr_env0_nav1.tlog --note "NAVL1_DAMPING 0.75->0.85" --plot
+
+Then open localstore/runs/runs.csv to compare it with the earlier runs.
+
+To test a different waypoint spacing, write the mission under its own name (the plan and home stay the same) and use that name in wp load and analyze; runs.csv records each run's mission, waypoint count and chord tolerance:
+
+python -m ardupilot.ardupilot_mission make --envs tfr_env.json --results tfr_results.json --index 0 --chord-tol 1 --out tfr_env0_chord1.waypoints
+
+To compare settings within one flight, change them with param set in MAVProxy (about 2 minutes of flight each, e.g. in CRUISE after rc 3 1846 and mode CRUISE), then:
+
+python -m ardupilot.ardupilot_mission wobble --log <log name>.tlog
+
+It reports roll, pitch, altitude and throttle oscillation, and how far pitch lags its command, for every stretch of the flight in one flight mode with the same parameters (a new row at every mode change and every param set).
+
+AUTOTUNE without a transmitter: in MAVProxy run output add 127.0.0.1:14552, take off, and once circling at altitude run in a second Ubuntu terminal (ArduPilot Python environment active):
+
+python3 /mnt/c/Users/isaia/fixed-wing-rl/ardupilot/autotune_inputs.py --axis pitch
+
+(or --axis roll). It sets AUTOTUNE_LEVEL 0, holds 80% throttle, sends the stick inputs, and ends in LOITER, which keeps the new gains. Copy the new values (param show PTCH_RATE* or RLL_RATE*) into ardupilot/c172_sitl.parm; SITL started with -w forgets them otherwise. The pitch and roll gains in c172_sitl.parm come from this.

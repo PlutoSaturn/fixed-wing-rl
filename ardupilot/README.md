@@ -1,14 +1,14 @@
 # ArduPilot SITL flight validation
 
-This folder flies SCP plans through a real autopilot, ArduPilot (ArduPlane SITL with the JSBSim Cessna 172), and scores each flight against its plan. It answers one question for the benchmark: **can a plan that is feasible on paper actually be flown, and when it can't, is that the plan's fault or the autopilot's?**
+This folder flies SCP plans through ArduPilot (ArduPlane SITL with the JSBSim Cessna 172), and scores each flight against its plan. It answers one question for the benchmark: **can a plan that is feasible on paper actually be flown, and when it can't, is that the plan's fault or the autopilot's?**
 
 Step-by-step commands for every tier are in [docs/ArduPilot_Commands.md](../docs/ArduPilot_Commands.md).
 
-| Tier | What it shows | Status |
-| --- | --- | --- |
-| 1 | The autopilot flies the C172 (a rectangle test mission) | done |
-| 2 | One known-solution plan (the stadium TFR detour) flies collision-free | done: 4.2 m RMS from the plan, 0.26% longer than the analytic optimum |
-| 3 | Plans for generated environments fly, as an unattended batch | done: 6 of 7 solved plans pass (results below) |
+| Tier | What it shows |
+| --- | --- | 
+| 1 | The autopilot flies the C172 (a rectangle test mission) |
+| 2 | One known-solution plan (the stadium TFR detour) flies collision-free |
+| 3 | Plans for generated environments fly, as an unattended batch |
 
 ## Files
 
@@ -24,6 +24,8 @@ Step-by-step commands for every tier are in [docs/ArduPilot_Commands.md](../docs
 Run outputs go to `localstore/` (not committed): each batch in `localstore/batches/<name>/` with `results.csv`, `summary.png`, and per flight `runs/<id>/` (log, parameters flown, mission, `check.png`).
 
 ## Tier 3 results
+
+A series of environments were generated to be flown in ArduPilot with varying degrees of  density: 3 "easy", 4 "nominal", and 3 "dense" environments.
 
 **Six of the seven SCP plans that solved were flown by ArduPilot within every pass criterion; the seventh, the most aggressive dense plan, brushed an obstacle.** SCP solved 7 of 10 generated environments; the other 3 stalled.
 
@@ -84,6 +86,14 @@ SITL is repeatable: the same plan flown twice with the same setup differed by un
 
 By difficulty: easy 3/3 pass, nominal 2/2 of the solved plans, dense 1/2 of the solved plans. Every flight took within 1-3% of the plan's flight time. Compared with the untuned setup (v1), RMS error fell on every plan; the largest gains were dense_1 (19.2 -> 14.0 m) and nominal_2 (11.2 -> 8.5 m).
 
+![Max distance from the plan by direction for each flown plan](figures/tier3_max_error_by_direction.png)
+
+*Worst sideways and altitude deviation from the plan for each flown plan, with the 30 m fail limit. Altitude is the larger error on 6 of 7 plans (on easy_2 both are about 2 m). Batch `tier3_v2`, 30 Oct 2026.*
+
+**A clean flight, easy_2** (RMS 0.7 m from the plan). Panels: top view, altitude, tracking error, roll, pitch, and throttle with airspeed.
+
+![easy_2 flight against its plan](figures/tier3_easy_2_flight.png)
+
 ### Failure analysis: dense_1
 
 The remaining error is altitude lag in ArduPilot's waypoint mode, not an unflyable plan. The JSBSim tracker flies each plan in time, using the plan's own bank and climb as feed-forward, and stays well inside the criteria on dense_1:
@@ -98,9 +108,7 @@ The JSBSim tracker's error is measured against the plan's position at each momen
 
 The failure happens where dense_1 descends at about 6 m/s while slowing from 57 to 44 m/s. Waypoints pass only the path's shape, so ArduPilot's altitude controller (TECS) reacts to the error after it opens instead of anticipating the descent. Raising ArduPilot's climb and sink limits did not help, which rules out a rate cap; passing the plan's speeds as waypoint commands made it worse.
 
-### Next steps
+![dense_1 flight against its plan](figures/tier3_dense_1_flight.png)
 
-1. **GUIDED-mode streaming:** send ArduPilot the plan's position and velocity in time instead of waypoints, so it anticipates climbs and turns as the JSBSim tracker does.
-2. **A larger batch (30-50 environments)** on tracking setup v2, for a pass rate with a usable confidence interval; 7 flights gives only a rough indication.
-3. **Planner headroom (team decision):** whether plans should leave margin in bank, climb rate and clearance for tracking error. Several plans already sit 23-25 m from obstacles instead of 30 m.
-4. **The 3 unsolved environments** are kept as SCP failure cases for the method comparison.
+*dense_1 on tracking setup v2. In the altitude panel the flight stays above the plan through the descent at about 6-8 km; the tracking error peaks at about 30 m near the end, where the aircraft brushes an obstacle. Batch `tier3_v2`, 30 Oct 2026.*
+

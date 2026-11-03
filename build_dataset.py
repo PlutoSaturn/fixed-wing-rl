@@ -16,7 +16,7 @@ def main() -> int:
         "--results",
         type=Path,
         default=default_data_dir,
-        help="directory containing solver result JSON files (default: localstore)",
+        help="solver result JSON file or directory (default: localstore)",
     )
     parser.add_argument(
         "--environment",
@@ -40,11 +40,10 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if not args.results.is_dir():
+    if not args.results.exists():
         print(
-            f"Results directory not found: {args.results}\n"
-            "Run solvers\\scp_aircraft.py first, or pass the folder containing "
-            "its result JSON files with --results."
+            f"Results file or directory not found: {args.results}\n"
+            "Pass an existing solver-result JSON file or result directory with --results."
         )
         return 1
     if args.format == "json" and not args.environment.is_file():

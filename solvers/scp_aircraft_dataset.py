@@ -111,6 +111,7 @@ class SCPAircraftDatasetParser:
         "success", "status", "failure_category", "failure_constraint",
         "stop_iteration", "stop_event", "iterations", "solve_time",
         "flight_time", "cost", "max_defect", "max_violation", "dense_min_margin",
+        "collision_free", "goal_error_m", "path_length_m", "replans", "failed_replans",
     )
     METADATA_COLUMNS = (
         "source_file", "env_index", "env_file", "env_fingerprint", "solver",
@@ -492,12 +493,20 @@ class SCPAircraftDatasetParser:
 
     def parse_result(self, result: dict[str, Any], result_file: str | Path = "result.json") -> dict[str, Any]:
         result_path = Path(result_file).resolve()
-        final = self._as_array(result.get("x"), columns=3)
+        final = self._as_array(
+            result.get("x", result.get("flown_x")), columns=3
+        )
         controls = self._as_array(result.get("u"), columns=1)
         guess = self._guess_array(result)
         raw_log = self._load_log(result_path, result)
         stop_iteration, stop_event = self._stop_iteration(result, raw_log)
-        success = bool(result.get("success", str(result.get("status", "")).startswith("feasible")))
+        status = result.get("status")
+        status_success = str(status).startswith("feasible") or status == "reached_goal"
+        success_value = result.get("success", status_success)
+        if status == "reached_goal" and result.get("collision_free") is False:
+            success_value = False
+        success = bool(success_value)
+        flight_time = result.get("flight_time", result.get("flight_time_s"))
 
         row: dict[str, Any] = {
             "source_file": str(result_path),
@@ -507,8 +516,11 @@ class SCPAircraftDatasetParser:
             "env_fingerprint": result.get("env_fingerprint"),
             "solver": result.get("solver"),
             "success": success,
-            "status": result.get("status"),
-            "failure_category": self._failure_category(result.get("status"), success, raw_log),
+            "status": status,
+            "failure_category": (
+                "collision" if status == "reached_goal" and not success
+                else self._failure_category(status, success, raw_log)
+            ),
             "stop_iteration": stop_iteration,
             "stop_event": stop_event,
             "log_iteration": self._log_iteration(raw_log),
@@ -535,11 +547,16 @@ class SCPAircraftDatasetParser:
             ),
             "iterations": result.get("iterations"),
             "solve_time": result.get("solve_time"),
-            "flight_time": result.get("flight_time"),
+            "flight_time": flight_time,
             "cost": result.get("cost"),
             "max_defect": result.get("max_defect"),
             "max_violation": result.get("max_violation"),
             "dense_min_margin": result.get("dense_min_margin"),
+            "collision_free": result.get("collision_free"),
+            "goal_error_m": result.get("goal_error_m"),
+            "path_length_m": result.get("path_length_m"),
+            "replans": result.get("replans"),
+            "failed_replans": result.get("failed_replans"),
             "best_start": result.get("best_start"),
             "attempt_index": None,
             "run_name": None,
@@ -608,8 +625,9 @@ class SCPAircraftDatasetParser:
                 guess_controls, self.node_count, self.CONTROL_NAMES, "guess_control"
             )
         )
-        row.update(self._resample_xyz(final, result.get("flight_time")) if success else
-                   self._resample_xyz(None, None))
+        # Keep solver-produced trajectories for inspection/plotting even on
+        # failed attempts; to_ml_tables deliberately excludes them from X.
+        row.update(self._resample_xyz(final, flight_time))
         for key, value in self.solver_constraints.items():
             if isinstance(value, (str, int, float, bool)) or value is None:
                 row[f"constraint_{key}"] = value
@@ -899,17 +917,24 @@ class SCPAircraftDatasetParser:
     def parse_directory(
         self, directory: str | Path, recursive: bool = False, file_format: str = "json"
     ) -> pd.DataFrame:
-        """Read JSON or HDF5 results and return flattened rows.
+        """Read a result file or JSON/HDF5 files in a directory.
 
         JSON files that do not contain SCP result records (for example raw
         environment files) are ignored. Malformed JSON raises a contextual
         ``ValueError`` rather than silently dropping data.
         """
         root = Path(directory)
-        if not root.is_dir():
-            raise NotADirectoryError(f"Result directory does not exist: {root}")
         if file_format not in {"json", "hdf5", "auto"}:
             raise ValueError("file_format must be 'json', 'hdf5', or 'auto'")
+        if root.is_file():
+            suffix = root.suffix.lower()
+            if file_format == "json" and suffix not in {".json", ""}:
+                raise ValueError(f"Expected a JSON result file, got: {root}")
+            if file_format == "hdf5" and suffix not in {".h5", ".hdf5"}:
+                raise ValueError(f"Expected an HDF5 result file, got: {root}")
+            return pd.DataFrame.from_records(self.parse_file(root))
+        if not root.is_dir():
+            raise FileNotFoundError(f"Result file or directory does not exist: {root}")
         patterns = ("*.json",) if file_format == "json" else (
             ("*.h5", "*.hdf5") if file_format == "hdf5" else ("*.json", "*.h5", "*.hdf5")
         )
@@ -932,7 +957,7 @@ class SCPAircraftDatasetParser:
         recursive: bool = False,
         file_format: str = "json",
     ) -> pd.DataFrame:
-        """Convenience batch API returning one DataFrame for a result directory."""
+        """Parse one result file or a directory into a DataFrame."""
         parser = cls(
             node_count=node_count,
             environment_file=environment_file,

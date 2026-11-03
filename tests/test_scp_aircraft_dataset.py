@@ -59,6 +59,48 @@ class SCPAircraftDatasetParserTests(unittest.TestCase):
         self.assertFalse(row["initial_guess_available"])
         self.assertIsNone(row["guess_final_position_max_error_m"])
 
+    def test_parse_receding_horizon_json_file_with_flown_trajectory(self):
+        result = {
+            "env_index": 0,
+            "method": "shooting",
+            "status": "reached_goal",
+            "collision_free": True,
+            "goal_error_m": 2.5,
+            "flight_time_s": 12.0,
+            "path_length_m": 150.0,
+            "replans": 4,
+            "failed_replans": 0,
+            "flown_x": [
+                [0, 0, 0, 15, 0, 0],
+                [25, 0, 5, 15, 0, 0],
+                [50, 0, 10, 15, 0, 0],
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "receding_results.json"
+            path.write_text(json.dumps([result]), encoding="utf-8")
+            frame = SCPAircraftDatasetParser.parse_directory_to_dataframe(
+                path, node_count=3
+            )
+
+        self.assertEqual(len(frame), 1)
+        self.assertEqual(frame.loc[0, "source_format"], "json")
+        self.assertTrue(frame.loc[0, "success"])
+        self.assertEqual(frame.loc[0, "failure_category"], "success")
+        self.assertEqual(frame.loc[0, "flight_time"], 12.0)
+        self.assertEqual(frame.loc[0, "trajectory_002_x"], 50.0)
+        self.assertEqual(frame.loc[0, "goal_error_m"], 2.5)
+
+        result["collision_free"] = False
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "receding_results.json"
+            path.write_text(json.dumps([result]), encoding="utf-8")
+            failed = SCPAircraftDatasetParser.parse_directory_to_dataframe(path)
+        self.assertFalse(failed.loc[0, "success"])
+        self.assertEqual(failed.loc[0, "failure_category"], "collision")
+        self.assertEqual(failed.loc[0, "trajectory_000_x"], 0.0)
+        self.assertEqual(failed.loc[0, "trajectory_099_z"], 10.0)
+
     def test_parse_directory_skips_environment_json_and_loads_environment_features(self):
         environment = {
             "start_pos": [0, 1, 2],

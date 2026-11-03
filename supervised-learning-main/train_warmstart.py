@@ -431,9 +431,13 @@ class EMA:
             be.copy_(b)
 
 
-def main(dataset, run, name, epochs, device, cache_file=None, out_dir=None, on_save=None):
+def main(dataset, run, name, epochs, device, cache_file=None, out_dir=None, on_save=None,
+         init_state=None, select="best"):
     """Train and save the best model. `on_save(ck_path, log_path)` is called after every
-    improvement (used on Modal to commit the Volume, so a crash keeps the best model)."""
+    improvement (used on Modal to commit the Volume, so a crash keeps the best model).
+    init_state: a state dict to start from (fine-tuning) instead of random weights.
+    select: "best" keeps the epoch with the lowest validation route error; "last" saves the
+    final (EMA) weights, for when the labels change and route error is not the target."""
     torch.manual_seed(SEED)
     rng = np.random.default_rng(SEED)
     cache = bc.load_cache(cache_file or cache_path(dataset, run))
@@ -448,6 +452,8 @@ def main(dataset, run, name, epochs, device, cache_file=None, out_dir=None, on_s
                       dec_layers=DEC_LAYERS, point_layers=POINT_LAYERS, dropout=DROPOUT,
                       n_pts=N_PTS, n_freq=N_FREQ, wl=FOURIER_WL)
     model = WarmStartNet(**model_args).to(device)
+    if init_state is not None:
+        model.load_state_dict(init_state)
     ema = EMA(model, EMA_DECAY) if EMA_DECAY else None
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     steps = max(epochs * math.ceil(len(train) / BATCH), 20)
@@ -492,8 +498,8 @@ def main(dataset, run, name, epochs, device, cache_file=None, out_dir=None, on_s
                 log.writeheader()
             log.writerow(row); flog.flush()
             score = row.get("minADE_best_m", row["loss"])
-            if score < best:
-                best = score
+            if score < best or (select == "last" and ep == epochs):
+                best = min(best, score)
                 torch.save({"state": net.state_dict(), "model_args": model_args,
                             "length_scale_m": scale, "v_cruise": cache["summary"]["v_cruise"],
                             "dataset": dataset, "run": run, "epoch": ep, "val": row,
@@ -522,7 +528,8 @@ try:
 except ImportError:
     modal = None
 
-if modal is not None:
+import os as _os
+if modal is not None and not _os.environ.get("FW_NO_MODAL_DEFS"):   # skipped when imported by another Modal app
     VOLUME_MOUNT = "/data"
     app = modal.App(MODAL_APP_NAME)
     image = (modal.Image.debian_slim(python_version=PYTHON_VERSION)

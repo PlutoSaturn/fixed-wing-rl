@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import h5py
 import numpy as np
 import pandas as pd
 
@@ -57,6 +58,48 @@ class SCPAircraftDatasetParserTests(unittest.TestCase):
         self.assertEqual(row["failure_constraint"], "max_thrust")
         self.assertFalse(row["initial_guess_available"])
         self.assertIsNone(row["guess_final_position_max_error_m"])
+
+    def test_parse_receding_horizon_json_file_with_flown_trajectory(self):
+        result = {
+            "env_index": 0,
+            "method": "shooting",
+            "status": "reached_goal",
+            "collision_free": True,
+            "goal_error_m": 2.5,
+            "flight_time_s": 12.0,
+            "path_length_m": 150.0,
+            "replans": 4,
+            "failed_replans": 0,
+            "flown_x": [
+                [0, 0, 0, 15, 0, 0],
+                [25, 0, 5, 15, 0, 0],
+                [50, 0, 10, 15, 0, 0],
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "receding_results.json"
+            path.write_text(json.dumps([result]), encoding="utf-8")
+            frame = SCPAircraftDatasetParser.parse_directory_to_dataframe(
+                path, node_count=3
+            )
+
+        self.assertEqual(len(frame), 1)
+        self.assertEqual(frame.loc[0, "source_format"], "json")
+        self.assertTrue(frame.loc[0, "success"])
+        self.assertEqual(frame.loc[0, "failure_category"], "success")
+        self.assertEqual(frame.loc[0, "flight_time"], 12.0)
+        self.assertEqual(frame.loc[0, "trajectory_002_x"], 50.0)
+        self.assertEqual(frame.loc[0, "goal_error_m"], 2.5)
+
+        result["collision_free"] = False
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "receding_results.json"
+            path.write_text(json.dumps([result]), encoding="utf-8")
+            failed = SCPAircraftDatasetParser.parse_directory_to_dataframe(path)
+        self.assertFalse(failed.loc[0, "success"])
+        self.assertEqual(failed.loc[0, "failure_category"], "collision")
+        self.assertEqual(failed.loc[0, "trajectory_000_x"], 0.0)
+        self.assertEqual(failed.loc[0, "trajectory_099_z"], 10.0)
 
     def test_parse_directory_skips_environment_json_and_loads_environment_features(self):
         environment = {
@@ -113,6 +156,97 @@ class SCPAircraftDatasetParserTests(unittest.TestCase):
         self.assertEqual(metadata.loc[0, "env_index"], 0)
         self.assertIn("occupancy_000", features.columns)
         self.assertIn("obstacle_count_box", features.columns)
+
+    def test_parse_hdf5_creates_one_ml_sample_per_attempt(self):
+        environment = {
+            "bounds_lo": [0, 0, 0],
+            "bounds_hi": [10, 10, 10],
+            "obstacles": [{
+                "type": "box",
+                "center": [5, 5, 5],
+                "half_extents": [1, 1, 1],
+            }],
+            "start_pos": [1, 1, 1],
+            "start_vel": [0, 0, 0],
+            "goal_pos": [9, 9, 9],
+            "goal_vel": [0, 0, 0],
+            "vehicle_radius": 0.5,
+            "margin": 0.25,
+            "metrics": {},
+        }
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            run_dir = Path(temporary_directory) / "dataset" / "solutions" / "test_run"
+            parts_dir = run_dir / "parts"
+            parts_dir.mkdir(parents=True)
+            (run_dir / "manifest.json").write_text(
+                json.dumps({
+                    "run": "test_run",
+                    "solver_settings": {"solvers.scp_aircraft.V_CRUISE": 15.0},
+                }),
+                encoding="utf-8",
+            )
+            result_path = parts_dir / "shard_00000_c000.h5"
+            with h5py.File(result_path, "w") as h5:
+                group = h5.create_group("fingerprint123")
+                group.attrs.update({
+                    "index": 4,
+                    "split": "train",
+                    "env_shard": 2,
+                    "method": "shooting",
+                    "best_start": 0,
+                    "n_starts": 2,
+                    "n_valid_starts": 1,
+                })
+                group.create_dataset("env_json", data=json.dumps(environment))
+                group.create_dataset("start_state", data=[1, 1, 1, 15, 0, 0])
+                attempts = group.create_group("attempts")
+                for index, status in enumerate(("feasible", "stalled")):
+                    attempt = attempts.create_group(str(index))
+                    attempt.attrs.update({
+                        "success": index == 0,
+                        "status": status,
+                        "cost": 10.0 + index,
+                        "flight_time": 2.0,
+                        "iterations": 3 + index,
+                        "solve_time": 1.0,
+                        "max_defect": 0.001,
+                        "max_violation": 0.0,
+                        "dense_min_margin": 2.0,
+                    })
+                    x = np.zeros((4, 6))
+                    x[:, :3] = np.linspace([1, 1, 1], [9, 9, 9], 4)
+                    attempt.create_dataset("x_rs", data=x)
+                    attempt.create_dataset("u_rs", data=np.ones((4, 3)))
+                    attempt.create_dataset(
+                        "guess_p", data=[[1, 1, 1], [1.5, 2, 2.5], [9, 9, 9]]
+                    )
+                    attempt.create_dataset("guess_t", data=[0.0, 0.2, 1.0])
+                    attempt.create_dataset(
+                        "history",
+                        data=json.dumps([{"iter": 3, "event": "converged"}]),
+                    )
+
+            parser = SCPAircraftDatasetParser(node_count=4)
+            frame = parser.parse_directory(
+                run_dir, recursive=True, file_format="auto"
+            )
+            features, targets, metadata = parser.to_ml_tables(frame)
+
+        self.assertEqual(len(frame), 2)
+        self.assertEqual(frame["attempt_index"].tolist(), [0, 1])
+        self.assertEqual(frame["env_index"].tolist(), [4, 4])
+        self.assertEqual(frame["guess_000_x"].tolist(), [1.0, 1.0])
+        self.assertAlmostEqual(frame.loc[0, "guess_001_x"], 2.75)
+        self.assertEqual(frame["guess_003_z"].tolist(), [9.0, 9.0])
+        self.assertEqual(frame["guess_full_state_available"].tolist(), [False, False])
+        self.assertEqual(frame["initial_guess_control_available"].tolist(), [False, False])
+        self.assertEqual(targets["success"].tolist(), [1, 0])
+        self.assertEqual(targets["status"].tolist(), ["feasible", "stalled"])
+        self.assertNotIn("status", features.columns)
+        self.assertNotIn("trajectory_000_x", features.columns)
+        self.assertTrue(all(pd.api.types.is_numeric_dtype(dtype) for dtype in features.dtypes))
+        self.assertEqual(metadata["run_name"].tolist(), ["test_run", "test_run"])
+        self.assertEqual(metadata["dataset_split"].tolist(), ["train", "train"])
 
 
 if __name__ == "__main__":

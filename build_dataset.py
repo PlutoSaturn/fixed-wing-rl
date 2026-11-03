@@ -1,4 +1,4 @@
-"""Build a flat CSV dataset from scp_aircraft JSON results."""
+"""Build ML CSV tables from scp_aircraft JSON or solve_envs HDF5 results."""
 from __future__ import annotations
 
 import argparse
@@ -16,13 +16,13 @@ def main() -> int:
         "--results",
         type=Path,
         default=default_data_dir,
-        help="directory containing solver result JSON files (default: localstore)",
+        help="solver result JSON file or directory (default: localstore)",
     )
     parser.add_argument(
         "--environment",
         type=Path,
         default=default_data_dir / "c172_envs.json",
-        help="environment JSON used by the solver (default: localstore/c172_envs.json)",
+        help="environment JSON for JSON solver results (not needed for solve_envs HDF5)",
     )
     parser.add_argument(
         "--output",
@@ -32,16 +32,21 @@ def main() -> int:
     )
     parser.add_argument("--nodes", type=int, default=100, help="resampled trajectory points")
     parser.add_argument("--recursive", action="store_true", help="search result folders recursively")
+    parser.add_argument(
+        "--format",
+        choices=("auto", "json", "hdf5"),
+        default="auto",
+        help="result format to scan (default: auto)",
+    )
     args = parser.parse_args()
 
-    if not args.results.is_dir():
+    if not args.results.exists():
         print(
-            f"Results directory not found: {args.results}\n"
-            "Run solvers\\scp_aircraft.py first, or pass the folder containing "
-            "its result JSON files with --results."
+            f"Results file or directory not found: {args.results}\n"
+            "Pass an existing solver-result JSON file or result directory with --results."
         )
         return 1
-    if not args.environment.is_file():
+    if args.format == "json" and not args.environment.is_file():
         print(
             f"Environment file not found: {args.environment}\n"
             "Pass the matching environment JSON with --environment. "
@@ -52,13 +57,14 @@ def main() -> int:
     frame = SCPAircraftDatasetParser.parse_directory_to_dataframe(
         directory=args.results,
         node_count=args.nodes,
-        environment_file=args.environment,
+        environment_file=args.environment if args.environment.is_file() else None,
         recursive=args.recursive,
+        file_format=args.format,
     )
     if frame.empty:
         print(
-            f"No solver result JSON files found in {args.results}. "
-            "Run the aircraft solver first or check --results."
+            f"No solver result records found in {args.results}. "
+            "Check --results, --format, and --recursive."
         )
         return 1
 
@@ -79,6 +85,8 @@ def main() -> int:
     print(f"  numeric model inputs X: {feature_path} ({features.shape[1]} columns)")
     print(f"  prediction targets y: {target_path} ({targets.shape[1]} columns)")
     print(f"  sample identifiers:    {metadata_path}")
+    if "source_format" in frame and (frame["source_format"] == "hdf5").any():
+        print("  HDF5 rows represent individual solver attempts.")
     if len(frame) < 100:
         print(
             "Warning: fewer than 100 solve samples; this is not enough to train "

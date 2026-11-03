@@ -145,3 +145,43 @@ AUTOTUNE without a transmitter: in MAVProxy run output add 127.0.0.1:14552, take
 python3 /mnt/c/Users/isaia/fixed-wing-rl/ardupilot/autotune_inputs.py --axis pitch
 
 (or --axis roll). It sets AUTOTUNE_LEVEL 0, holds 80% throttle, sends the stick inputs, and ends in LOITER, which keeps the new gains. Copy the new values (param show PTCH_RATE* or RLL_RATE*) into ardupilot/c172_sitl.parm; SITL started with -w forgets them otherwise. The pitch and roll gains in c172_sitl.parm come from this.
+
+____
+
+**Tier 3: fly SCP plans for generated environments, as a batch**
+
+Generate C172-scale environments, solve them with SCP, turn every solved plan into a mission (checking that it can be flown as waypoints), fly them all in SITL unattended, then score each flight. Everything for one batch lives in localstore/batches/<name>/: manifest.json, missions/, logs/ (one .tlog, .run.json and .sitl.txt per flight), runs/ (per-flight results and plots), results.csv, summary.json and summary.png.
+
+PyCharm, step 1: generate the pilot batch's environments (3 easy, 4 nominal, 3 dense):
+
+python -m environment.envgen --size 12000 2500 600 --vehicle-radius 6 --margin 30 --endpoints ends --occupancy 0.02 0.04 --n 3 --seed 101 --out tier3_easy_envs.json
+
+python -m environment.envgen --size 12000 2500 600 --vehicle-radius 6 --margin 30 --endpoints ends --occupancy 0.05 0.08 --n 4 --seed 102 --out tier3_nominal_envs.json
+
+python -m environment.envgen --size 12000 2500 600 --vehicle-radius 6 --margin 30 --endpoints ends --occupancy 0.09 0.12 --n 3 --seed 103 --out tier3_dense_envs.json
+
+PyCharm, step 2: solve them (about 1-2 minutes per environment):
+
+python -m solvers.scp_aircraft --envs tier3_easy_envs.json --out tier3_easy_results.json --feasible-out tier3_easy_feasible.json
+
+python -m solvers.scp_aircraft --envs tier3_nominal_envs.json --out tier3_nominal_results.json --feasible-out tier3_nominal_feasible.json
+
+python -m solvers.scp_aircraft --envs tier3_dense_envs.json --out tier3_dense_results.json --feasible-out tier3_dense_feasible.json
+
+PyCharm, step 3: build the batch:
+
+python -m ardupilot.ardupilot_mission batch-make --name tier3_pilot --pair tier3_easy_envs.json tier3_easy_results.json --pair tier3_nominal_envs.json tier3_nominal_results.json --pair tier3_dense_envs.json tier3_dense_results.json --note "tracking setup v1"
+
+For each environment it prints flyable, not_flyable (with the reason) or not_solved. A plan is not flyable as waypoints when the expected flown path (the waypoint legs plus the autopilot's turns at each waypoint) comes closer to an obstacle than half the planner's margin, or when a corner needs more bank than the autopilot may use. Missions use 1 m chord tolerance (BATCH_CHORD_TOL_M) and one airspeed, the plan's mean (SPEED_PROFILE = "constant"). --speed-profile plan instead puts a DO_CHANGE_SPEED with the plan's mean airspeed before each waypoint leg; in the pilot it made tracking worse (ArduPilot followed the speeds late and the throttle swung 0-100%), so it is off by default. make takes the same option. --param NAME=VALUE (repeatable) gives a batch its own autopilot parameters, on top of c172_sitl.parm: run_batch.py sets them before arming, and they are recorded in each flight's log, params.parm and runs.csv. Use it to test a setting on a batch without editing c172_sitl.parm.
+
+WSL, step 4: fly every flyable one, unattended (close any running SITL first; a terminal with your ArduPilot Python environment active, where sim_vehicle.py works):
+
+python3 /mnt/c/Users/isaia/fixed-wing-rl/ardupilot/run_batch.py /mnt/c/Users/isaia/fixed-wing-rl/localstore/batches/tier3_pilot/manifest.json
+
+For each instance it starts SITL at that mission's home (no MAVProxy), records the log, uploads the mission, arms in AUTO, waits until the aircraft has circled in the final loiter for 30 s (simulated), and stops SITL. Each flight is about 10 simulated minutes (about 5 real minutes at --speedup 5). Ctrl-C stops it; running the same command again skips the instances already completed (--redo flies them again, --only ID flies just one). If an instance fails to start, logs/<id>.sitl.txt has SITL's output.
+
+PyCharm, step 5: score the batch:
+
+python -m ardupilot.ardupilot_mission batch-analyze --name tier3_pilot --plot
+
+Each flown instance PASSES if it never touched an obstacle or left the workspace, came within 50 m of the goal, stayed within the planner's margin (30 m) of the plan, kept the rms distance to the plan at or under 10 m, and took within 10% of the plan's flight time (PASS_* settings in ardupilot_mission.py). Flown clearance under half the margin is flagged as a near miss. Outcomes: PASS, FAIL, REJECTED (not flyable as waypoints), NOT_FLOWN (e.g. never armed) and NOT_SOLVED.

@@ -77,6 +77,20 @@ TECS_SINK_MAX        = 6.0
 SITL_PARAM_FILE      = "ardupilot/c172_sitl.parm"           # relative to the project root
 AIRFRAME_FILE        = "aircraftmodel/c172_params.json"     # the planner's C172 (speeds, bank limit)
 TRIM_THROTTLE_PCT    = 71.0             # as in c172_sitl.parm (summary compares the flight with it)
+AP_ROLL_LIMIT_DEG    = 45.0             # ROLL_LIMIT_DEG in c172_sitl.parm (most bank the autopilot may use)
+SPEED_PROFILE        = "constant"       # "constant": one airspeed for the whole mission, the plan's mean.
+                                        # "plan": before each waypoint leg, command the plan's mean airspeed
+                                        #   over that leg (DO_CHANGE_SPEED). Tried in the Tier 3 pilot
+                                        #   (batch tier3_v2_speed): ArduPilot followed the speeds 5-10 s late,
+                                        #   the throttle swung 0-100%, and the hardest plan tracked worse,
+                                        #   so "constant" is the default (tracking setup v2)
+SPEED_CMD_STEP_MS    = 0.5              # "plan": only add a speed command when it changes by at least this
+SPEED_HEADROOM_MS    = 1.5              # "plan": stay this far below the C172's V_MAX (TECS needs some margin)
+SPEED_SPREAD_WARN_MS = 12.0             # "constant": warn when the plan's speed range is wider than this
+                                        #   (ArduPilot flies one airspeed, so the timing will differ)
+FLY_MIN_CLEARANCE_FRAC = 0.5            # a plan is "not flyable as waypoints" when the expected flown
+                                        #   path (legs + the autopilot's turns) comes closer to an obstacle
+                                        #   than this fraction of the planner's margin
 
 # box (Tier 1 test mission), relative to home; the runway points along --heading
 BOX_START_M          = 2000.0           # first corner this far ahead of home (room to climb)
@@ -106,6 +120,17 @@ OSC_SKIP_S           = 30.0
 # Parameters that change by themselves (statistics, barometer calibration, telemetry
 # rates) are left out of that comparison.
 RUNS_DIR             = "runs"
+
+# ---- Tier 3: batches of generated environments (batch-make, run_batch.py, batch-analyze) ----
+BATCH_DIR            = "batches"         # localstore/batches/<batch name>/
+BATCH_CHORD_TOL_M    = 1.0               # waypoint chord tolerance for batch missions (tracking setup v1)
+BATCH_SPEEDUP        = 5                 # SITL --speedup used by run_batch.py (JSBSim manages about 2x)
+# pass / fail for one flight (see evaluate_flight); every check must pass
+PASS_MAX_ERROR_FRAC  = 1.0               # max distance from the plan < this x the planner's margin
+PASS_RMS_M           = 10.0              # rms distance from the plan
+PASS_GOAL_M          = 50.0              # closest approach to the plan's goal
+PASS_TIME_FRAC       = 0.10              # flight time within this fraction of the plan's
+NEAR_MISS_FRAC       = 0.5               # flagged (not failed): flown clearance below this x margin
 PARAM_IGNORE         = ("STAT_", "BARO", "MAV", "SR0_", "SR1_", "SR2_", "SR3_", "MIS_")
 
 R_EARTH = fly.R_EARTH
@@ -321,19 +346,76 @@ def write_waypoints(path, home_lat, home_lon, items):
         f.write("\n".join(lines) + "\n")
 
 
-def make(args):
-    from solvers.scp_aircraft import load_plan
-    env, r, res = load_plan(args.envs, args.results, args.index)
-    if not r["success"]:
-        raise SystemExit(f"Environment {args.index} has no feasible plan (status {r['status']}).")
+def autopilot_path(W, radius, max_bank_deg, speed):
+    """Estimate of the path ArduPilot flies through the waypoints W: straight legs
+    joined at each waypoint by a turn of `radius` (the autopilot starts turning
+    before the waypoint, so it cuts inside each corner). Where a leg is too short
+    for that turn, the turn is tightened to fit. Returns (points, steepest bank the
+    tightened turns need in deg)."""
+    out, worst_bank = [W[0]], 0.0
+    for i in range(1, len(W) - 1):
+        a, b, c = W[i - 1], W[i], W[i + 1]
+        u1, u2 = (b - a)[:2], (c - b)[:2]
+        l1, l2 = np.linalg.norm(u1), np.linalg.norm(u2)
+        if l1 < 1e-6 or l2 < 1e-6:
+            out.append(b); continue
+        u1, u2 = u1 / l1, u2 / l2
+        theta = float(np.arccos(np.clip(u1 @ u2, -1.0, 1.0)))       # heading change at this waypoint
+        if theta < 1e-4:
+            out.append(b); continue
+        tangent = radius * np.tan(theta / 2)
+        tangent = min(tangent, 0.5 * l1, 0.5 * l2)                    # both turns must fit on a leg
+        r_eff = tangent / np.tan(theta / 2)
+        worst_bank = max(worst_bank, float(np.degrees(np.arctan(speed**2 / (GRAVITY * max(r_eff, 1e-6))))))
+        p1, p2 = b[:2] - tangent * u1, b[:2] + tangent * u2
+        side = np.sign(u1[0] * u2[1] - u1[1] * u2[0])                 # +1 left turn, -1 right turn
+        centre = p1 + side * r_eff * np.array([-u1[1], u1[0]])
+        a0 = np.arctan2(*(p1 - centre)[::-1])
+        ang = a0 + side * np.linspace(0.0, theta, max(3, int(np.degrees(theta)) + 2))
+        arc = centre + r_eff * np.c_[np.cos(ang), np.sin(ang)]
+        out.extend(np.c_[arc, np.full(len(arc), b[2])])
+    out.append(W[-1])
+    return np.array(out), worst_bank
+
+
+def densify(Q, spacing=10.0):
+    """Points along the polyline Q at most `spacing` apart."""
+    pts = [Q[:1]]
+    for a, b in zip(Q[:-1], Q[1:]):
+        n = max(1, int(np.ceil(np.linalg.norm(b - a) / spacing)))
+        pts.append(a + np.linspace(0, 1, n + 1)[1:, None] * (b - a))
+    return np.vstack(pts)
+
+
+def leg_speeds(V, idx, v_lo, v_hi):
+    """The plan's mean airspeed over each waypoint leg idx[k] -> idx[k+1], clipped to [v_lo, v_hi]."""
+    return np.array([np.clip(np.mean(V[a:b + 1]), v_lo, v_hi) for a, b in zip(idx[:-1], idx[1:])])
+
+
+def build_mission(env, r, chord_tol=None, speed_profile=None):
+    """Everything `make` writes for one SCP plan: the mission items, where SITL's home
+    goes, and the checks that say whether the plan can be flown as waypoints.
+
+    Rejections (the mission is still built, but the instance should not be flown):
+      * the waypoint path, with the autopilot's turns, passes closer than
+        FLY_MIN_CLEARANCE_FRAC x margin to an obstacle (inside the planner's margin by
+        more than the autopilot can be trusted to hold);
+      * a corner needs more bank than the autopilot may use (ROLL_LIMIT_DEG in
+        c172_sitl.parm, AP_ROLL_LIMIT_DEG here) because the legs around it are short.
+    Warnings (flown anyway): lead-in / exit near an obstacle (outside the scored
+    segment; obstacles are not physical in SITL), climb or sink beyond TECS limits,
+    and a wide speed range (ArduPilot flies one airspeed, so timing drifts)."""
+    chord_tol = CHORD_TOL_M if chord_tol is None else chord_tol
+    speed_profile = SPEED_PROFILE if speed_profile is None else speed_profile
+    if speed_profile not in ("plan", "constant"):
+        raise ValueError(f"speed_profile must be 'plan' or 'constant', not {speed_profile!r}")
     R, params = turn_radius()
     t, xs = dense_plan(r)
     P, V, gam, chi = xs[:, :3], xs[:, 3], xs[:, 4], xs[:, 5]
     lo, hi = env.bounds_lo, env.bounds_hi
-    warnings_ = []
+    warnings_, rejects = [], []
 
     # ---- plan waypoints
-    chord_tol = CHORD_TOL_M if getattr(args, "chord_tol", None) is None else args.chord_tol
     idx = resample(P, chi, chord_tol)
     W = P[idx]
     chord, _ = point_to_polyline(P, W)
@@ -349,9 +431,8 @@ def make(args):
 
     # ---- exit: leave the workspace after the goal by the smallest turn that clears every obstacle
     speed = float(np.clip(np.mean(V), params["V_MIN"] + 2, params["V_MAX"] - 4))
-    exit_wp, end_c, exit_turn, exit_clear = exit_route(env, P[-1], chi[-1],
-                                                       speed**2 / (GRAVITY * np.tan(np.radians(AP_BANK_DEG))))
-    g = P[-1]
+    ap_radius = speed**2 / (GRAVITY * np.tan(np.radians(AP_BANK_DEG)))
+    exit_wp, end_c, exit_turn, exit_clear = exit_route(env, P[-1], chi[-1], ap_radius)
     if exit_clear < env.margin:
         warnings_.append(f"no fully clear way out after the goal; best exit passes {exit_clear:.0f} m from an "
                          f"obstacle (outside the plan; in SITL the obstacles are not physical)")
@@ -374,51 +455,128 @@ def make(args):
     if climb > TECS_CLMB_MAX or sink > TECS_SINK_MAX:
         warnings_.append(f"plan climbs {climb:.1f} m/s / sinks {sink:.1f} m/s, beyond TECS_CLMB_MAX "
                          f"{TECS_CLMB_MAX} / TECS_SINK_MAX {TECS_SINK_MAX}: expect altitude lag")
-    # speed (set above): the plan's mean airspeed, kept 4 m/s below the limit so TECS has
-    # headroom (only the path is compared afterwards, so flying a bit slower is fine)
+    if speed_profile == "constant" and V.max() - V.min() > SPEED_SPREAD_WARN_MS:
+        warnings_.append(f"plan speed ranges {V.min():.1f}-{V.max():.1f} m/s but ArduPilot flies one airspeed "
+                         f"({speed:.1f} m/s): expect the flight time to differ from the plan's")
+
+    # ---- can the plan be flown as waypoints? (the scored part: start to goal)
+    flown_est, worst_bank = autopilot_path(W, ap_radius, AP_ROLL_LIMIT_DEG, speed)
+    est = densify(flown_est)
+    inside = np.all((est >= lo) & (est <= hi), axis=1)
+    est_clear = float(body_clearance(env, est[inside]).min()) if inside.any() else float("inf")
+    est_offset = float(point_to_polyline(est, P)[0].max())
+    plan_clear = float(body_clearance(env, densify(P, 20.0)).min())
+    min_clear = FLY_MIN_CLEARANCE_FRAC * env.margin
+    if est_clear < min_clear:
+        rejects.append(f"waypoint path with the autopilot's turns passes {est_clear:.1f} m from an obstacle "
+                       f"(needs >= {min_clear:.0f} m = {FLY_MIN_CLEARANCE_FRAC:g} x margin; the plan itself "
+                       f"keeps {plan_clear:.1f} m)")
+    if worst_bank > AP_ROLL_LIMIT_DEG:
+        rejects.append(f"a waypoint corner needs {worst_bank:.0f} deg of bank (legs too short for the turn); "
+                       f"the autopilot may use {AP_ROLL_LIMIT_DEG:.0f}")
+    checks = {"plan_min_clearance_m": plan_clear, "est_min_clearance_m": est_clear,
+              "est_max_offset_from_plan_m": est_offset, "chord_max_m": float(chord.max()),
+              "worst_corner_bank_deg": worst_bank, "min_clearance_required_m": min_clear}
 
     # ---- mission items: (frame, command, p1, p2, p3, p4, x, y, z_rel)
+    #      Speeds ("plan" profile): ArduPilot runs the DO commands that follow a NAV command while that
+    #      NAV command is active, i.e. while flying TO that waypoint. So the speed for the leg
+    #      W[k-1] -> W[k] goes right after waypoint W[k]; the lead-in uses the plan's start speed.
     alt = lambda z: float(z + FLOOR_AGL_M)
+    v_lo, v_hi = params["V_MIN"] + 2, params["V_MAX"] - SPEED_HEADROOM_MS
+    if speed_profile == "plan":
+        v_leg = leg_speeds(V, idx, v_lo, v_hi)
+        v_start = float(np.clip(V[0], v_lo, v_hi))
+    else:
+        v_leg, v_start = np.full(len(W) - 1, speed), speed
     items = [(FRAME_REL_ALT, CMD_TAKEOFF, TAKEOFF_PITCH_DEG, 0, 0, 0, home_xy[0], home_xy[1], TAKEOFF_ALT_M),
-             (FRAME_REL_ALT, CMD_CHANGE_SPEED, 0, speed, -1, 0, None, None, 0),
+             (FRAME_REL_ALT, CMD_CHANGE_SPEED, 0, v_start, -1, 0, None, None, 0),
              (FRAME_REL_ALT, CMD_LOITER_TO_ALT, 1, LOITER_RADIUS_M, 0, 0, loiter_c[0], loiter_c[1], alt(s0[2])),
              (FRAME_REL_ALT, CMD_WAYPOINT, 0, 0, 0, 0, lead[0], lead[1], alt(lead[2]))]
     first_plan_item = len(items) + 1                         # +1: item 0 is home
-    items += [(FRAME_REL_ALT, CMD_WAYPOINT, 0, 0, 0, 0, w[0], w[1], alt(w[2])) for w in W]
+    plan_items, last_v, n_speed_cmds = [], v_start, 0
+    for k, w in enumerate(W):
+        plan_items.append(len(items) + 1)
+        items.append((FRAME_REL_ALT, CMD_WAYPOINT, 0, 0, 0, 0, w[0], w[1], alt(w[2])))
+        if k >= 1 and abs(v_leg[k - 1] - last_v) >= SPEED_CMD_STEP_MS:
+            items.append((FRAME_REL_ALT, CMD_CHANGE_SPEED, 0, float(v_leg[k - 1]), -1, 0, None, None, 0))
+            last_v, n_speed_cmds = float(v_leg[k - 1]), n_speed_cmds + 1
     items += [(FRAME_REL_ALT, CMD_WAYPOINT, 0, 0, 0, 0, exit_wp[0], exit_wp[1], alt(exit_wp[2])),
               (FRAME_REL_ALT, CMD_LOITER_UNLIM, 0, 0, LOITER_RADIUS_M, 0, end_c[0], end_c[1], alt(end_c[2]))]
-
     hlat, hlon = enu_to_geo(*home_xy)
-    name = args.out or f"{os.path.splitext(os.path.basename(args.envs))[0]}{args.index}.waypoints"
-    out = localstore_path(name)
-    write_waypoints(out, hlat, hlon, items)
-    meta = {"envs": args.envs, "results": args.results, "index": args.index,
+    # rough simulated duration: takeoff and climb, lead-in, the plan, the exit (for the batch runner's timeout)
+    expected_s = (alt(s0[2]) / (0.6 * TECS_CLMB_MAX) + 120.0 + LEAD_IN_TURN_RADII * R / speed
+                  + float(r["flight_time"]) + 2 * LOITER_GAP_M / speed + 120.0)
+    return {"items": items, "W": W, "P": P, "chord": chord, "speed": speed, "R": R,
+            "speed_profile": speed_profile, "leg_speeds": [float(v) for v in v_leg], "plan_items": plan_items,
+            "n_speed_commands": n_speed_cmds + 1,
+            "commanded_mean_ms": float(np.mean(v_leg)) if len(v_leg) else speed,
+            "home_lat_lon": (float(hlat), float(hlon)), "home_heading_deg": home_heading,
+            "first_plan_item": first_plan_item, "start_alt_rel_m": alt(s0[2]),
+            "exit_turn_deg": exit_turn, "exit_clearance_m": exit_clear,
+            "warnings": warnings_, "rejects": rejects, "checks": checks, "expected_sim_s": expected_s}
+
+
+def write_mission(mission, out, env_file, results_file, index, chord_tol, flight_time):
+    """Write the .waypoints file and its .json companion (read by analyze)."""
+    hlat, hlon = mission["home_lat_lon"]
+    write_waypoints(out, hlat, hlon, mission["items"])
+    meta = {"envs": env_file, "results": results_file, "index": index,
             "floor_agl_m": FLOOR_AGL_M, "origin": [fly.ORIGIN_LAT_DEG, fly.ORIGIN_LON_DEG],
-            "home_lat_lon": [float(hlat), float(hlon)], "home_heading_deg": home_heading,
-            "first_plan_item": first_plan_item, "n_plan_waypoints": len(W), "chord_tol_m": chord_tol,
-            "commanded_airspeed_ms": speed, "plan_flight_time_s": r["flight_time"]}
-    meta["kind"] = "scp_plan"
+            "home_lat_lon": [hlat, hlon], "home_heading_deg": mission["home_heading_deg"],
+            "first_plan_item": mission["first_plan_item"], "n_plan_waypoints": len(mission["W"]),
+            "chord_tol_m": chord_tol, "commanded_airspeed_ms": mission["commanded_mean_ms"],
+            "speed_profile": mission["speed_profile"], "leg_speeds_ms": mission["leg_speeds"],
+            "plan_items": mission["plan_items"],
+            "plan_flight_time_s": flight_time, "flyable": not mission["rejects"],
+            "rejects": mission["rejects"], "warnings": mission["warnings"], "checks": mission["checks"],
+            "kind": "scp_plan"}
     with open(f"{out}.json", "w") as f:
         json.dump(meta, f, indent=2)
+    return meta
+
+
+def sitl_home(mission):
+    hlat, hlon = mission["home_lat_lon"]
+    return f"{hlat:.7f},{hlon:.7f},0,{mission['home_heading_deg']:.0f}"
+
+
+def make(args):
+    from solvers.scp_aircraft import load_plan
+    env, r, res = load_plan(args.envs, args.results, args.index)
+    if not r["success"]:
+        raise SystemExit(f"Environment {args.index} has no feasible plan (status {r['status']}).")
+    chord_tol = CHORD_TOL_M if getattr(args, "chord_tol", None) is None else args.chord_tol
+    m = build_mission(env, r, chord_tol, getattr(args, "speed_profile", None))
+    name = args.out or f"{os.path.splitext(os.path.basename(args.envs))[0]}{args.index}.waypoints"
+    out = localstore_path(name)
+    write_mission(m, out, args.envs, args.results, args.index, chord_tol, r["flight_time"])
 
     # ---- report
-    print(f"Wrote {out} ({len(items) + 1} items) and {out}.json")
+    P, W, R, c = m["P"], m["W"], m["R"], m["checks"]
+    print(f"Wrote {out} ({len(m['items']) + 1} items) and {out}.json")
     print(f"  plan: {len(W)} waypoints over {np.sum(np.linalg.norm(np.diff(P, axis=0), axis=1)) / 1000:.2f} km, "
-          f"items {first_plan_item}-{first_plan_item + len(W) - 1}; "
-          f"straight-line legs stay within {chord.max():.1f} m of the plan")
-    print(f"  airspeed {speed:.1f} m/s (plan mean), lead-in {LEAD_IN_TURN_RADII * R:.0f} m, "
-          f"climb loiter to {alt(s0[2]):.0f} m above home")
-    print(f"  exit after the goal: turn {exit_turn:+.0f} deg, then straight out "
-          f"(closest obstacle {exit_clear:.0f} m)")
-    for w in warnings_:
+          f"items {m['first_plan_item']}-{m['first_plan_item'] + len(W) - 1}; "
+          f"straight-line legs stay within {m['chord'].max():.1f} m of the plan")
+    if m["speed_profile"] == "plan":
+        print(f"  airspeed follows the plan: {m['n_speed_commands']} speed commands, "
+              f"{min(m['leg_speeds']):.1f}-{max(m['leg_speeds']):.1f} m/s")
+    print(f"  airspeed {m['commanded_mean_ms']:.1f} m/s (mean), lead-in {LEAD_IN_TURN_RADII * R:.0f} m, "
+          f"climb loiter to {m['start_alt_rel_m']:.0f} m above home")
+    print(f"  exit after the goal: turn {m['exit_turn_deg']:+.0f} deg, then straight out "
+          f"(closest obstacle {m['exit_clearance_m']:.0f} m)")
+    print(f"  expected flown path: closest obstacle {c['est_min_clearance_m']:.1f} m (plan "
+          f"{c['plan_min_clearance_m']:.1f} m), at most {c['est_max_offset_from_plan_m']:.1f} m from the plan")
+    for w in m["warnings"]:
         print("  WARNING:", w)
-    sitl_home = f"{hlat:.7f},{hlon:.7f},0,{home_heading:.0f}"
+    for w in m["rejects"]:
+        print("  NOT FLYABLE AS WAYPOINTS:", w)
     log_name = os.path.splitext(name)[0] + ".tlog"
     print(f"""
 ------------------------------------------------------------------------------
 To fly it
 ------------------------------------------------------------------------------
-{sitl_commands(sitl_home, out)}
+{sitl_commands(sitl_home(m), out)}
 When it is loitering after the last waypoint, copy the telemetry log (in WSL):
   cp ~/ardupilot/ArduPlane/mav.tlog {wsl_path(localstore_path(log_name))}
   (if it is not there:  find ~/ardupilot -name "*.tlog" -mmin -60)
@@ -687,15 +845,18 @@ def analyze(args):
     F = np.c_[x, y, f["alt_rel"] - meta["floor_agl_m"]]
     t = f["t"]
 
-    # ---- the plan segment: first pass near the start, then the first pass near the goal
+    # ---- the plan segment: from the aircraft's closest approach to the plan's start (not the first
+    #      pass within PASS_TOL_M: the takeoff can pass under the start, hundreds of metres too low)
+    #      to its first pass near the goal after that
     d0 = np.linalg.norm(F - Pp[0], axis=1)
     near0 = np.nonzero(d0 < PASS_TOL_M)[0]
     if not len(near0):
         raise SystemExit(f"The aircraft never came within {PASS_TOL_M:.0f} m of the plan's start "
                          f"(closest {d0.min():.0f} m). Did the mission run, and is SITL's home where "
                          f"'make' said?")
-    i0 = near0[0] + int(np.argmin(d0[near0[0]:near0[0] + 200]))
+    i0 = int(np.argmin(d0))
     d1 = np.linalg.norm(F[i0:] - Pp[-1], axis=1)
+    goal_miss = float(d1.min())                                  # closest the aircraft came to the goal
     near1 = np.nonzero(d1 < PASS_TOL_M)[0]
     reached = len(near1) > 0
     i1 = i0 + (near1[0] + int(np.argmin(d1[near1[0]:near1[0] + 200])) if reached else int(np.argmin(d1)))
@@ -711,7 +872,7 @@ def analyze(args):
     out_of_box = float(np.max(np.r_[lo - Fs.min(0), Fs.max(0) - hi, 0.0]))
     plan_clear = body_clearance(env, Pp)
     summary = {
-        "log": args.log, "mission": args.mission, "reached_goal": bool(reached),
+        "log": args.log, "mission": args.mission, "reached_goal": bool(reached), "goal_miss_m": goal_miss,
         "flight_time_s": float(ts[-1]), "plan_flight_time_s": float(r["flight_time"]),
         "max_error_m": float(err.max()), "rms_error_m": float(np.sqrt(np.mean(err**2))),
         "max_horizontal_error_m": float(errh.max()),
@@ -720,8 +881,14 @@ def analyze(args):
         "planned_margin_m": env.margin, "samples_in_collision": int((clear < 0).sum()),
         "left_workspace_m": out_of_box,
         "collision_free": bool(clear.min() >= 0 and out_of_box <= 0)}
+    v_plan_near = None
     if "airspeed" in f:
         summary["mean_airspeed_ms"] = float(np.mean(f["airspeed"][seg]))
+        # the plan's airspeed at the nearest plan point, to see whether ArduPilot follows the speed profile
+        k_near = np.concatenate([np.argmin(((Fs[i:i + 400, None, :] - Pp[None]) ** 2).sum(-1), axis=1)
+                                 for i in range(0, len(Fs), 400)])
+        v_plan_near = xs[k_near, 3]
+        summary["airspeed_vs_plan_rms_ms"] = float(np.sqrt(np.mean((f["airspeed"][seg] - v_plan_near) ** 2)))
 
     # ---- oscillation (weaving), after the first OSC_SKIP_S of the plan
     osc = {}
@@ -753,10 +920,14 @@ def analyze(args):
     print(f"  closest approach to an obstacle: flown {summary['min_clearance_m']:.1f} m, "
           f"planned {summary['plan_min_clearance_m']:.1f} m (plan keeps {env.margin:.0f} m + vehicle radius)")
     if "mean_airspeed_ms" in summary:
-        print(f"  mean airspeed {summary['mean_airspeed_ms']:.1f} m/s (commanded {meta['commanded_airspeed_ms']:.1f})")
+        print(f"  mean airspeed {summary['mean_airspeed_ms']:.1f} m/s (commanded {meta['commanded_airspeed_ms']:.1f}"
+              f"{', following the plan' if meta.get('speed_profile') == 'plan' else ''}); "
+              f"{summary['airspeed_vs_plan_rms_ms']:.1f} m/s rms from the plan's airspeed")
     def osc_text(name, label, unit):
         rms, period = osc.get(name, (None, None))
-        return f"{label} {rms:.1f} {unit} rms, period {period:.1f} s" if rms is not None else f"{label} n/a"
+        if rms is None:
+            return f"{label} n/a"
+        return f"{label} {rms:.1f} {unit} rms" + (f", period {period:.1f} s" if period is not None else "")
     print(f"  oscillation after the first {OSC_SKIP_S:.0f} s (part faster than {OSC_WINDOW_S:.0f} s):")
     print(f"    {osc_text('roll', 'roll', 'deg')}; {osc_text('commanded_roll', 'commanded roll', 'deg')}"
           + (f"; max |roll| {summary['max_abs_roll_deg']:.1f} deg" if "max_abs_roll_deg" in summary else ""))
@@ -788,12 +959,15 @@ def analyze(args):
                        + ([f"{f['airspeed'][seg][k]:.4g}"] if "airspeed" in f else []))
     print(f"  wrote {base}_summary.json and {base}_flight.csv")
     plot(env, Pp, F, Fs, err, ts, base, f.get("attitude"), f.get("nav"), t[i0], ts[-1],
-         (t, f["throttle"]) if "throttle" in f else None, summary)
-    archive_run(log_path, base, summary, f.get("params", {}), str(find_input(args.mission)))
+         (t, f["throttle"]) if "throttle" in f else None, summary,
+         (ts, f["airspeed"][seg], v_plan_near) if v_plan_near is not None else None)
+    archive_run(log_path, base, summary, f.get("params", {}), str(find_input(args.mission)),
+                root=getattr(args, "runs_dir", None))
     import matplotlib.pyplot as plt
     if args.plot:
         plt.show()
     plt.close("all")
+    return summary
 
 
 # --------------------------------------------------------------------------
@@ -832,11 +1006,11 @@ def param_changes(old, new):
     return [f"{k} {fmt(old.get(k))}->{fmt(new.get(k))}" for k in keys]
 
 
-def archive_run(log_path, base, summary, params, mission_path=None):
-    "Copy this flight's log, results, parameters and mission to <log folder>/runs/<log name>/."
+def archive_run(log_path, base, summary, params, mission_path=None, root=None):
+    "Copy this flight's log, results, parameters and mission to <log folder>/runs/<log name>/ (or root/<log name>/)."
     import shutil
     name = os.path.basename(base)
-    root = os.path.join(os.path.dirname(log_path), RUNS_DIR)
+    root = root or os.path.join(os.path.dirname(log_path), RUNS_DIR)
     os.makedirs(root, exist_ok=True)
     digest = _file_hash(log_path)
     run, k = os.path.join(root, name), 1
@@ -891,7 +1065,8 @@ def write_runs_table(root):
             prev = p if p else prev
 
 
-def plot(env, Pp, F, Fs, err, ts, base, att=None, nav=None, t0=0.0, t_end=None, thr=None, summary=None):
+def plot(env, Pp, F, Fs, err, ts, base, att=None, nav=None, t0=0.0, t_end=None, thr=None, summary=None,
+         aspd=None):
     import matplotlib.pyplot as plt
     from environment.envgen import plot_environment
     ax = plot_environment(env)
@@ -937,9 +1112,18 @@ def plot(env, Pp, F, Fs, err, ts, base, att=None, nav=None, t0=0.0, t_end=None, 
         axs[3].set_visible(False); axs[4].set_visible(False)
     if thr is not None:
         k = (thr[0] >= t0) & (thr[0] <= t0 + t_end)
-        axs[5].plot(thr[0][k] - t0, thr[1][k], "r-", lw=0.8)
-        axs[5].set_xlabel("time since plan start [s]"); axs[5].set_ylabel("throttle [%]")
-        axs[5].set_title("throttle")
+        axs[5].plot(thr[0][k] - t0, thr[1][k], "r-", lw=0.8, label="throttle")
+        axs[5].set_xlabel("time since plan start [s]"); axs[5].set_ylabel("throttle [%]", color="r")
+        axs[5].set_title("throttle and airspeed")
+        if aspd is not None:                                   # airspeed against the plan's, right axis
+            a2 = axs[5].twinx()
+            a2.plot(aspd[0], aspd[1], "m-", lw=0.9, label="airspeed")
+            a2.plot(aspd[0], aspd[2], "k--", lw=1.0, label="plan airspeed")
+            a2.set_ylabel("airspeed [m/s]")
+            a2.legend(fontsize=8, loc="lower right")
+            v = summary.get("airspeed_vs_plan_rms_ms")
+            if v is not None:
+                axs[5].set_title(f"throttle and airspeed (airspeed {v:.1f} m/s rms from the plan's)")
     else:
         axs[5].set_visible(False)
     v = summary.get("altitude_oscillation_m")
@@ -1175,6 +1359,226 @@ def wobble(args):
 
 
 # --------------------------------------------------------------------------
+# Tier 3: batches of generated environments
+# --------------------------------------------------------------------------
+def batch_path(name, *parts):
+    """localstore/batches/<name>/<parts...> (folders created as needed)."""
+    from environment.envgen import localstore_dir
+    d = localstore_dir() / BATCH_DIR / name
+    d.mkdir(parents=True, exist_ok=True)
+    if not parts:
+        return d
+    p = d.joinpath(*parts)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def batch_make(args):
+    """Missions for every solved environment in one or more (environments, results)
+    pairs, a flyability check for each, and the manifest run_batch.py flies from."""
+    from environment.envgen import load_environments
+    from solvers.scp_aircraft import load_plan
+    import datetime
+    chord_tol = args.chord_tol
+    if (batch_path(args.name) / "manifest.json").exists() and not args.overwrite:
+        raise SystemExit(f"Batch '{args.name}' already exists ({batch_path(args.name)}). Pick a new --name, "
+                         f"or add --overwrite to rebuild its missions (flown logs are kept).")
+    instances = []
+    for envs_file, results_file in args.pair:
+        envs = load_environments(envs_file)
+        by_index = {r["env_index"]: r for r in json.load(open(find_input(results_file)))}
+        stem = os.path.splitext(os.path.basename(envs_file))[0]
+        for i in range(len(envs)):
+            iid = f"{stem}_{i}"
+            rec = {"id": iid, "envs": envs_file, "results": results_file, "index": i}
+            r0 = by_index.get(i)
+            if r0 is None or not r0.get("success"):
+                rec.update(status="not_solved",
+                           reason="no result" if r0 is None else f"SCP status {r0.get('status')}")
+                instances.append(rec); print(f"  {iid}: not solved ({rec['reason']})"); continue
+            env, r, _ = load_plan(envs_file, results_file, i)
+            m = build_mission(env, r, chord_tol, getattr(args, "speed_profile", None))
+            out = batch_path(args.name, "missions", f"{iid}.waypoints")
+            write_mission(m, out, envs_file, results_file, i, chord_tol, r["flight_time"])
+            log = batch_path(args.name, "logs", f"{iid}.tlog")
+            rec.update(status="flyable" if not m["rejects"] else "not_flyable",
+                       rejects=m["rejects"], warnings=m["warnings"], checks=m["checks"],
+                       mission=str(out), mission_wsl=wsl_path(out), home=sitl_home(m),
+                       log=str(log), log_wsl=wsl_path(log), margin_m=env.margin,
+                       plan_flight_time_s=float(r["flight_time"]), expected_sim_s=m["expected_sim_s"],
+                       n_obstacles=len(env.obstacles))
+            instances.append(rec)
+            c = m["checks"]
+            print(f"  {iid}: {rec['status']:<11} {len(m['W'])} waypoints, expected path keeps "
+                  f"{c['est_min_clearance_m']:.1f} m (plan {c['plan_min_clearance_m']:.1f} m)"
+                  + "".join(f"\n      NOT FLYABLE: {x}" for x in m["rejects"]))
+    manifest = {"name": args.name, "created": datetime.datetime.now().isoformat(timespec="seconds"),
+                "note": args.note or "", "chord_tol_m": chord_tol, "speedup": args.speedup,
+                "speed_profile": getattr(args, "speed_profile", None) or SPEED_PROFILE,
+                "param_overrides": parse_param_overrides(getattr(args, "param", None) or []),
+                "parm_wsl": wsl_path(project_root() / SITL_PARAM_FILE), "instances": instances}
+    mf = batch_path(args.name) / "manifest.json"
+    with open(mf, "w") as fh:
+        json.dump(manifest, fh, indent=2)
+    n = {k: sum(x["status"] == k for x in instances) for k in ("flyable", "not_flyable", "not_solved")}
+    if manifest["param_overrides"]:
+        print("  parameters for this batch (set before arming, on top of c172_sitl.parm): "
+              + ", ".join(f"{k}={v:g}" for k, v in manifest["param_overrides"].items()))
+    print(f"""
+Batch '{args.name}': {len(instances)} environments: {n['flyable']} flyable, {n['not_flyable']} not flyable as
+waypoints, {n['not_solved']} not solved. Wrote {mf}
+
+To fly the flyable ones (WSL, a terminal with your ArduPilot Python environment active;
+close any running SITL first). It runs them one after another, unattended:
+  python3 {wsl_path(project_root() / "ardupilot" / "run_batch.py")} {wsl_path(mf)}
+Then, in PyCharm's terminal:
+  python -m ardupilot.ardupilot_mission batch-analyze --name {args.name}
+""")
+
+
+def parse_param_overrides(items):
+    """["TECS_SINK_MAX=7", ...] -> {"TECS_SINK_MAX": 7.0, ...}"""
+    out = {}
+    for it in items:
+        name, sep, value = it.partition("=")
+        if not sep or not name.strip():
+            raise SystemExit(f"--param must look like NAME=VALUE, not {it!r}")
+        try:
+            out[name.strip().upper()] = float(value)
+        except ValueError:
+            raise SystemExit(f"--param {it!r}: {value!r} is not a number")
+    return out
+
+
+def evaluate_flight(s, margin):
+    """Pass/fail for one analyzed flight (the PASS_* settings). Returns (passed, reasons, near_miss)."""
+    fails = []
+    if s["samples_in_collision"] > 0:
+        fails.append(f"collision ({s['min_clearance_m']:.1f} m clearance)")
+    if s["left_workspace_m"] > 0:
+        fails.append(f"left the workspace by {s['left_workspace_m']:.0f} m")
+    if s["goal_miss_m"] > PASS_GOAL_M:
+        fails.append(f"missed the goal by {s['goal_miss_m']:.0f} m")
+    if s["max_error_m"] >= PASS_MAX_ERROR_FRAC * margin:
+        fails.append(f"max {s['max_error_m']:.1f} m from the plan (limit {PASS_MAX_ERROR_FRAC * margin:.0f})")
+    if s["rms_error_m"] > PASS_RMS_M:
+        fails.append(f"rms {s['rms_error_m']:.1f} m from the plan (limit {PASS_RMS_M:.0f})")
+    if s["reached_goal"]:
+        ratio = s["flight_time_s"] / s["plan_flight_time_s"]
+        if abs(ratio - 1) > PASS_TIME_FRAC:
+            fails.append(f"flight time {100 * (ratio - 1):+.0f}% vs the plan (limit +-{100 * PASS_TIME_FRAC:.0f}%)")
+    return not fails, fails, s["min_clearance_m"] < NEAR_MISS_FRAC * margin
+
+
+def batch_analyze(args):
+    """Analyze every flown instance of a batch, score it, and summarize the batch."""
+    from types import SimpleNamespace
+    import csv
+    bd = batch_path(args.name)
+    mf = bd / "manifest.json"
+    if not mf.exists():
+        raise SystemExit(f"No batch '{args.name}' ({mf} not found). Run batch-make first.")
+    manifest = json.load(open(mf))
+    rows = []
+    for inst in manifest["instances"]:
+        row = {"id": inst["id"], "status": inst["status"], "outcome": "", "reasons": "", "near_miss": "",
+               "warnings": len(inst.get("warnings", []))}
+        if inst["status"] == "not_solved":
+            row.update(outcome="NOT_SOLVED", reasons=inst.get("reason", ""))
+        elif inst["status"] == "not_flyable":
+            row.update(outcome="REJECTED", reasons="; ".join(inst["rejects"]))
+        else:
+            log = Path(inst["log"])
+            run_info = {}
+            rj = log.with_suffix(".run.json")
+            if rj.exists():
+                run_info = json.load(open(rj))
+            row["run_status"] = run_info.get("status", "")
+            if not log.exists() or run_info.get("status") in ("sitl_failed", "upload_failed", "arm_failed", "param_failed"):
+                row.update(outcome="NOT_FLOWN", reasons=run_info.get("detail", "no log"))
+            else:
+                print(f"\n=== {inst['id']} ===")
+                try:
+                    s = analyze(SimpleNamespace(mission=inst["mission"], log=str(log), plot=False,
+                                                note=f"batch {args.name}", runs_dir=str(bd / "runs")))
+                except SystemExit as e:                             # e.g. never reached the plan's start
+                    row.update(outcome="FAIL", reasons=str(e)); rows.append(row); continue
+                ok, why, near = evaluate_flight(s, inst["margin_m"])
+                if run_info.get("status") not in (None, "completed"):
+                    why.append(f"run {run_info.get('status')}: {run_info.get('detail', '')}"); ok = False
+                row.update(outcome="PASS" if ok else "FAIL", reasons="; ".join(why), near_miss="yes" if near else "")
+                for k in ("rms_error_m", "max_error_m", "min_clearance_m", "plan_min_clearance_m", "goal_miss_m",
+                          "flight_time_s", "plan_flight_time_s", "roll_oscillation_deg", "pitch_oscillation_deg",
+                          "altitude_oscillation_m", "max_horizontal_error_m", "max_vertical_error_m",
+                          "airspeed_vs_plan_rms_ms"):
+                    row[k] = s.get(k)
+        rows.append(row)
+
+    cols = ["id", "outcome", "reasons", "near_miss", "status", "run_status", "rms_error_m", "max_error_m",
+            "min_clearance_m", "plan_min_clearance_m", "goal_miss_m", "flight_time_s", "plan_flight_time_s",
+            "roll_oscillation_deg", "pitch_oscillation_deg", "altitude_oscillation_m", "max_horizontal_error_m",
+            "max_vertical_error_m", "airspeed_vs_plan_rms_ms", "warnings"]
+    fmt = lambda v: f"{v:.2f}" if isinstance(v, float) else ("" if v is None else v)
+    with open(bd / "results.csv", "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(cols)
+        for r_ in rows:
+            w.writerow([fmt(r_.get(c)) for c in cols])
+    counts = {k: sum(r_["outcome"] == k for r_ in rows) for k in ("PASS", "FAIL", "REJECTED", "NOT_FLOWN", "NOT_SOLVED")}
+    flown = counts["PASS"] + counts["FAIL"]
+    summary = {"name": args.name, "n_instances": len(rows), **{k.lower(): v for k, v in counts.items()},
+               "pass_rate_of_flown": counts["PASS"] / flown if flown else None,
+               "near_misses": sum(r_["near_miss"] == "yes" for r_ in rows),
+               "thresholds": {"max_error_frac_of_margin": PASS_MAX_ERROR_FRAC, "rms_m": PASS_RMS_M,
+                              "goal_m": PASS_GOAL_M, "time_frac": PASS_TIME_FRAC, "near_miss_frac": NEAR_MISS_FRAC}}
+    with open(bd / "summary.json", "w") as fh:
+        json.dump(summary, fh, indent=2)
+    plot_batch(rows, bd / "summary.png", args.name)
+
+    print(f"\nBatch '{args.name}': {len(rows)} environments")
+    print(f"  {'id':<22} {'outcome':<10} {'rms':>6} {'max':>6} {'clear':>6}  reasons")
+    for r_ in rows:
+        num = lambda k: f"{r_[k]:6.1f}" if isinstance(r_.get(k), float) else f"{'':>6}"
+        print(f"  {r_['id']:<22} {r_['outcome']:<10} {num('rms_error_m')} {num('max_error_m')} "
+              f"{num('min_clearance_m')}  {r_['reasons']}{'  [near miss]' if r_['near_miss'] else ''}")
+    rate = f"{100 * summary['pass_rate_of_flown']:.0f}%" if flown else "n/a"
+    print(f"  PASS {counts['PASS']}, FAIL {counts['FAIL']}, REJECTED (not flyable as waypoints) {counts['REJECTED']}, "
+          f"NOT FLOWN {counts['NOT_FLOWN']}, NOT SOLVED {counts['NOT_SOLVED']}; pass rate of flown: {rate}")
+    print(f"  wrote {bd / 'results.csv'}, {bd / 'summary.json'} and {bd / 'summary.png'}; "
+          f"per-flight plots and logs in {bd / 'runs'}")
+    import matplotlib.pyplot as plt
+    if args.plot:
+        plt.show()
+    plt.close("all")
+
+
+def plot_batch(rows, path, name):
+    import matplotlib.pyplot as plt
+    order = ["PASS", "FAIL", "REJECTED", "NOT_FLOWN", "NOT_SOLVED"]
+    colours = {"PASS": "tab:green", "FAIL": "tab:red", "REJECTED": "tab:orange", "NOT_FLOWN": "0.6",
+               "NOT_SOLVED": "0.8"}
+    fig, axs = plt.subplots(1, 2, figsize=(13, 4.8))
+    counts = [sum(r_["outcome"] == k for r_ in rows) for k in order]
+    axs[0].bar(order, counts, color=[colours[k] for k in order])
+    axs[0].set_title(f"batch {name}: outcomes ({len(rows)} environments)"); axs[0].set_ylabel("environments")
+    for x, c in enumerate(counts):
+        axs[0].text(x, c, str(c), ha="center", va="bottom")
+    flown = [r_ for r_ in rows if isinstance(r_.get("rms_error_m"), float)]
+    for r_ in flown:
+        axs[1].scatter(r_["rms_error_m"], r_["min_clearance_m"], color=colours[r_["outcome"]], s=40)
+        axs[1].annotate(r_["id"], (r_["rms_error_m"], r_["min_clearance_m"]), fontsize=7,
+                        xytext=(3, 3), textcoords="offset points")
+    axs[1].axvline(PASS_RMS_M, color="k", ls="--", lw=1, label=f"rms limit {PASS_RMS_M:.0f} m")
+    axs[1].axhline(0, color="tab:red", lw=1, label="touching an obstacle")
+    axs[1].set_xlabel("rms distance from the plan [m]"); axs[1].set_ylabel("closest approach to an obstacle [m]")
+    axs[1].set_title("flown instances"); axs[1].legend(fontsize=8)
+    for a in axs:
+        a.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 def main():
@@ -1197,6 +1601,8 @@ def main():
     m.add_argument("--results", default="tfr_results.json")
     m.add_argument("--index", type=int, default=0)
     m.add_argument("--out", default=None, help="mission file name (default <envs><index>.waypoints)")
+    m.add_argument("--speed-profile", choices=["plan", "constant"], default=None,
+                   help=f"airspeed: follow the plan per leg, or one constant speed (default {SPEED_PROFILE})")
     m.add_argument("--chord-tol", type=float, default=None,
                    help=f"how far a straight leg may stray from the plan, m (default CHORD_TOL_M = {CHORD_TOL_M:g})")
     a = sub.add_parser("analyze", help="Tier 2: check a flown SCP mission against the plan and the obstacles")
@@ -1206,8 +1612,25 @@ def main():
     a.add_argument("--note", default=None, help='what was different about this run, e.g. "TECS_TIME_CONST 8"')
     w_ = sub.add_parser("wobble", help="oscillation in each flight mode of any flight (e.g. an FBWA test)")
     w_.add_argument("--log", required=True, help="MAVProxy .tlog")
+    bm = sub.add_parser("batch-make", help="Tier 3: missions + flyability checks for many solved environments")
+    bm.add_argument("--name", required=True, help="batch name (folder localstore/batches/<name>/)")
+    bm.add_argument("--pair", nargs=2, action="append", required=True, metavar=("ENVS", "RESULTS"),
+                    help="an environments file and the SCP results solved on it; repeat for several")
+    bm.add_argument("--chord-tol", type=float, default=BATCH_CHORD_TOL_M)
+    bm.add_argument("--speed-profile", choices=["plan", "constant"], default=None,
+                    help=f"airspeed: follow the plan per leg, or one constant speed (default {SPEED_PROFILE})")
+    bm.add_argument("--speedup", type=int, default=BATCH_SPEEDUP, help="SITL speedup for run_batch.py")
+    bm.add_argument("--note", default=None, help='e.g. "tracking setup v1"')
+    bm.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
+                    help="autopilot parameter for this batch only, set by run_batch.py before arming "
+                         "(on top of c172_sitl.parm); repeat for several")
+    bm.add_argument("--overwrite", action="store_true", help="rebuild the missions of an existing batch")
+    ba = sub.add_parser("batch-analyze", help="Tier 3: score every flown instance of a batch and summarize")
+    ba.add_argument("--name", required=True)
+    ba.add_argument("--plot", action="store_true", help="show the summary plot (saved either way)")
     args = ap.parse_args()
-    {"box": box, "summary": summary, "make": make, "analyze": analyze, "wobble": wobble}[args.command](args)
+    {"box": box, "summary": summary, "make": make, "analyze": analyze, "wobble": wobble,
+     "batch-make": batch_make, "batch-analyze": batch_analyze}[args.command](args)
 
 
 if __name__ == "__main__":

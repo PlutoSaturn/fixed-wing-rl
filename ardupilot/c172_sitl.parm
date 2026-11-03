@@ -132,7 +132,9 @@ TECS_TIME_CONST   8         # s (default 5). Tuning run 2: throttle swung 58-100
 # ---- navigation -------------------------------------------------------------------
 # tuning run 3 (tfr_env0_nav1) tried NAVL1_DAMPING 0.85 (default 0.75): the arc's roll swings did not
 # shrink; they come from the waypoint corners (a bank pulse at every waypoint, one per ~6.3 s leg)
-NAVL1_PERIOD      20        # s; larger = smoother, slower path convergence (larger aircraft)
+# tuning run 4 (Tier 3 pilot): at 20 s the L1 look-ahead (~250 m) overshot the tight S-turns of the
+# dense plans (roll swinging +-20-40 deg, 20-40 m off the path); trying 15 s (default 20)
+NAVL1_PERIOD      15        # s; larger = smoother, slower path convergence (larger aircraft)
 WP_RADIUS         120       # m
 WP_LOITER_RAD     600       # m; must exceed the turn radius (about 420 m at 30 deg, 49 m/s)
 

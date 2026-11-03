@@ -8,8 +8,7 @@
 
 A cart carries a pendulum balanced upright. The cart must move 1 m along its track in 2 s, starting and ending at rest with the pendulum upright, using as little control effort as possible.
 
-Model and parameters are from Kelly, "An Introduction to Trajectory Optimization: How to Do Your Own Direct Collocation", *SIAM Review* 59(4), 2017, Table 3:
-https://epubs.siam.org/doi/10.1137/16M1062569
+Model and parameters are from Kelly, "An Introduction to Trajectory Optimization: How to Do Your Own Direct Collocation", *SIAM Review* 59(4), 2017, Table 3 (see the [Kelly 2017 reference page](../references/kelly2017.md)):
 
 | Symbol | Value | Meaning |
 |---|---|---|

@@ -1,4 +1,4 @@
-"""Build flat supervised-learning rows from SCP aircraft result JSON files.
+"""Build supervised-learning tables from SCP aircraft JSON or HDF5 results.
 
 The current ``scp_aircraft.py`` output does not persist the initial guess or
 raw solver log. Those features are populated only when a result/log explicitly
@@ -16,7 +16,7 @@ import pandas as pd
 
 
 class SCPAircraftDatasetParser:
-    """Parse SCP aircraft results into one flattened row per solve result.
+    """Parse SCP aircraft results into one flattened row per solve attempt.
 
     Parameters
     ----------
@@ -99,7 +99,8 @@ class SCPAircraftDatasetParser:
         "position_lo_x", "position_lo_y", "position_lo_z",
         "position_hi_x", "position_hi_y", "position_hi_z",
         "vehicle_radius", "margin", "clearance", "obstacle_count",
-        "route_distance_m", "initial_guess_available", "solver_start_speed",
+        "route_distance_m", "initial_guess_available", "guess_full_state_available",
+        "initial_guess_control_available", "solver_start_speed",
         "solver_start_gamma_rad", "solver_start_heading_rad",
         "solver_start_x", "solver_start_y", "solver_start_z",
         "solver_end_x", "solver_end_y", "solver_end_z",
@@ -113,7 +114,9 @@ class SCPAircraftDatasetParser:
     )
     METADATA_COLUMNS = (
         "source_file", "env_index", "env_file", "env_fingerprint", "solver",
-        "best_start", "attempt_count", "initial_guess_source", "raw_log_available",
+        "source_format", "run_name", "attempt_index", "dataset_split",
+        "environment_shard", "best_start", "attempt_count", "n_valid_starts",
+        "initial_guess_source", "guess_trajectory_kind", "raw_log_available",
     )
 
     def __init__(
@@ -297,18 +300,32 @@ class SCPAircraftDatasetParser:
 
     @staticmethod
     def _resample_columns(
-        array: np.ndarray | None, node_count: int, names: tuple[str, ...], prefix: str
+        array: np.ndarray | None,
+        node_count: int,
+        names: tuple[str, ...],
+        prefix: str,
+        source_times: np.ndarray | None = None,
     ) -> dict[str, float | None]:
         fields = {
             f"{prefix}_{index:03d}_{name}": None
             for index in range(node_count)
             for name in names
         }
-        if array is None or array.shape[1] < len(names):
+        if array is None or len(array) < 2:
             return fields
-        old_progress = np.linspace(0.0, 1.0, len(array))
+        old_progress = (
+            np.asarray(source_times, dtype=float)
+            if source_times is not None else np.linspace(0.0, 1.0, len(array))
+        )
+        if (
+            len(old_progress) != len(array)
+            or not np.isfinite(old_progress).all()
+            or np.any(np.diff(old_progress) <= 0)
+        ):
+            raise ValueError(f"{prefix} interpolation times must be finite and increasing")
+        old_progress = (old_progress - old_progress[0]) / (old_progress[-1] - old_progress[0])
         new_progress = np.linspace(0.0, 1.0, node_count)
-        for column, name in enumerate(names):
+        for column, name in enumerate(names[:array.shape[1]]):
             samples = np.interp(new_progress, old_progress, array[:, column])
             for index, value in enumerate(samples):
                 fields[f"{prefix}_{index:03d}_{name}"] = float(value)
@@ -450,14 +467,19 @@ class SCPAircraftDatasetParser:
             if kind:
                 key = f"obstacle_count_{kind}"
                 result[key] = result.get(key, 0) + 1
-        try:
-            from environment.envgen import Environment
+        if not obstacles:
+            occupancy = np.zeros(int(np.prod(self.OCCUPANCY_RESOLUTION)), dtype=bool)
+        else:
+            try:
+                from environment.envgen import Environment
 
-            occupancy = Environment.from_dict(environment).occupancy_grid(
-                self.OCCUPANCY_RESOLUTION
-            ).reshape(-1)
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(f"Could not create occupancy features from environment: {exc}") from exc
+                occupancy = Environment.from_dict(environment).occupancy_grid(
+                    self.OCCUPANCY_RESOLUTION
+                ).reshape(-1)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Could not create occupancy features from environment: {exc}"
+                ) from exc
         for index, occupied in enumerate(occupancy):
             result[f"occupancy_{index:03d}"] = int(occupied)
         metrics = environment.get("metrics")
@@ -479,6 +501,7 @@ class SCPAircraftDatasetParser:
 
         row: dict[str, Any] = {
             "source_file": str(result_path),
+            "source_format": "json",
             "env_index": result.get("env_index"),
             "env_file": result.get("env_file"),
             "env_fingerprint": result.get("env_fingerprint"),
@@ -492,6 +515,16 @@ class SCPAircraftDatasetParser:
             "failure_constraint": self._constraint_cause(raw_log),
             "raw_log_available": raw_log is not None,
             "initial_guess_available": guess is not None,
+            "guess_full_state_available": guess is not None
+            and guess.shape[1] >= len(self.STATE_NAMES),
+            "initial_guess_control_available": isinstance(result.get("initial_guess"), dict)
+            and self._as_array(
+                result["initial_guess"].get("u"), columns=len(self.CONTROL_NAMES)
+            ) is not None,
+            "guess_trajectory_kind": (
+                "full_state" if guess is not None and guess.shape[1] >= len(self.STATE_NAMES)
+                else "position_only" if guess is not None else None
+            ),
             "initial_guess_source": (
                 next(
                     (key for key in ("guess_x", "initial_guess_x", "x_guess")
@@ -508,6 +541,10 @@ class SCPAircraftDatasetParser:
             "max_violation": result.get("max_violation"),
             "dense_min_margin": result.get("dense_min_margin"),
             "best_start": result.get("best_start"),
+            "attempt_index": None,
+            "run_name": None,
+            "dataset_split": None,
+            "environment_shard": None,
             "attempt_count": len(result.get("attempts", []))
             if isinstance(result.get("attempts"), list) else None,
             "attempts_json": self._json_value(result.get("attempts")),
@@ -630,6 +667,7 @@ class SCPAircraftDatasetParser:
         feature_columns = list(dict.fromkeys(feature_columns))
         present_features = [column for column in feature_columns if column in frame.columns]
         X = frame.reindex(columns=present_features).copy()
+        X = X.loc[:, X.notna().any(axis=0)]
         for column in X.columns:
             if X[column].dtype == bool:
                 X[column] = X[column].astype("int8")
@@ -643,8 +681,214 @@ class SCPAircraftDatasetParser:
         metadata = frame.reindex(columns=metadata_columns).copy()
         return X, y, metadata
 
+    @staticmethod
+    def _decode_hdf5_text(value: Any) -> str:
+        if isinstance(value, bytes):
+            return value.decode("utf-8")
+        if isinstance(value, np.ndarray) and value.shape == ():
+            return SCPAircraftDatasetParser._decode_hdf5_text(value.item())
+        return str(value)
+
+    @staticmethod
+    def _hdf5_attr(value: Any) -> Any:
+        if isinstance(value, bytes):
+            return value.decode("utf-8")
+        if isinstance(value, np.generic):
+            return value.item()
+        return value
+
+    def parse_hdf5_file(self, path: str | Path) -> list[dict[str, Any]]:
+        """Parse solve_envs.py HDF5 output, producing one row per attempt."""
+        try:
+            import h5py
+        except ImportError as exc:
+            raise ImportError(
+                "Reading solve_envs.py HDF5 output requires h5py. "
+                "Install it in the active environment with: python -m pip install h5py"
+            ) from exc
+
+        h5_path = Path(path).resolve()
+        manifest_path = h5_path.parent.parent / "manifest.json"
+        manifest: dict[str, Any] = {}
+        if manifest_path.is_file():
+            try:
+                manifest = self._read_json(manifest_path)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"Could not read HDF5 run manifest {manifest_path}: {exc}") from exc
+        solver_settings = manifest.get("solver_settings", {})
+        rows: list[dict[str, Any]] = []
+        try:
+            with h5py.File(h5_path, "r") as h5:
+                for fingerprint in sorted(h5.keys()):
+                    environment_group = h5[fingerprint]
+                    if "env_json" not in environment_group or "attempts" not in environment_group:
+                        continue
+                    try:
+                        environment = json.loads(
+                            self._decode_hdf5_text(environment_group["env_json"][()])
+                        )
+                    except (TypeError, json.JSONDecodeError) as exc:
+                        raise ValueError(
+                            f"Invalid env_json in {h5_path}:{fingerprint}"
+                        ) from exc
+                    env_attrs = {
+                        key: self._hdf5_attr(value)
+                        for key, value in environment_group.attrs.items()
+                    }
+                    for attempt_name in sorted(
+                        environment_group["attempts"].keys(),
+                        key=lambda name: (
+                            not name.isdigit(),
+                            int(name) if name.isdigit() else name,
+                        ),
+                    ):
+                        attempt = environment_group["attempts"][attempt_name]
+                        attrs = {
+                            key: self._hdf5_attr(value) for key, value in attempt.attrs.items()
+                        }
+                        history = None
+                        if "history" in attempt:
+                            try:
+                                history = json.loads(
+                                    self._decode_hdf5_text(attempt["history"][()]) or "null"
+                                )
+                            except (TypeError, json.JSONDecodeError) as exc:
+                                raise ValueError(
+                                    f"Invalid history in {h5_path}:{fingerprint}/attempts/{attempt_name}"
+                                ) from exc
+                        guess_positions = (
+                            np.asarray(attempt["guess_p"][()], dtype=float)
+                            if "guess_p" in attempt else None
+                        )
+                        guess_times = (
+                            np.asarray(attempt["guess_t"][()], dtype=float)
+                            if "guess_t" in attempt else None
+                        )
+                        final_states = (
+                            np.asarray(attempt["x_rs"][()], dtype=float)
+                            if "x_rs" in attempt else None
+                        )
+                        controls = (
+                            np.asarray(attempt["u_rs"][()], dtype=float)
+                            if "u_rs" in attempt else None
+                        )
+                        # HDF5 attempts store guess positions only; do not invent
+                        # guessed speed, attitude, or controls.
+                        synthetic_result = {
+                            "success": bool(attrs.get("success", False)),
+                            "status": attrs.get("status", "unknown"),
+                            "iterations": attrs.get("iterations"),
+                            "solve_time": attrs.get("solve_time"),
+                            "flight_time": attrs.get("flight_time"),
+                            "cost": attrs.get("cost"),
+                            "max_defect": attrs.get("max_defect"),
+                            "max_violation": attrs.get("max_violation"),
+                            "dense_min_margin": attrs.get("dense_min_margin"),
+                            "x": final_states.tolist() if final_states is not None else None,
+                            "u": controls.tolist() if controls is not None else None,
+                            "guess_x": guess_positions.tolist()
+                            if guess_positions is not None else None,
+                            "history": history,
+                            "solver_config": {},
+                        }
+                        row = self.parse_result(
+                            synthetic_result, result_file=h5_path
+                        )
+                        row.update(self._environment_features(environment))
+                        row.update({
+                            "source_format": "hdf5",
+                            "source_file": str(h5_path),
+                            "env_index": env_attrs.get("index"),
+                            "env_file": None,
+                            "env_fingerprint": fingerprint,
+                            "solver": env_attrs.get("method"),
+                            "run_name": manifest.get("run", h5_path.parent.parent.name),
+                            "attempt_index": int(attempt_name)
+                            if attempt_name.isdigit() else attempt_name,
+                            "dataset_split": env_attrs.get("split"),
+                            "environment_shard": env_attrs.get("env_shard"),
+                            "best_start": env_attrs.get("best_start"),
+                            "attempt_count": env_attrs.get("n_starts"),
+                            "n_valid_starts": env_attrs.get("n_valid_starts"),
+                            "initial_guess_available": guess_positions is not None,
+                            "guess_full_state_available": False,
+                            "initial_guess_control_available": False,
+                            "initial_guess_source": "attempt.guess_p"
+                            if guess_positions is not None else None,
+                            "guess_trajectory_kind": "position_only",
+                            "raw_log_available": False,
+                            "raw_log": None,
+                            "failure_constraint": None,
+                            "solver_config_json": self._json_value(solver_settings),
+                            "constraint_config_json": self._json_value(solver_settings),
+                        })
+                        for key, value in solver_settings.items():
+                            safe_key = re.sub(r"[^a-zA-Z0-9_]+", "_", key).lower()
+                            number = self._safe_number(value)
+                            if number is not None:
+                                row[f"solver_config_{safe_key}"] = number
+                        start = np.asarray(environment["start_pos"], dtype=float)
+                        goal = np.asarray(environment["goal_pos"], dtype=float)
+                        row["route_distance_m"] = float(np.linalg.norm(goal - start))
+                        row["solver_start_x"], row["solver_start_y"], row["solver_start_z"] = start
+                        row["solver_end_x"], row["solver_end_y"], row["solver_end_z"] = goal
+                        start_state = np.asarray(
+                            environment_group["start_state"][()], dtype=float
+                        ) if "start_state" in environment_group else None
+                        if start_state is not None and len(start_state) >= 6:
+                            row["solver_start_speed"] = float(start_state[3])
+                            row["solver_start_gamma_rad"] = float(start_state[4])
+                            row["solver_start_heading_rad"] = float(start_state[5])
+                        row["solver_end_speed_is_free"] = True
+                        row["solver_end_heading_is_free"] = True
+                        row["solver_end_gamma_is_fixed"] = bool(
+                            solver_settings.get("solvers.scp_aircraft.FINAL_LEVEL", False)
+                        )
+                        row["initial_guess_flight_time"] = None
+                        guess_rs = self._resample_columns(
+                            guess_positions, self.node_count, ("x", "y", "z"), "guess",
+                            source_times=guess_times,
+                        )
+                        if (
+                            guess_positions is not None and len(guess_positions) >= 2
+                            and final_states is not None and len(final_states) >= 2
+                        ):
+                            source_times = (
+                                guess_times if guess_times is not None
+                                else np.linspace(0.0, 1.0, len(guess_positions))
+                            )
+                            aligned_guess = np.column_stack([
+                                np.interp(
+                                    np.linspace(0.0, 1.0, self.node_count),
+                                    (source_times - source_times[0])
+                                    / (source_times[-1] - source_times[0]),
+                                    guess_positions[:, axis],
+                                )
+                                for axis in range(3)
+                            ])
+                            aligned_final = np.column_stack([
+                                np.interp(
+                                    np.linspace(0.0, 1.0, self.node_count),
+                                    np.linspace(0.0, 1.0, len(final_states)),
+                                    final_states[:, axis],
+                                )
+                                for axis in range(3)
+                            ])
+                            row.update(self._guess_differences(aligned_guess, aligned_final))
+                        row.update(guess_rs)
+                        row.update(self._resample_columns(
+                            controls, self.node_count, self.CONTROL_NAMES, "control"
+                        ))
+                        row["attempt_history_json"] = self._json_value(history)
+                        rows.append(row)
+        except OSError as exc:
+            raise ValueError(f"Could not read HDF5 solver results {h5_path}: {exc}") from exc
+        return rows
+
     def parse_file(self, path: str | Path) -> list[dict[str, Any]]:
         result_path = Path(path).resolve()
+        if result_path.suffix.lower() in {".h5", ".hdf5"}:
+            return self.parse_hdf5_file(result_path)
         try:
             payload = self._read_json(result_path)
         except (OSError, json.JSONDecodeError) as exc:
@@ -653,9 +897,9 @@ class SCPAircraftDatasetParser:
         return [self.parse_result(record, result_path) for record in records]
 
     def parse_directory(
-        self, directory: str | Path, recursive: bool = False
+        self, directory: str | Path, recursive: bool = False, file_format: str = "json"
     ) -> pd.DataFrame:
-        """Read result JSON files in a directory and return flattened rows.
+        """Read JSON or HDF5 results and return flattened rows.
 
         JSON files that do not contain SCP result records (for example raw
         environment files) are ignored. Malformed JSON raises a contextual
@@ -664,7 +908,13 @@ class SCPAircraftDatasetParser:
         root = Path(directory)
         if not root.is_dir():
             raise NotADirectoryError(f"Result directory does not exist: {root}")
-        paths = sorted(root.rglob("*.json") if recursive else root.glob("*.json"))
+        if file_format not in {"json", "hdf5", "auto"}:
+            raise ValueError("file_format must be 'json', 'hdf5', or 'auto'")
+        patterns = ("*.json",) if file_format == "json" else (
+            ("*.h5", "*.hdf5") if file_format == "hdf5" else ("*.json", "*.h5", "*.hdf5")
+        )
+        search = root.rglob if recursive else root.glob
+        paths = sorted(path for pattern in patterns for path in search(pattern))
         rows: list[dict[str, Any]] = []
         for path in paths:
             parsed = self.parse_file(path)
@@ -680,6 +930,7 @@ class SCPAircraftDatasetParser:
         environment_dir: str | Path | None = None,
         solver_constraints: dict[str, Any] | None = None,
         recursive: bool = False,
+        file_format: str = "json",
     ) -> pd.DataFrame:
         """Convenience batch API returning one DataFrame for a result directory."""
         parser = cls(
@@ -688,7 +939,9 @@ class SCPAircraftDatasetParser:
             environment_dir=environment_dir,
             solver_constraints=solver_constraints,
         )
-        return parser.parse_directory(directory, recursive=recursive)
+        return parser.parse_directory(
+            directory, recursive=recursive, file_format=file_format
+        )
 
 
 def parse_results_directory(
@@ -698,6 +951,7 @@ def parse_results_directory(
     environment_dir: str | Path | None = None,
     solver_constraints: dict[str, Any] | None = None,
     recursive: bool = False,
+    file_format: str = "json",
 ) -> pd.DataFrame:
     """Functional wrapper for :meth:`SCPAircraftDatasetParser.parse_directory`."""
     return SCPAircraftDatasetParser.parse_directory_to_dataframe(
@@ -707,4 +961,5 @@ def parse_results_directory(
         environment_dir=environment_dir,
         solver_constraints=solver_constraints,
         recursive=recursive,
+        file_format=file_format,
     )

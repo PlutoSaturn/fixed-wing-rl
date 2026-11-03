@@ -4,6 +4,7 @@ __pycache__/
 .env
 *.env
 localstore/
+supervised-learning-main/rl_pilot/
 .json
 *.json
 .idea/

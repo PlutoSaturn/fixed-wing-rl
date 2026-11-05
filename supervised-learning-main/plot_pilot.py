@@ -4,6 +4,8 @@ Plot what the RL pilot is doing: fly a few flights with a saved checkpoint and d
 For each flight:
     top view and side view of the path with the obstacles it actually had (dark) and the ones
     thinned out for this curriculum stage (light), start, goal, and where / how the flight ended;
+    what it found out on the way: the cells its map marked occupied (orange, top view: at any
+    altitude), the airspace it never saw (grey), and the points its far scans hit (red dots);
     time histories of speed, climb angle, bank angle, thrust, and the lidar distance straight
     ahead and the closest of all rays.
 The agent flies its mean action (no exploration noise), on this computer (CPU is fine).
@@ -15,7 +17,8 @@ Then (from the fixed-wing-rl folder):
     python supervised-learning-main/plot_pilot.py --name pilot_v2 --n 10 --full      full environments (validation split)
     python supervised-learning-main/plot_pilot.py --name pilot_v2 --checkpoint best --show
 Plots are saved to supervised-learning-main/rl_pilot/<name>/plots/.
-Works with checkpoints from before the forward-only lidar change too (detected automatically).
+Needs a checkpoint from this version of rl_pilot.py (OBS_VERSION 8: scans and the map it builds).
+Older runs: plot them with the plot_pilot.py / rl_pilot.py of their version.
 """
 import argparse
 import json
@@ -68,51 +71,21 @@ def use_legacy_rays():
     rp.N_RAYS_FAN = 15
 
 
-def drop_projected_miss(n_rays):
-    """Checkpoints from before the projected-miss inputs: remove those two inputs."""
+def drop_inputs(lo, hi, n_keep):
+    """Older checkpoints: remove inputs lo:hi of the current observation (added later)."""
     orig = rp.Sim.obs
 
     def obs(self):
         o, m = orig(self)
-        return torch.cat([o[:, :13], o[:, 15:]], -1), m
+        return torch.cat([o[:, :lo], o[:, hi:]], -1), m
     rp.Sim.obs = obs
-    rp.OBS_DIM = 13 + n_rays
+    rp.OBS_DIM = n_keep
 
 
 def fly_recorded(agent, W, maps, af, env_rows, keep_frac, seed):
-    """Like rl_pilot.fly, but also keeps the thinned-out obstacles and the lidar readings."""
-    n = len(env_rows)
-    sim = rp.Sim(W, maps, None, af, n, "cpu", seed=seed)
-    sim.keep_frac = keep_frac
-    sim.reset(torch.arange(n), torch.as_tensor(env_rows))
-    drop = sim.drop.clone()
-    done = torch.zeros(n, dtype=torch.bool)
-    status = torch.zeros(n, dtype=torch.long)
-    X, U, T, RY = [sim.x.clone()], [sim.u.clone()], [sim.t.clone()], []
-    steps = int(rp.TIME_LIMIT_X * sim.tref.max().item() / rp.DT) + 2
-    with torch.no_grad():
-        for _ in range(steps):
-            o, m = sim.obs()
-            RY.append(sim.rays.clone())
-            act = agent.mean(o, m).clamp(-1, 1)
-            xp, up_, tp = sim.x.clone(), sim.u.clone(), sim.t.clone()
-            _, d, s, _ = sim.step(act)
-            sim.x = torch.where(done[:, None], xp, sim.x)
-            sim.u = torch.where(done[:, None], up_, sim.u)
-            sim.t = torch.where(done, tp, sim.t)
-            status = torch.where(~done & d, s, status)
-            done = done | d
-            X.append(sim.x.clone()); U.append(sim.u.clone()); T.append(sim.t.clone())
-            if done.all():
-                break
-    RY.append(RY[-1])
-    X, U, T, RY = (torch.stack(v, 1).numpy() for v in (X, U, T, RY))
-    out = []
-    for i in range(n):
-        k = int(np.searchsorted(T[i], T[i, -1])) + 1
-        out.append({"status": rp.STATUS[int(status[i])], "t": T[i, :k], "X": X[i, :k], "U": U[i, :k],
-                    "rays": RY[i, :k] * rp.RAY_RANGE_M, "drop": drop[i]})
-    return out
+    """rl_pilot.fly with recording: the path, the lidar along it, the map it built, what its far
+    scans hit, and the thinned-out obstacles."""
+    return rp.fly(agent, None, W, maps, None, af, env_rows, "cpu", keep_frac=keep_frac, seed=seed, record=True)
 
 
 def occupancy(W, e, pts, drop=None):
@@ -140,6 +113,8 @@ def plot_flight(fl, W, e, env_index, af, out, show, stage_txt):
     XZ, ZZ = np.meshgrid(xs, zs)
     side = np.stack([XZ.ravel(), y_at(XZ.ravel()), ZZ.ravel()], 1)
     has_drop = bool(fl["drop"].any())
+    seen = fl.get("seen")                                             # (SX, SY, SZ) 0 unknown 1 free 2 occupied
+    info_txt = f"   its map knew {100 * fl.get('known', 0):.0f}% of the corridor at the end"
     slices = []
     for pts, shape in ((top, XX.shape), (side, XZ.shape)):
         all_ = occupancy(W, e, pts).reshape(shape)
@@ -157,7 +132,28 @@ def plot_flight(fl, W, e, env_index, af, out, show, stage_txt):
         ext = [xs[0] * km, xs[-1] * km, (ys[0] if v == 0 else zs[0]) * km, (ys[-1] if v == 0 else zs[-1]) * km]
         ax.imshow(img, origin="lower", extent=ext, aspect="auto" if v else "equal", interpolation="nearest")
         j = 1 if v == 0 else 2
-        ax.plot(X[:, 0] * km, X[:, j] * km, color=col, lw=2.2)
+        if v == 0 and seen is not None:                              # what its map knew at the end
+            sx0, sx1 = rp.SEEN_X_M
+            sy0, sy1 = rp.SEEN_Y_M
+            sext = [sx0 * km, sx1 * km, sy0 * km, sy1 * km]
+            SX, SY, SZ = seen.shape                                 # the layer at the flight's altitude
+            cx = sx0 + rp.SEEN_CELL_M * (np.arange(SX) + 0.5)
+            zw = z_at(cx) + W["origin"][e, 2].item() - W["lo"][2].item()
+            lay = np.clip((zw // rp.SEEN_CELL_M).astype(int), 0, SZ - 1)
+            sl = seen.numpy()[np.arange(SX), :, lay]                  # (SX, SY)
+            occ_ = (sl == 2).T.astype(float)
+            unk_ = (sl == 0).T.astype(float)
+            ax.imshow(np.ma.masked_where(unk_ == 0, unk_), origin="lower", extent=sext, aspect="equal",
+                      cmap="Greys", vmin=0, vmax=4, alpha=0.6, interpolation="nearest")
+            ax.imshow(np.ma.masked_where(occ_ == 0, occ_), origin="lower", extent=sext, aspect="equal",
+                      cmap="Oranges", vmin=0, vmax=1.6, alpha=0.65, interpolation="nearest")
+        for bi, h in enumerate(fl.get("far_hits", [])):              # what the far scans hit
+            if len(h):
+                ax.plot(h[:, 0] * km, h[:, j] * km, ".", ms=1.5, color="#e34948", alpha=0.5,
+                        label="far-scan hits" if bi == 0 else None)
+        ax.plot(X[:, 0] * km, X[:, j] * km, color=col, lw=2.2, label="flown")
+        if v == 0:
+            ax.legend(fontsize=7, frameon=False, loc="upper left", markerscale=6)
         ax.plot(0, 0, "o", ms=8, color=INK, mec="white", mew=2)
         ax.plot(goal[0] * km, goal[j] * km, "s", ms=9, color=INK, mec="white", mew=2)
         ax.plot(X[-1, 0] * km, X[-1, j] * km, "X" if fl["status"] != "goal" else "o", ms=12, color=col, mec="white", mew=1.5)
@@ -166,7 +162,8 @@ def plot_flight(fl, W, e, env_index, af, out, show, stage_txt):
                 ax.annotate("", xy=((X[k, 0] + 250 * math.cos(X[k, 5])) * km, (X[k, 1] + 250 * math.sin(X[k, 5])) * km),
                             xytext=(X[k, 0] * km, X[k, 1] * km), arrowprops=dict(arrowstyle="->", color=col, lw=1))
         ax.set_xlim(ext[0], ext[1]); ax.set_ylim(ext[2], ext[3])
-        ax.set_title("Top view (obstacles at the flight's altitude)" if v == 0 else
+        ax.set_title("Top view at the flight's altitude (grey = obstacles; orange = cells its map marked occupied; "
+                     "shaded = never seen)" if v == 0 else
                      "Side view (obstacles at the flight's lateral position)", loc="left", fontsize=10, color=INK)
         ax.set_xlabel("along start-goal line (km)", fontsize=8, color=MUTED)
         ax.set_ylabel("cross track (km)" if v == 0 else "height rel. start (km)", fontsize=8, color=MUTED)
@@ -194,7 +191,7 @@ def plot_flight(fl, W, e, env_index, af, out, show, stage_txt):
         ax.set_xlabel("time (s)", fontsize=8, color=MUTED)
         ax.tick_params(labelsize=8, colors=MUTED)
         ax.grid(color=GRID, lw=0.6)
-    fig.suptitle(f"Environment {env_index}: {fl['status'].replace('_', ' ')} after {t[-1]:.0f} s   ({stage_txt})",
+    fig.suptitle(f"Environment {env_index}: {fl['status'].replace('_', ' ')} after {t[-1]:.0f} s{info_txt}   ({stage_txt})",
                  x=0.06, ha="left", fontsize=13, color=col if fl["status"] != "goal" else INK)
     fig.savefig(out, dpi=120, bbox_inches="tight", facecolor="white")
     if show:
@@ -223,17 +220,10 @@ def main():
         raise SystemExit(f"{ck_path} not found. Copy it from Modal first:\n  modal run "
                          f"supervised-learning-main/rl_pilot.py --name {a.name} --download-only")
     ck = torch.load(ck_path, map_location="cpu", weights_only=False)
-    n_in = ck["agent"]["actor.0.weight"].shape[1] - 128
-    version = (ck.get("settings") or {}).get("OBS_VERSION") or (1 if n_in == 13 + 31 else 2 if n_in == 13 + 29 else None)
-    if version == 1:
-        use_legacy_rays()
-        drop_projected_miss(31)
-        print("checkpoint uses the first lidar (+-105 deg, sphere tracing); plotting with that")
-    elif version == 2:
-        drop_projected_miss(rp.N_RAYS)
-        print("checkpoint uses the forward lidar without the projected-miss inputs; plotting with that")
-    if n_in != rp.OBS_DIM:
-        raise SystemExit(f"checkpoint expects {n_in} inputs, this rl_pilot.py makes {rp.OBS_DIM}")
+    version = (ck.get("settings") or {}).get("OBS_VERSION")
+    if version != rp.OBS_VERSION:
+        raise SystemExit(f"checkpoint is from an older version of the pilot (OBS_VERSION {version}); plot it with "
+                         f"the plot_pilot.py and rl_pilot.py of that version (this one is {rp.OBS_VERSION}).")
     st = ck.get("state", {})
     sett = ck.get("settings") or {}
     rp.ACTION_MODE = sett.get("ACTION_MODE", "rate")                 # earlier runs commanded rates
@@ -269,13 +259,12 @@ def main():
         keep = rp.KEEP_STAGES[st.get("keep_idx", 0)]
         rows = rng.choice(pool, min(a.n, len(pool)), replace=False)
         stage_txt = f"training stage: {keep:.0%} of obstacles, least-cluttered {st.get('pool_frac', 0.3):.0%} of environments"
-    maps = torch.zeros((W["E"], 3, rp.MAP_NX, rp.MAP_NY))
+    maps = None
     if a.successes:                                   # fly batches until enough flights reached the goal
         print(f"{a.checkpoint}.pt from update {st.get('update', '?')}; flying until {a.n} reach the goal ({stage_txt}) ...")
         got_rows, got, all_flights, tries = [], [], [], 0
         while len(got) < a.n and tries < 10:
             batch = rng.choice(pool, min(max(2 * a.n, 10), len(pool)), replace=False)
-            maps[torch.as_tensor(batch)] = rp.build_maps(W, "cpu", ids_all=torch.as_tensor(batch))
             fl_b = fly_recorded(agent, W, maps, af, batch, keep, a.seed + tries)
             all_flights += fl_b
             for e, fl in zip(batch, fl_b):
@@ -285,7 +274,6 @@ def main():
             print(f"  batch {tries}: {sum(f['status'] == 'goal' for f in fl_b)} of {len(fl_b)} reached the goal")
         rows, flights = np.asarray(got_rows, dtype=int), got
     else:
-        maps[torch.as_tensor(rows)] = rp.build_maps(W, "cpu", ids_all=torch.as_tensor(rows))
         print(f"{a.checkpoint}.pt from update {st.get('update', '?')}; flying {len(rows)} flights ({stage_txt}) ...")
         flights = fly_recorded(agent, W, maps, af, rows, keep, a.seed)
         all_flights = flights
@@ -298,12 +286,13 @@ def main():
         out = out_dir / f"{'full' if a.full else 'stage'}_{i:02d}_env{idx:05d}.png"
         plot_flight(fl, W, int(e), idx, af, out, a.show, stage_txt)
         X = fl["X"]
-        print(f"  env {idx:5d}: {fl['status']:13s} after {fl['t'][-1]:5.0f} s, {X[-1, 0] / 1000:5.2f} of "
+        print(f"  env {idx:5d}: {fl['status']:13s} after {fl['t'][-1]:5.0f} s (map knew {100 * fl['known']:.0f}% of the corridor), {X[-1, 0] / 1000:5.2f} of "
               f"{W['goal'][e, 0].item() / 1000:5.2f} km along, speed {X[-1, 3]:4.1f} m/s  -> {out}")
     st_counts = {}
     for fl in all_flights:
         st_counts[fl["status"]] = st_counts.get(fl["status"], 0) + 1
     print("summary:", ", ".join(f"{k} {v}" for k, v in st_counts.items()))
+
     # where the failures happen
     fails = [(fl, e) for fl, e in zip(flights, rows) if fl["status"] != "goal"]
     if fails:

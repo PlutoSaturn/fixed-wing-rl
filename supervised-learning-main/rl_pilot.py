@@ -16,14 +16,26 @@ The simulator (vectorized in PyTorch, thousands of flights at once on one GPU)
     Obstacles are the same convex pieces as envgen, inflated by the planning clearance (36 m);
     entering one, or leaving the box, ends the flight as a crash.
 
-What the agent senses
+What the agent senses (only what its own scans have shown it; nothing else about the obstacles)
     its speed, climb angle, current controls, height above the floor and below the ceiling,
     the direction / distance / elevation of the goal, the elapsed time, and
-    "lidar": N_RAYS rays looking forward (a horizontal fan of +-FAN_DEG and two slightly raised /
-        lowered fans of +-45 deg), each giving the exact distance along its own direction to the
-        first inflated obstacle or box wall it hits, up to RAY_RANGE_M, plus
-    a coarse map of the whole environment: occupancy of MAP_NX x MAP_NY x 3 cells (500 m x 500 m x
-        200 m), with its own position and the goal marked, so it can choose a corridor early.
+    a SHORT SCAN every step: N_RAYS lidar rays looking forward (a horizontal fan of +-FAN_DEG and two
+        slightly raised / lowered fans of +-45 deg), each giving the exact distance to the first
+        inflated obstacle or box wall it hits, up to RAY_RANGE_M (cheap: done every step), and
+    a FAR SCAN every FAR_EVERY_S seconds (and at the start): FAR_AZ x FAR_EL rays in a narrow cone
+        (+-FAR_AZ[1] deg x +-FAR_EL[1] deg) centred on the line to the goal, out to FAR_RANGE_M, to
+        learn how the course opens up kilometres ahead (costlier: done now and then).
+
+The map it builds as it flies: every flight starts with an empty 3D map of SEEN_CELL_M cells
+(everything unknown). Each ray of either scan marks the cells it passes through as free and the cell
+where it hits as occupied (occupied wins: obstacles do not move). The map only ever gains detail, so
+its view of the environment improves as it flies. It sees that map twice:
+    a local view ahead: LOCAL_NF x LOCAL_NS cells (LOCAL_AHEAD_M along its heading, +-LOCAL_SIDE_M
+        to the sides) at three altitudes (LOCAL_DZ_M below / level / above), occupied and unknown
+        channels, turning with the aircraft, and
+    an overview of the whole map: MAP_NX x MAP_NY cells of MAP_CELL m, three altitude bands, share
+        of each cell seen occupied and share still unknown, with its own position and the goal marked.
+No rewinds: a crash ends the flight.
 
 It also sees the projected miss at the goal plane (lateral and vertical, in MISS_SCALE_M), so it
 can line up its arrival early, including climbing or descending in time.
@@ -39,7 +51,7 @@ and the agent always see the same obstacles; the benchmark flight times were sol
 flight-time gap can be slightly optimistic for the affected environments).
 
 Reward each step
-    + PROG_W  * (progress toward the goal / straight-line distance)
+    + PROG_W  * (reduction in distance to the goal / starting distance)   (progress)
     - TIME_W  * (dt / straight-line flight time)               (fly fast)
     - PROX_W  * dt * (how deep it is inside a PROX_M soft zone around the inflated obstacles)
     - TTC_W   * dt * (1 - time to impact / TTC_S)   when heading at an obstacle (central rays) with
@@ -67,7 +79,7 @@ current setting exceeds CURRICULUM_SUCCESS:
        every flight keeps a random KEEP_STAGES share of its environment's obstacles (a new subset
        each flight), starting with none - open sky, to learn to fly the envelope to the goal fast
     2. then all obstacles, adding more cluttered environments (by occupancy) CURRICULUM_STEP at a time.
-The lidar, collisions and the coarse map always reflect the obstacles the flight actually has.
+The scans (so its map) and collisions always reflect the obstacles the flight actually has.
 Solver evaluations always use the full environments.
 Progress is judged on the agent's real flying: every CHECK_EVERY updates it flies CHECK_FLIGHTS
 flights of the current stage with its mean action (no exploration noise); that success rate decides
@@ -129,9 +141,24 @@ FAN_DEG        = 75.0                #   (forward field of view only)
 N_RAYS_TILT    = 7                   # raised and lowered fans (+-TILT_DEG), -45 ... +45 deg
 TILT_DEG       = 8.0
 RAY_RANGE_M    = 1500.0
-MAP_NX, MAP_NY = 26, 10              # coarse map cells (500 m) along / across the start-goal line
-MAP_X0, MAP_Y0 = -1000.0, -2500.0    # map corner in the flight frame, m
+MAP_NX, MAP_NY = 26, 10              # overview of its map: cells (500 m) along / across the start-goal line
+MAP_X0, MAP_Y0 = -1000.0, -2500.0    # overview corner in the flight frame, m
 MAP_CELL       = 500.0
+
+# the map it builds from its scans (starts all unknown)
+SEEN_CELL_M    = 100.0               # cell size (x, y, z), flight frame
+SEEN_X_M       = (-1000.0, 13000.0)  # extent along the start-goal line ...
+SEEN_Y_M       = (-2500.0, 2500.0)   #   ... and across it (z: the whole box)
+SCAN_STEP_M    = 50.0                # free space is marked every this far along each ray
+FAR_EVERY_S    = 10.0                # a far scan every this many seconds (and at the start): a cone ...
+FAR_AZ         = (31, 15.0)          #   ... of this many rays across +- this azimuth (deg) ...
+FAR_EL         = (11, 5.0)           #   ... x this many across +- this elevation (deg), around the line
+FAR_RANGE_M    = 5000.0              #   to the goal, out to this range
+FAR_EL_MAX_DEG = 10.0                # the cone's centre is tilted toward the goal by at most this
+FAR_CHUNK      = 24                  # rays per batch in the far scan (memory)
+LOCAL_AHEAD_M  = (-500.0, 3000.0)    # local view: from behind to ahead of the aircraft ...
+LOCAL_SIDE_M   = 1000.0              #   ... +- this to the sides ...
+LOCAL_DZ_M     = (-100.0, 0.0, 100.0)   # ... at these altitudes relative to it (cells of SEEN_CELL_M)
 
 # reward
 PROG_W         = 10.0
@@ -174,7 +201,8 @@ KEEP_STAGES        = (0.0, 0.25, 0.5, 0.75, 1.0)   # obstacle thinning first: ea
                                      #   share of its environment's obstacles (0 = open sky: learn to fly)
 CURRICULUM_START   = 0.3             # least cluttered share of the training envs to start with
 CURRICULUM_STEP    = 0.1
-CURRICULUM_SUCCESS = 0.7             # NOISE-FREE success rate on the current stage needed to move on
+CURRICULUM_SUCCESS = 0.7             # NOISE-FREE success rate on the current stage
+                                     #   needed to move on
 CHECK_EVERY        = 10              # updates between noise-free check flights on the current stage
 CHECK_FLIGHTS      = 256             # flights per check (the last 2 checks are averaged)
 PLATEAU_UPDATES    = 100             # updates without a better noise-free success rate = a plateau
@@ -193,7 +221,7 @@ CHECKPOINT_EVERY = 10
 MODAL_APP_NAME = "fixed-wing-pilot"
 MODAL_VOLUME   = "fixed-wing-rl-data"
 GPU            = "H100"
-N_GPUS         = 1                   # GPUs in the training container (Modal allows up to 8). The flights are
+N_GPUS         = 1                 # GPUs in the training container (Modal allows up to 8). The flights are
                                      #   split across them, each GPU holds a copy of the agent, and their
                                      #   gradients are averaged into one update (same learning, faster).
 LOOP_TIMEOUT_S = 24 * 3600
@@ -223,8 +251,15 @@ VOLUME_MOUNT = "/data"
 CODE_DIRS = ("environment", "solvers", "aircraftmodel")
 _CFG_KEYS = ("dataset", "run", "n_envs", "seed")
 N_RAYS = N_RAYS_FAN + 2 * N_RAYS_TILT
-OBS_VERSION = 3                      # 1: old lidar; 2: forward exact lidar; 3: + projected miss at the goal
+OBS_VERSION = 8                      # 1: old lidar; 2: forward exact lidar; 3: + projected miss; 5: + difficulty field;
+                                     # 6: + look-ahead manoeuvres; 7: learned penalty map; 8: maps it builds from
+                                     #   its own scans (short + far scan; local view + overview)
 OBS_DIM = 15 + N_RAYS
+LOCAL_NF = int(round((LOCAL_AHEAD_M[1] - LOCAL_AHEAD_M[0]) / SEEN_CELL_M))
+LOCAL_NS = int(round(2 * LOCAL_SIDE_M / SEEN_CELL_M))
+GMAP_SHAPE = (8, MAP_NX, MAP_NY)                     # overview: occupied x3, unknown x3, own position, goal
+LMAP_SHAPE = (2 * len(LOCAL_DZ_M), LOCAL_NF, LOCAL_NS)   # local view: occupied, unknown per altitude
+MAP_FLAT = math.prod(GMAP_SHAPE) + math.prod(LMAP_SHAPE)
 STATUS = {0: "flying", 1: "goal", 2: "crash", 3: "out_of_bounds", 4: "stall", 5: "timeout", 6: "missed"}
 
 
@@ -387,6 +422,10 @@ def build_world(cache, scale, bounds_lo, bounds_hi, vehicle_radius, clearance, d
          "lo": tt(np.asarray(bounds_lo) + vehicle_radius), "hi": tt(np.asarray(bounds_hi) - vehicle_radius),
          "clearance": float(clearance), "E": E}
     W["removed"] = clear_start_goal(W, CLEAR_RADIUS_M)          # departure / arrival areas kept clear
+    H = float(W["hi"][2] - W["lo"][2])
+    W["seen_shape"] = (int(round((SEEN_X_M[1] - SEEN_X_M[0]) / SEEN_CELL_M)),
+                       int(round((SEEN_Y_M[1] - SEEN_Y_M[0]) / SEEN_CELL_M)),
+                       max(3, int(math.ceil(H / SEEN_CELL_M))))
     return W
 
 
@@ -424,7 +463,7 @@ def clear_start_goal(W, radius):
     return removed
 
 
-def sdf(p, env_ids, W, chunk=None, drop=None):
+def sdf(p, env_ids, W, chunk=None, drop=None, walls=True):
     """Distance-like clearance (m) of points p (N, M, 3, flight frame) from the inflated obstacles and
     the box walls of each flight's environment; negative inside. Conservative (never larger than
     the true distance), which makes it safe for sphere tracing."""
@@ -444,6 +483,9 @@ def sdf(p, env_ids, W, chunk=None, drop=None):
     for m0 in range(0, M, step):
         pp = p[:, m0:m0 + step]
         h = piece_h(pp, tok, d).masked_fill(mask[:, None], 1e9).min(-1).values   # (N, m)
+        if not walls:
+            out.append(h)
+            continue
         # box walls (world frame)
         cy, sy = torch.cos(W["yaw"][env_ids]), torch.sin(W["yaw"][env_ids])
         xw = pp[..., 0] * cy[:, None] - pp[..., 1] * sy[:, None] + W["origin"][env_ids, None, 0]
@@ -470,7 +512,7 @@ def ray_dirs(chi, device):
     return v
 
 
-def ray_hits(pos, dirs, env_ids, W, drop=None):
+def ray_hits(pos, dirs, env_ids, W, drop=None, rng=None):
     """Exact distance (m) along each ray to the first inflated obstacle piece or box wall it hits.
     pos (N, 3), dirs (N, R, 3) unit, flight frame. 0 if the ray starts inside an obstacle; RAY_RANGE_M
     if nothing is hit within range. Same shapes as envgen/sdf(): inflated spheroids are ellipsoids
@@ -542,7 +584,7 @@ def ray_hits(pos, dirs, env_ids, W, drop=None):
     inv = 1.0 / torch.where(dw.abs() < eps, torch.full_like(dw, eps), dw)
     tw = torch.where(dw > 0, (W["hi"] - pw) * inv, (W["lo"] - pw) * inv)
     tw = torch.where(dw.abs() < eps, big, tw).clamp(min=0.0).min(-1).values
-    return torch.clamp(torch.minimum(t_hit, tw), max=RAY_RANGE_M)
+    return torch.clamp(torch.minimum(t_hit, tw), max=RAY_RANGE_M if rng is None else rng)
 
 
 def cast_rays(pos, chi, env_ids, W, drop=None):
@@ -550,48 +592,13 @@ def cast_rays(pos, chi, env_ids, W, drop=None):
     return ray_hits(pos, dirs, env_ids, W, drop) / RAY_RANGE_M
 
 
-def build_maps(W, device, batch=16, ids_all=None, drop=None, progress=False):
-    """Coarse occupancy (len(ids), 3, MAP_NX, MAP_NY): fraction of 8 sample points per cell that are
-    inside an inflated obstacle or outside the box. Layers = world altitude bands of 1/3 height.
-    ids_all: environment ids (default: all); drop: (len(ids), T) obstacles to leave out."""
-    import torch
-    if ids_all is None:
-        ids_all = torch.arange(W["E"], device=device)
-    xs = MAP_X0 + MAP_CELL * (torch.arange(MAP_NX, device=device) + 0.5)
-    ys = MAP_Y0 + MAP_CELL * (torch.arange(MAP_NY, device=device) + 0.5)
-    off = torch.tensor([-0.25, 0.25], device=device) * MAP_CELL
-    H = (W["hi"][2] - W["lo"][2]).item()
-    zoff = torch.tensor([-1 / 12, 1 / 12], device=device) * H
-    maps = torch.zeros((len(ids_all), 3, MAP_NX, MAP_NY), device=device)
-    for e0 in range(0, len(ids_all), batch):
-        ids = ids_all[e0:e0 + batch]
-        pts = []
-        for layer in range(3):
-            zc = W["lo"][2] + H * (layer + 0.5) / 3
-            for dx in off:
-                for dy in off:
-                    for dz in zoff:
-                        X, Y = torch.meshgrid(xs + dx, ys + dy, indexing="ij")
-                        Z = torch.full_like(X, float(zc + dz))
-                        pts.append(torch.stack([X, Y, Z], -1).reshape(-1, 3))
-        P = torch.stack(pts, 0).reshape(3, 8, MAP_NX * MAP_NY, 3)       # world z
-        P = P.reshape(-1, 3)[None].expand(len(ids), -1, -1).clone()
-        P[..., 2] = P[..., 2] - W["origin"][ids, None, 2]               # -> flight frame z
-        dr = drop[e0:e0 + batch] if drop is not None else None
-        occ = (sdf(P, ids, W, chunk=2048, drop=dr) < 0).float().reshape(len(ids), 3, 8, MAP_NX, MAP_NY).mean(2)
-        maps[e0:e0 + len(ids)] = occ
-        if progress and (e0 // batch) % 50 == 0:
-            log(f"  maps: {e0 + len(ids)}/{len(ids_all)}")
-    return maps
-
-
 class Sim:
     """N parallel flights. State per flight: x (6: px py pz V gamma chi, flight frame), controls
-    (T, n_v, n_h), time, environment id."""
+    (T, n_v, n_h), time, environment id, and the map it has built from its scans."""
 
     def __init__(self, W, maps, bench_tf, af, n, device, seed=0):
         import torch
-        self.W, self.maps, self.af, self.n, self.dev = W, maps, af, n, device
+        self.W, self.af, self.n, self.dev = W, af, n, device
         self.bench_tf = bench_tf
         self.gen = torch.Generator(device="cpu").manual_seed(seed)
         self.x = torch.zeros((n, 6), device=device)
@@ -603,12 +610,130 @@ class Sim:
         self.prev_d = torch.ones(n, device=device)
         self.prev_phi = torch.full((n,), -AIM_K, device=device)
         self.prev_act = torch.zeros((n, 3), device=device)
+        self.rows = torch.arange(n, device=device)
+        # the map each flight builds: 0 unknown, 1 seen free, 2 seen occupied
+        self.SX, self.SY, self.SZ = W["seen_shape"]
+        self.C = self.SX * self.SY * self.SZ
+        self.seen = torch.zeros((n, self.C), dtype=torch.uint8, device=device)
+        self.steps = torch.zeros(n, dtype=torch.long, device=device)            # steps since the flight started
+        self.far_every = max(1, int(round(FAR_EVERY_S / DT)))
+        self.crashes = torch.zeros(n, dtype=torch.long, device=device)           # (always 0: no rewinds)
+        self.ended = torch.zeros(n, dtype=torch.bool, device=device)            # set by step: flight finished
+        self.frozen = torch.zeros(n, dtype=torch.bool, device=device)           # fly(): finished flights stay put
+        self.last_status = torch.zeros(n, dtype=torch.long, device=device)
+        self.L = int(TIME_LIMIT_X * float(W["goal"].norm(dim=-1).max()) / af["V_CRUISE"] / DT) + 8
+        self.hist_x = torch.zeros((n, self.L, 6), device=device)
+        self.hist_u = torch.zeros((n, self.L, 3), device=device)
+        self.hist_t = torch.zeros((n, self.L), device=device)
+        self.hist_len = torch.ones(n, dtype=torch.long, device=device)
+        self.record = False                                   # fly(record=True): lidar along the path
+        self.hist_r = None
         self.pool = None
         self.keep_frac = 1.0                                  # share of obstacles each new flight keeps
         T = W["tok"].shape[1]
         self.drop = torch.zeros((n, T), dtype=torch.bool, device=device)
-        self.mapocc = torch.zeros((n, 3, MAP_NX, MAP_NY), device=device)
         self.rays = None
+        # far-scan directions (relative to the line to the goal): azimuth x elevation
+        az = torch.linspace(-math.radians(FAR_AZ[1]), math.radians(FAR_AZ[1]), FAR_AZ[0], device=device)
+        el = torch.linspace(-math.radians(FAR_EL[1]), math.radians(FAR_EL[1]), FAR_EL[0], device=device)
+        A_, E_ = torch.meshgrid(az, el, indexing="ij")
+        self.far_az, self.far_el = A_.reshape(-1), E_.reshape(-1)
+        self.far_hits = None                                  # fly(record=True): what each far scan hit
+        # local view sample offsets (forward, side, up) in the heading frame
+        f = LOCAL_AHEAD_M[0] + SEEN_CELL_M * (torch.arange(LOCAL_NF, device=device) + 0.5)
+        sd = -LOCAL_SIDE_M + SEEN_CELL_M * (torch.arange(LOCAL_NS, device=device) + 0.5)
+        dz = torch.tensor(LOCAL_DZ_M, device=device)
+        Z_, F_, S_ = torch.meshgrid(dz, f, sd, indexing="ij")                     # (3, NF, NS)
+        self.loc_f, self.loc_s, self.loc_z = F_.reshape(-1), S_.reshape(-1), Z_.reshape(-1)
+
+    # ---- the map it builds ----
+    def cell_index(self, p, env_ids):
+        """Flat map cell of flight-frame points p (..., 3) of flights with environments env_ids
+        (broadcast over the leading dim); -1 outside the map."""
+        import torch
+        sh = (-1,) + (1,) * (p.dim() - 2)
+        zw = p[..., 2] + self.W["origin"][env_ids, 2].view(sh) - self.W["lo"][2]
+        ix = torch.floor((p[..., 0] - SEEN_X_M[0]) / SEEN_CELL_M).long()
+        iy = torch.floor((p[..., 1] - SEEN_Y_M[0]) / SEEN_CELL_M).long()
+        iz = torch.floor(zw / SEEN_CELL_M).long()
+        ok = (ix >= 0) & (ix < self.SX) & (iy >= 0) & (iy < self.SY) & (iz >= 0) & (iz < self.SZ)
+        return torch.where(ok, (ix * self.SY + iy) * self.SZ + iz, torch.full_like(ix, -1))
+
+    def mark(self, rows, pos, dirs, dist, rng):
+        """Rays from pos (B, 3) along dirs (B, R, 3) that hit at dist (B, R) (= rng: nothing hit):
+        cells along each ray before the hit become free, the hit cell occupied."""
+        import torch
+        env = self.env[rows]
+        S = int(rng // SCAN_STEP_M)
+        sv = SCAN_STEP_M * (torch.arange(S, device=self.dev) + 0.5)
+        pts = pos[:, None, None] + dirs[:, :, None] * sv[None, None, :, None]            # (B, R, S, 3)
+        idx = self.cell_index(pts, env)
+        free = (sv[None, None] < dist[..., None] - 0.5 * SCAN_STEP_M) & (idx >= 0)
+        flat = (rows[:, None, None] * self.C + idx)[free]
+        sv_ = self.seen.view(-1)
+        sv_.scatter_reduce_(0, flat, torch.ones_like(flat, dtype=torch.uint8), reduce="amax")
+        hit = dist < rng * 0.999
+        hp = pos[:, None] + dirs * (dist + 1.0)[..., None]
+        hidx = self.cell_index(hp, env)
+        ok = hit & (hidx >= 0)
+        sv_[(rows[:, None] * self.C + hidx)[ok]] = 2
+
+    def far_scan(self, rows):
+        """The cone toward the goal for flights rows, added to their maps."""
+        import torch
+        if len(rows) == 0:
+            return
+        x = self.x[rows]
+        pos = x[:, :3]
+        rel = self.W["goal"][self.env[rows]] - pos
+        az0 = torch.atan2(rel[:, 1], rel[:, 0])
+        el0 = torch.atan2(rel[:, 2], rel[:, :2].norm(dim=-1)).clamp(-math.radians(FAR_EL_MAX_DEG), math.radians(FAR_EL_MAX_DEG))
+        ang = az0[:, None] + self.far_az[None]
+        el = el0[:, None] + self.far_el[None]
+        dirs = torch.stack([torch.cos(el) * torch.cos(ang), torch.cos(el) * torch.sin(ang), torch.sin(el)], -1)
+        env, drop = self.env[rows], self.drop[rows]
+        for r0 in range(0, dirs.shape[1], FAR_CHUNK):
+            d_ = dirs[:, r0:r0 + FAR_CHUNK]
+            dist = ray_hits(pos, d_, env, self.W, drop=drop, rng=FAR_RANGE_M)
+            self.mark(rows, pos, d_, dist, FAR_RANGE_M)
+            if self.record:
+                hit = dist < FAR_RANGE_M * 0.999
+                pts = pos[:, None] + d_ * dist[..., None]
+                for b in range(len(rows)):
+                    self.far_hits.append((int(rows[b]), pts[b][hit[b]].cpu().numpy()))
+
+    def map_views(self):
+        """(N, MAP_FLAT) half: the overview of its map and the local view ahead, flattened."""
+        import torch
+        import torch.nn.functional as F
+        n, x = self.n, self.x
+        M = self.seen.view(n, self.SX, self.SY, self.SZ)
+        nx_ = int(round(MAP_NX * MAP_CELL / SEEN_CELL_M))
+        x0 = int(round((MAP_X0 - SEEN_X_M[0]) / SEEN_CELL_M))
+        y0 = int(round((MAP_Y0 - SEEN_Y_M[0]) / SEEN_CELL_M))
+        ny_ = int(round(MAP_NY * MAP_CELL / SEEN_CELL_M))
+        Mc = M[:, x0:x0 + nx_, y0:y0 + ny_]
+        st = torch.stack([(Mc == 2), (Mc == 0)], 1).float()                    # (n, 2, X, Y, Z)
+        pooled = F.adaptive_avg_pool3d(st, (MAP_NX, MAP_NY, 3))                 # (n, 2, MX, MY, 3)
+        g = torch.zeros((n,) + GMAP_SHAPE, device=self.dev)
+        g[:, :6] = pooled.permute(0, 1, 4, 2, 3).reshape(n, 6, MAP_NX, MAP_NY)
+        ar = self.rows
+        for ch, p in ((6, x[:, :3]), (7, self.W["goal"][self.env])):
+            ix = ((p[:, 0] - MAP_X0) / MAP_CELL).long().clamp(0, MAP_NX - 1)
+            iy = ((p[:, 1] - MAP_Y0) / MAP_CELL).long().clamp(0, MAP_NY - 1)
+            g[ar, ch, ix, iy] = 1.0
+        # local view ahead (turns with the heading)
+        c, s_ = torch.cos(x[:, 5:6]), torch.sin(x[:, 5:6])
+        px = x[:, 0:1] + c * self.loc_f[None] - s_ * self.loc_s[None]
+        py = x[:, 1:2] + s_ * self.loc_f[None] + c * self.loc_s[None]
+        pz = x[:, 2:3] + self.loc_z[None].expand(n, -1)
+        idx = self.cell_index(torch.stack([px, py, pz], -1), self.env)          # (n, K)
+        val = torch.gather(self.seen.long(), 1, idx.clamp(min=0))
+        val = torch.where(idx < 0, torch.full_like(val, 2), val)                # off the map = blocked
+        nl = len(LOCAL_DZ_M)
+        loc = torch.cat([(val == 2).float().view(n, nl, LOCAL_NF, LOCAL_NS),
+                         (val == 0).float().view(n, nl, LOCAL_NF, LOCAL_NS)], 1)
+        return torch.cat([g.reshape(n, -1), loc.reshape(n, -1)], 1).half()
 
     # ---- aircraft model ----
     def T_avail(self, V):
@@ -678,13 +803,26 @@ class Sim:
         D = a["a1"] * a["V_CRUISE"] ** 2 + a["a2"] / a["V_CRUISE"] ** 2
         self.u[idx] = torch.tensor([D, 1.0, 0.0], device=self.dev)
         self.t[idx] = 0.0
+        self.crashes[idx] = 0
+        self.ended[idx] = False
+        self.frozen[idx] = False
+        self.hist_x[idx, 0] = x
+        self.hist_u[idx, 0] = self.u[idx]
+        self.hist_t[idx, 0] = 0.0
+        self.hist_len[idx] = 1
+        if self.record:
+            if self.hist_r is None:
+                self.hist_r = torch.zeros((self.n, self.L, N_RAYS), device=self.dev)
+                self.far_hits = []
+            self.hist_r[idx] = 0.0
         if self.keep_frac >= 1.0:
             self.drop[idx] = False
-            self.mapocc[idx] = self.maps[env_ids]
         else:
             r = torch.rand((len(idx), self.drop.shape[1]), generator=self.gen).to(self.dev)
             self.drop[idx] = r >= self.keep_frac
-            self.mapocc[idx] = build_maps(self.W, self.dev, batch=64, ids_all=env_ids, drop=self.drop[idx])
+        self.seen[idx] = 0                                       # empty map: everything unknown
+        self.steps[idx] = 0
+        self.far_scan(idx)                                       # first look down the course at the start
 
     def sample_envs(self, k):
         import torch
@@ -692,6 +830,8 @@ class Sim:
         return self.pool[j].to(self.dev)
 
     def obs(self):
+        """-> (vector inputs (N, OBS_DIM), maps (N, MAP_FLAT) half). Runs the short scan (every
+        step) and the far scan (flights that are due), and adds both to the map first."""
         import torch
         a = self.af
         x, u = self.x, self.u
@@ -702,7 +842,14 @@ class Sim:
         gmax = math.radians(a["GAMMA_MAX_DEG"])
         zw = x[:, 2] + self.W["origin"][self.env, 2]
         H = (self.W["hi"][2] - self.W["lo"][2])
-        self.rays = cast_rays(x[:, :3], x[:, 5], self.env, self.W, drop=self.drop)
+        dirs = ray_dirs(x[:, 5], self.dev)
+        dist = ray_hits(x[:, :3], dirs, self.env, self.W, drop=self.drop)        # short scan
+        self.rays = dist / RAY_RANGE_M
+        live = torch.nonzero(~self.frozen).squeeze(1)
+        if len(live):
+            self.mark(live, x[live, :3], dirs[live], dist[live], RAY_RANGE_M)
+        due = torch.nonzero((self.steps % self.far_every == 0) & (self.steps > 0) & ~self.frozen).squeeze(1)
+        self.far_scan(due)
         v = torch.stack([
             (x[:, 3] - a["V_CRUISE"]) / (a["V_MAX"] - a["V_MIN"]), x[:, 4] / gmax,
             torch.sin(bearing), torch.cos(bearing),
@@ -711,16 +858,15 @@ class Sim:
             u[:, 0] / self.T_avail(x[:, 3]), u[:, 1] - 1.0, u[:, 2] / math.tan(math.radians(a["BANK_MAX_DEG"])),
             torch.sin(x[:, 5]), self.t / self.tref], -1)
         lat, vert, _ = self.projected_miss(x, g)
-        obs = torch.cat([v, torch.stack([lat, vert], -1).clamp(-3, 3) / 1.0, self.rays], -1)
-        # map with own position and goal marked
-        m = torch.zeros((self.n, 5, MAP_NX, MAP_NY), device=self.dev)
-        m[:, :3] = self.mapocc
-        ar = torch.arange(self.n, device=self.dev)
-        for ch, p in ((3, x[:, :3]), (4, g)):
-            ix = ((p[:, 0] - MAP_X0) / MAP_CELL).long().clamp(0, MAP_NX - 1)
-            iy = ((p[:, 1] - MAP_Y0) / MAP_CELL).long().clamp(0, MAP_NY - 1)
-            m[ar, ch, ix, iy] = 1.0
-        return obs, m
+        obs = torch.cat([v, torch.stack([lat, vert], -1).clamp(-3, 3), self.rays], -1)
+        return obs, self.map_views()
+
+    def known_share(self):
+        """Share of the map's cells inside the flight corridor (|y| < 1.5 km) that are no longer unknown."""
+        M = self.seen.view(self.n, self.SX, self.SY, self.SZ)
+        y0 = int(round((-1500.0 - SEEN_Y_M[0]) / SEEN_CELL_M))
+        y1 = int(round((1500.0 - SEEN_Y_M[0]) / SEEN_CELL_M))
+        return (M[:, :, y0:y1] > 0).float().mean((1, 2, 3))
 
     def smooth_term(self, act):
         """attitude mode: squared change of the climb / bank targets since the last step;
@@ -764,6 +910,7 @@ class Sim:
         """-> reward (N,), done (N,) bool, status (N,) int, controls used (N, 3)."""
         import torch
         a = self.af
+        self.u_before = self.u
         u = self.apply_envelope(act)
         x = self.x
         k1 = self.f(x, u); k2 = self.f(x + 0.5 * DT * k1, u)
@@ -817,82 +964,116 @@ class Sim:
             - torch.where(status == 5, TIMEOUT_R, 0.0) \
             - torch.where(status == 6, MISS_R * torch.clamp(miss_at_plane / MISS_SCALE_M, max=1.0), 0.0)
         self.last_close = d_close
+        # ---- finished flights (fly) stay put ----
+        live = ~self.frozen
+        status = torch.where(live, status, torch.zeros_like(status))
+        r = torch.where(live, r, torch.zeros_like(r))
+        if bool(self.frozen.any()):
+            fz = self.frozen[:, None]
+            self.x = torch.where(fz, x, self.x)
+            self.u = torch.where(fz, self.u_before, self.u)
+            self.t = torch.where(self.frozen, self.t - DT, self.t)
+        self.ended = status > 0
+        self.last_status = status
+        self.steps = self.steps + live.long()
+        ia = torch.nonzero(live).squeeze(1)                                 # record the path
+        if len(ia):
+            L_ = self.hist_len[ia].clamp(max=self.L - 1)
+            self.hist_x[ia, L_] = self.x[ia]
+            self.hist_u[ia, L_] = self.u[ia]
+            self.hist_t[ia, L_] = self.t[ia]
+            if self.record and self.rays is not None:
+                self.hist_r[ia, L_ - 1] = self.rays[ia]
+            self.hist_len[ia] = L_ + 1
         return r, status > 0, status, u
 
 
 def make_agent(device):
     import torch
     import torch.nn as nn
+    n_g = math.prod(GMAP_SHAPE)
 
     class MapEnc(nn.Module):
-        def __init__(self):
+        def __init__(self, ch, nx, ny):
             super().__init__()
-            self.net = nn.Sequential(nn.Conv2d(5, 16, 3, padding=1), nn.ReLU(),
+            self.net = nn.Sequential(nn.Conv2d(ch, 16, 3, padding=1), nn.ReLU(),
                                      nn.Conv2d(16, 32, 3, stride=2, padding=1), nn.ReLU(), nn.Flatten())
-            n = 32 * ((MAP_NX + 1) // 2) * ((MAP_NY + 1) // 2)
-            self.fc = nn.Sequential(nn.Linear(n, 128), nn.ReLU())
+            self.fc = nn.Sequential(nn.Linear(32 * ((nx + 1) // 2) * ((ny + 1) // 2), 128), nn.ReLU())
 
         def forward(self, m):
             return self.fc(self.net(m))
 
     def trunk(out):
-        return nn.Sequential(nn.Linear(OBS_DIM + 128, HIDDEN), nn.Tanh(), nn.Linear(HIDDEN, HIDDEN), nn.Tanh(),
+        return nn.Sequential(nn.Linear(OBS_DIM + 256, HIDDEN), nn.Tanh(), nn.Linear(HIDDEN, HIDDEN), nn.Tanh(),
                              nn.Linear(HIDDEN, out))
 
     class Agent(nn.Module):
         def __init__(self):
             super().__init__()
-            self.map_a, self.map_c = MapEnc(), MapEnc()
+            self.map_a, self.map_c = MapEnc(*GMAP_SHAPE), MapEnc(*GMAP_SHAPE)      # overview of its map
+            self.loc_a, self.loc_c = MapEnc(*LMAP_SHAPE), MapEnc(*LMAP_SHAPE)      # local view ahead
             self.actor, self.critic = trunk(3), trunk(1)
             nn.init.zeros_(self.actor[-1].weight)
             with torch.no_grad():
                 self.actor[-1].bias.copy_(torch.tensor([0.4, 0.0, 0.0]))   # start near trim thrust, no turn
             self.log_std = nn.Parameter(torch.full((3,), LOG_STD_INIT))
 
+        @staticmethod
+        def split(m):
+            m = m.float()
+            return m[:, :n_g].view(-1, *GMAP_SHAPE), m[:, n_g:].view(-1, *LMAP_SHAPE)
+
         def mean(self, o, m):
-            return self.actor(torch.cat([o, self.map_a(m)], -1))
+            g, l_ = self.split(m)
+            return self.actor(torch.cat([o, self.map_a(g), self.loc_a(l_)], -1))
 
         def value(self, o, m):
-            return self.critic(torch.cat([o, self.map_c(m)], -1)).squeeze(-1)
+            g, l_ = self.split(m)
+            return self.critic(torch.cat([o, self.map_c(g), self.loc_c(l_)], -1)).squeeze(-1)
 
     return Agent().to(device)
 
 
-def fly(agent, sim_template, W, maps, bench_tf, af, env_rows, device, max_mult=TIME_LIMIT_X, keep_frac=1.0, seed=0):
-    """Fly the agent's mean action on the given environments; record every step (flight frame)."""
+def fly(agent, sim_template, W, maps, bench_tf, af, env_rows, device, max_mult=TIME_LIMIT_X, keep_frac=1.0, seed=0,
+        record=False):
+    """Fly the agent's mean action on the given environments; its path (flight frame). record=True
+    also returns the lidar along the path and the map it built."""
     import numpy as np
     import torch
     n = len(env_rows)
-    sim = Sim(W, maps, bench_tf, af, n, device, seed=seed)
+    sim = Sim(W, None, bench_tf, af, n, device, seed=seed)
     sim.keep_frac = keep_frac
+    sim.record = record
     ids = torch.as_tensor(np.asarray(env_rows), device=device)
     sim.reset(torch.arange(n, device=device), ids)
-    done = torch.zeros(n, dtype=torch.bool, device=device)
     status = torch.zeros(n, dtype=torch.long, device=device)
-    rec_x, rec_u, rec_t = [sim.x.clone()], [sim.u.clone()], [sim.t.clone()]
+    known = torch.zeros(n, device=device)
     steps = int(max_mult * sim.tref.max().item() / DT) + 2
     with torch.no_grad():
         for _ in range(steps):
             o, m = sim.obs()
             act = agent.mean(o, m).clamp(-1, 1)
-            x_prev, u_prev, t_prev = sim.x.clone(), sim.u.clone(), sim.t.clone()
-            _, d, s, _ = sim.step(act)
-            # finished flights stay frozen
-            sim.x = torch.where(done[:, None], x_prev, sim.x)
-            sim.u = torch.where(done[:, None], u_prev, sim.u)
-            sim.t = torch.where(done, t_prev, sim.t)
-            status = torch.where(~done & d, s, status)
-            done = done | d
-            rec_x.append(sim.x.clone()); rec_u.append(sim.u.clone()); rec_t.append(sim.t.clone())
-            if done.all():
+            sim.step(act)
+            status = torch.where(sim.ended, sim.last_status, status)
+            if bool(sim.ended.any()):
+                known = torch.where(sim.ended, sim.known_share(), known)
+            sim.frozen = sim.frozen | sim.ended
+            if sim.frozen.all():
                 break
-    X = torch.stack(rec_x, 1).cpu().numpy()
-    U = torch.stack(rec_u, 1).cpu().numpy()
-    Tm = torch.stack(rec_t, 1).cpu().numpy()
+    known = torch.where(sim.frozen, known, sim.known_share())
+    L = sim.hist_len.cpu().numpy()
+    X, U, Tm = sim.hist_x.cpu().numpy(), sim.hist_u.cpu().numpy(), sim.hist_t.cpu().numpy()
     out = []
     for i in range(n):
-        k = int(np.searchsorted(Tm[i], Tm[i, -1])) + 1                 # last distinct time
-        out.append({"status": STATUS[int(status[i])], "t": Tm[i, :k], "X": X[i, :k], "U": U[i, :k]})
+        k = int(L[i])
+        f = {"status": STATUS[int(status[i])], "t": Tm[i, :k], "X": X[i, :k], "U": U[i, :k],
+             "crashes": 0, "known": float(known[i])}
+        if record:
+            f["rays"] = sim.hist_r[i, :k].cpu().numpy() * RAY_RANGE_M
+            f["seen"] = sim.seen[i].view(sim.SX, sim.SY, sim.SZ).cpu()
+            f["far_hits"] = [h for j, h in sim.far_hits if j == i]
+            f["drop"] = sim.drop[i].cpu()
+        out.append(f)
     return out
 
 
@@ -965,18 +1146,9 @@ def run(cfg, submit_solves, commit):
     n_rm = [len(r) for r in W["removed"]]
     log(f"cleared start / goal areas ({CLEAR_RADIUS_M:.0f} m): removed {sum(n_rm)} pieces in "
         f"{sum(1 for k in n_rm if k)} of {W['E']} environments")
-    mpath = root / "maps.pt"
-    if mpath.exists():
-        maps = torch.load(mpath, map_location=device)
-    else:
-        t0 = time.time()
-        log(f"building coarse obstacle maps for {W['E']} environments (first run only, a few minutes) ...")
-        maps = build_maps(W, device, progress=True)
-        buf = io.BytesIO(); torch.save(maps.cpu(), buf); write_bytes_atomic(mpath, buf.getvalue())
-        log(f"coarse maps built in {time.time() - t0:.0f} s")
-        maps = maps.to(device)
     Ws = [W] + [{k: (v.to(d) if hasattr(v, "to") else v) for k, v in W.items()} for d in devices[1:]]
-    maps_g = [maps] + [maps.to(d) for d in devices[1:]]
+    maps = None
+    maps_g = [None] * len(devices)
 
     splits = cache["split"]
     train_rows = np.nonzero(splits == "train")[0]
@@ -1027,7 +1199,8 @@ def run(cfg, submit_solves, commit):
     for sm in sims:
         sm.reset(torch.arange(sm.n, device=sm.dev), sm.sample_envs(sm.n))
     ep_ret = [torch.zeros(sm.n, device=sm.dev) for sm in sims]
-    recent = []                                                    # finished episodes (status, return, tf ratio)
+    recent = []                                                    # finished flights (status, return, tf ratio, crashes)
+    recent_known = []                                             # share of the corridor its map knew at the end
 
     def save(best=False):
         buf = io.BytesIO()
@@ -1080,11 +1253,12 @@ def run(cfg, submit_solves, commit):
     def start_eval(update, rows, split, kinds, tag):
         flights = fly(agent, None, W, maps, bench_tf, af, rows, device)
         fstat = {k: 100 * sum(f["status"] == k for f in flights) / len(flights) for k in STATUS.values() if k != "flying"}
+        fstat["map_known"] = 100 * float(np.mean([f["known"] for f in flights]))
         items = items_from_flights(rows, flights, split, kinds)
         pending.append({"update": update, "split": split, "tag": tag, "fstat": fstat,
                         "snapshot": {k: v.detach().cpu().clone() for k, v in agent.state_dict().items()},
                         "get": submit_solves(items), "t0": time.time()})
-        log(f"{tag} update {update}: flew {len(rows)} {split} envs (goal {fstat['goal']:.0f}%, crash "
+        log(f"{tag} update {update}: flew {len(rows)} {split} envs (map known {fstat['map_known']:.0f}%; goal {fstat['goal']:.0f}%, crash "
             f"{fstat['crash']:.0f}%, stall {fstat['stall']:.0f}%, timeout {fstat['timeout']:.0f}%); "
             f"{len(items)} solves sent")
 
@@ -1113,7 +1287,9 @@ def run(cfg, submit_solves, commit):
                 if pr["score_mean"] > st["best_eval"] + 0.05:
                     st["best_eval"], st["best_eval_update"] = pr["score_mean"], p["update"]
                     buf = io.BytesIO()
-                    torch.save({"agent": p["snapshot"], "state": dict(st), "cfg": cfg}, buf)
+                    torch.save({"agent": p["snapshot"], "state": dict(st), "cfg": cfg,
+                                "settings": {k_: v_ for k_, v_ in globals().items() if k_.isupper()
+                                             and isinstance(v_, (int, float, str, bool, type(None)))}}, buf)
                     write_bytes_atomic(root / "best.pt", buf.getvalue())
                     log(f"  new best agent (update {p['update']})")
             else:
@@ -1149,12 +1325,15 @@ def run(cfg, submit_solves, commit):
                     outs.append((done, status))
                 for g, sm in enumerate(sims):                 # then the bookkeeping that waits for results
                     done, status = outs[g]
-                    idx = torch.nonzero(done).squeeze(1)
+                    idx = torch.nonzero(sm.ended).squeeze(1)      # flights that finished (crashes with budget
+                                                                  #   left were rewound and keep flying)
                     if len(idx):
                         stt, tt = status[idx].cpu().numpy(), sm.t[idx].cpu().numpy()
                         ee, rr = sm.env[idx].cpu().numpy(), ep_ret[g][idx].cpu().numpy()
-                        for s_, t_, e_, r_ in zip(stt, tt, ee, rr):
-                            recent.append((int(s_), float(r_), float(t_ / bench_tf[int(e_)]) if s_ == 1 else float("nan")))
+                        kn = sm.known_share()[idx].cpu().numpy()
+                        for s_, t_, e_, r_, k_ in zip(stt, tt, ee, rr, kn):
+                            recent.append((int(s_), float(r_), float(t_ / bench_tf[int(e_)]) if s_ == 1 else float("nan"), 0))
+                            recent_known.append(float(k_))
                         ep_ret[g][idx] = 0.0
                         sm.reset(idx, sm.sample_envs(len(idx)))
             data = []
@@ -1220,10 +1399,11 @@ def run(cfg, submit_solves, commit):
 
         # ---- stats, curriculum, stagnation ----
         recent = recent[-4000:]
+        recent_known = recent_known[-4000:]
         last = recent[-max(1, min(len(recent), 2 * n)):]
-        cnt = lambda c: 100 * sum(s_ == c for s_, _, _ in last) / max(len(last), 1)
+        cnt = lambda c: 100 * sum(e_[0] == c for e_ in last) / max(len(last), 1)
         succ = cnt(1)
-        ratios = [r_ for s_, _, r_ in last if s_ == 1]
+        ratios = [e_[2] for e_ in last if e_[0] == 1]
         st["update"] = k + 1
         action = ""
         det = ""
@@ -1234,6 +1414,7 @@ def run(cfg, submit_solves, commit):
             rows_c = np.random.default_rng(cfg["seed"] * 7919 + k).choice(pool, CHECK_FLIGHTS, replace=len(pool) < CHECK_FLIGHTS)
             fl = fly(agent, None, W, maps, bench_tf, af, rows_c, device, keep_frac=KEEP_STAGES[st["keep_idx"]], seed=k)
             det = 100 * sum(f["status"] == "goal" for f in fl) / len(fl)
+
             hist = st.setdefault("det_hist", [])
             hist.append(det)
             score2 = float(np.mean(hist[-2:]))
@@ -1249,6 +1430,7 @@ def run(cfg, submit_solves, commit):
                 st["best_success"], st["since_best"] = -1.0, 0
                 hist.clear()
                 recent.clear()
+                recent_known.clear()
             else:
                 if st["best_success"] < 0 or score2 > st["best_success"] + 1.0:
                     st["best_success"], st["since_best"] = score2, 0
@@ -1273,8 +1455,10 @@ def run(cfg, submit_solves, commit):
         sig = agent.log_std.clamp(min=LOG_STD_MIN).exp().tolist()
         row = {"update": k + 1, "obstacles_kept": KEEP_STAGES[st["keep_idx"]], "pool_frac": round(st["pool_frac"], 2),
                "episodes": len(last),
-               "goal_pct": round(succ, 2), "goal_noise_free_pct": round(det, 2) if det != "" else "", "crash_pct": round(cnt(2) + cnt(3), 2), "stall_pct": round(cnt(4), 2),
-               "timeout_pct": round(cnt(5), 2), "missed_pct": round(cnt(6), 2), "return_mean": round(float(np.mean([r_ for _, r_, _ in last])) if last else 0.0, 3),
+               "goal_pct": round(succ, 2), "goal_noise_free_pct": round(det, 2) if det != "" else "",
+               "crash_pct": round(cnt(2) + cnt(3), 2), "stall_pct": round(cnt(4), 2),
+               "timeout_pct": round(cnt(5), 2), "missed_pct": round(cnt(6), 2),
+               "map_known_pct": round(100 * float(np.mean(recent_known[-len(last):])), 2) if recent_known else "", "return_mean": round(float(np.mean([e_[1] for e_ in last])) if last else 0.0, 3),
                "tf_vs_benchmark": round(float(np.median(ratios)), 4) if ratios else "",
                "std_T": round(sig[0], 3), "std_nv": round(sig[1], 3), "std_nh": round(sig[2], 3),
                **{kk: round(vv, 4) for kk, vv in info.items()},
@@ -1282,8 +1466,9 @@ def run(cfg, submit_solves, commit):
                "elapsed_min": round((time.time() - t_start) / 60, 1)}
         append_csv(root / "updates.csv", [row])
         if (k + 1) % 5 == 0 or action:
-            log(f"update {k + 1:5d}: goal {succ:5.1f}%" + (f" (noise-free {det:5.1f}%)" if det != "" else "") + f"  crash {row['crash_pct']:5.1f}%  stall {row['stall_pct']:4.1f}%  "
-                f"timeout {row['timeout_pct']:4.1f}%  missed {row['missed_pct']:4.1f}%  tf/bench {row['tf_vs_benchmark'] or float('nan'):.3f}  "
+            log(f"update {k + 1:5d}: goal {succ:5.1f}%" + (f" (noise-free {det:5.1f}%)" if det != "" else "")
+                + f"  crash {row['crash_pct']:5.1f}%  stall {row['stall_pct']:4.1f}%  "
+                f"timeout {row['timeout_pct']:4.1f}%  missed {row['missed_pct']:4.1f}%  map known {row['map_known_pct'] or 0:4.1f}%  tf/bench {row['tf_vs_benchmark'] or float('nan'):.3f}  "
                 f"obst {KEEP_STAGES[st['keep_idx']]:.0%} pool {st['pool_frac']:.0%}  std {sig[1]:.2f}  [{row['steps_per_s']} steps/s] {action}")
         if (k + 1) % CHECKPOINT_EVERY == 0 or action:
             save()

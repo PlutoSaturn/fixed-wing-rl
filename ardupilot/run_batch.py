@@ -230,8 +230,10 @@ def set_params(link, overrides):
     return True, ""
 
 
-def fly(inst, link, items, overrides=None):
-    """Upload, arm, and follow the flight. Returns (status, detail)."""
+def fly(inst, link, items, overrides=None, in_plan=None):
+    """Upload, arm, and follow the flight. Returns (status, detail).
+    in_plan: parameters set in flight, once the aircraft heads for the plan's first waypoint
+    (e.g. a throttle lock that would starve the takeoff and climb if set before arming)."""
     link.m.target_system, link.m.target_component = 1, 1
     link.m.mav.request_data_stream_send(1, 1, mavutil.mavlink.MAV_DATA_STREAM_ALL, 10, 1)
     link.m.mav.param_request_list_send(1, 1)               # the log records every parameter
@@ -262,8 +264,18 @@ def fly(inst, link, items, overrides=None):
     sim_limit = TIMEOUT_FACTOR * inst["expected_sim_s"] + TIMEOUT_EXTRA_S
     wall_end = time.time() + sim_limit / MIN_SIM_RATE
     in_loiter_since, last_report = None, 0.0
+    first_plan_item = inst.get("first_plan_item")
+    in_plan_done = not in_plan
+    if in_plan and first_plan_item is None:
+        return "param_failed", "in-plan parameters need first_plan_item in the manifest (rebuild the batch)"
     while True:
         link.pump(1.0)
+        if not in_plan_done and link.seq is not None and link.seq >= first_plan_item:
+            log(f"  reached the plan (item {link.seq}); setting in-plan parameters")
+            ok, detail = set_params(link, in_plan)
+            if not ok:
+                return "param_failed", f"in flight: {detail}"
+            in_plan_done = True
         now_sim = (link.boot_s or arm_sim) - arm_sim
         if time.time() - link.last_msg > SILENCE_TIMEOUT_S:
             return "sitl_died", f"no messages for {SILENCE_TIMEOUT_S:.0f} s (at {now_sim:.0f} s simulated)"
@@ -309,6 +321,9 @@ def main():
     log(f"Batch '{manifest['name']}': {len(todo)} instances to fly at --speedup {speedup}")
     if manifest.get("param_overrides"):
         log("  parameters for this batch: " + ", ".join(f"{k}={v:g}" for k, v in manifest["param_overrides"].items()))
+    if manifest.get("param_overrides_in_plan"):
+        log("  set in flight at the plan's start: "
+            + ", ".join(f"{k}={v:g}" for k, v in manifest["param_overrides_in_plan"].items()))
     results = []
     for k, inst in enumerate(todo, 1):
         tlog = Path(inst["log_wsl"])
@@ -334,7 +349,8 @@ def main():
                     status, detail = "sitl_failed", "no heartbeat from SITL"
                 else:
                     status, detail = fly(inst, link, read_wpl(inst["mission_wsl"]),
-                                         manifest.get("param_overrides") or {})
+                                         manifest.get("param_overrides") or {},
+                                         manifest.get("param_overrides_in_plan") or {})
         except KeyboardInterrupt:
             status, detail = "interrupted", "stopped by the user"
         except Exception as e:                                   # keep going with the next instance
@@ -348,6 +364,7 @@ def main():
             stop_sitl(proc, fh)
         rec = {"id": inst["id"], "status": status, "detail": detail, "wall_s": round(time.time() - t0, 1),
                "speedup": speedup, "param_overrides": manifest.get("param_overrides") or {},
+               "param_overrides_in_plan": manifest.get("param_overrides_in_plan") or {},
                "finished": time.strftime("%Y-%m-%dT%H:%M:%S")}
         json.dump(rec, open(run_json, "w"), indent=2)
         results.append(rec)

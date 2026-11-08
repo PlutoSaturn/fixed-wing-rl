@@ -193,3 +193,13 @@ PyCharm, step 5: score the batch:
 python -m ardupilot.ardupilot_mission batch-analyze --name tier3_v4 --plot
 
 Each flown instance PASSES if it never touched an obstacle or left the workspace, came within 50 m of the goal, stayed within the planner's margin (30 m) of the plan, kept the rms distance to the plan at or under 10 m, and took within 10% of the plan's flight time (PASS_* settings in ardupilot_mission.py). Flown clearance under half the margin is flagged as a near miss. Outcomes: PASS, FAIL, REJECTED (not flyable as waypoints), NOT_FLOWN (e.g. never armed) and NOT_SOLVED.
+
+Tracking setup v5 (GUIDED follower): instead of uploading the plan as waypoints, stream it in GUIDED mode, as a companion computer would. Every solved plan stayed within 8.1 m of its plan and 1.8 m sideways (v4: 9.9 m), at the cost of a busier throttle. Needs ArduPlane 4.3 or newer (cd ~/ardupilot && git describe --tags). Build the batch with --follower guided (lookahead 150 m, altitude lead 30 m and TECS_CLMB_MAX 6.5 are the defaults: GUIDED_* in ardupilot_mission.py):
+
+python -m ardupilot.ardupilot_mission batch-make --name tier3_v5 --follower guided --note "tracking setup v5" --pair tier3_easy_envs.json tier3_easy_results.json --pair tier3_nominal_envs.json tier3_nominal_results.json --pair tier3_dense_envs.json tier3_dense_results.json
+
+Fly it at --speedup 3 (not 5), so guided_follower.py keeps up with its 20 Hz stream:
+
+python3 /mnt/c/Users/isaia/fixed-wing-rl/ardupilot/run_batch.py /mnt/c/Users/isaia/fixed-wing-rl/localstore/batches/tier3_v5/manifest.json --speedup 3
+
+Each flight logs the follower's states (wait, engaging, active, leaving, done) and writes logs/<id>.guided.csv with what it commanded. Score it as usual (batch-analyze --name tier3_v5). Other options: --lookahead, --guided-alt-lead, --guided-alt-comp on/off, --guided-alt-rate, --guided-alt-step, --guided-speed-ramp (tried, worse). In a Windows terminal, don't click inside the window while a batch runs: QuickEdit mode pauses the script until you press Esc.

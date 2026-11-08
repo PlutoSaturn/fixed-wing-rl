@@ -135,6 +135,18 @@ BATCH_SPEED_PROFILE  = "plan"            # tracking setup v4: the plan's airspee
                                          #   for height on steep climbs. Cost: the throttle moves 1.3-3x more
                                          #   (a TECS step at each speed command). Commanding the speeds 4 or 8 s
                                          #   early (speed_lead_test.py) was worse than no lead.
+GUIDED_LOOKAHEAD_M   = 150.0             # --follower guided: the L1 aim point this far along the curved plan
+GUIDED_ALT_LEAD_M    = 30.0              #   altitude commanded this far ahead along the plan (guided_test round 3:
+                                         #   dense_1 max altitude error 8.6 m with none, 5.8 m with 30 m, 7.7 m with 60 m)
+GUIDED_PARAM_OVERRIDES = {"TECS_CLMB_MAX": 6.5}  # GUIDED batches only (tracking setup v5): 5.0 m/s capped the
+                                         #   plan's 6 deg climbs at 47-57 m/s (5.1-5.9 m/s); with 6.5, dense_2's
+                                         #   end climb 13.1 -> 5.0 m (batch tier3_guided_clmb). Not in
+                                         #   c172_sitl.parm, so the waypoint setups (v1-v4) keep their results
+GUIDED_ALT_RATE_MS   = 100000.0          #   climb rate sent with each altitude (so ArduPlane never clips the target)
+GUIDED_ALT_STEP_M    = 0.5               #   send a new altitude when it changes by this much
+GUIDED_REF_STEP_M    = 5.0               #   reference trajectory sample spacing (guided_follower.py interpolates)
+GUIDED_EXTEND_BACK_M = 3000.0            #   straight extension before the start (the lead-in) ...
+GUIDED_EXTEND_FWD_M  = 1000.0            #   ... and after the goal, so the aim point always exists
 BATCH_SPEEDUP        = 5                 # SITL --speedup used by run_batch.py (JSBSim manages about 2x)
 # pass / fail for one flight (see evaluate_flight); every check must pass
 PASS_MAX_ERROR_FRAC  = 1.0               # max distance from the plan < this x the planner's margin
@@ -662,6 +674,59 @@ def leg_speeds(V, idx, v_lo, v_hi):
     return np.array([np.clip(np.mean(V[a:b + 1]), v_lo, v_hi) for a, b in zip(idx[:-1], idx[1:])])
 
 
+def guided_reference(P, V, chi, v_lo, v_hi, alt_comp=True, step=GUIDED_REF_STEP_M):
+    """The trajectory guided_follower.py flies (--follower guided): the dense plan resampled every
+    `step` m of horizontal distance, with the commanded altitude (the plan's, plus the climb lead of
+    the tracking correction when alt_comp), the plan's airspeed clipped to [v_lo, v_hi], and straight
+    extensions before the start and after the goal. s = 0 at the plan's start."""
+    seg = np.linalg.norm(np.diff(P[:, :2], axis=0), axis=1)
+    keep = np.r_[True, seg > 1e-6]                                   # drop repeated points
+    P, V, chi = P[keep], V[keep], np.unwrap(chi[keep])
+    s = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(P[:, :2], axis=0), axis=1))]
+    sg = np.r_[np.arange(0.0, s[-1], step), s[-1]]
+    x, y, z = (np.interp(sg, s, P[:, k]) for k in range(3))
+    v = np.clip(np.interp(sg, s, V), v_lo, v_hi)
+    z_cmd = z.copy()
+    if alt_comp:
+        n = max(1, int(round(ARC_SMOOTH_M / step)))
+        sm = (lambda a: np.convolve(np.pad(a, n, mode="edge"), np.ones(n) / n, mode="same")[n:-n]) if n > 1 else (lambda a: a)
+        slope = sm(np.gradient(z, sg))
+        curv = np.gradient(slope, sg)
+        z_cmd = z + np.clip(TRACK_COMP_SLOPE_M * slope + TRACK_COMP_CURV_M2 * curv + TRACK_COMP_BIAS_M,
+                            -TRACK_COMP_MAX_ALT_M, TRACK_COMP_MAX_ALT_M)
+        z_cmd[0], z_cmd[-1] = z[0], z[-1]
+    nb, nf = int(GUIDED_EXTEND_BACK_M / step), int(GUIDED_EXTEND_FWD_M / step)
+    kb, kf = np.arange(nb, 0, -1) * step, np.arange(1, nf + 1) * step
+    u0 = np.array([np.cos(chi[0]), np.sin(chi[0])])
+    u1 = np.array([np.cos(chi[-1]), np.sin(chi[-1])])
+    X = np.r_[x[0] - kb * u0[0], x, x[-1] + kf * u1[0]]
+    Y = np.r_[y[0] - kb * u0[1], y, y[-1] + kf * u1[1]]
+    cat = lambda a: np.r_[np.full(nb, a[0]), a, np.full(nf, a[-1])]
+    return {"x": X, "y": Y, "z_plan": cat(z), "z_cmd": cat(z_cmd), "v": cat(v),
+            "s": np.r_[-kb, sg, sg[-1] + kf], "i_start": nb, "i_end": nb + len(sg) - 1}
+
+
+def guided_mission(m, P, V, chi, alt_comp=True):
+    """Turn a build_mission() result into a GUIDED-follower mission: takeoff, climb loiter and lead-in
+    as before, then only the plan's start waypoint (the follower switches to GUIDED before it), the
+    exit and the final loiter (the follower switches back to AUTO at the exit). Returns the new
+    mission dict and the reference trajectory (lat, lon, altitudes above home, airspeed, s)."""
+    R_, params = turn_radius()
+    ref = guided_reference(P, V, chi, params["V_MIN"] + 2, params["V_MAX"] - SPEED_HEADROOM_MS, alt_comp)
+    lat, lon = enu_to_geo(ref["x"], ref["y"])
+    items = list(m["items"][:4]) + [(FRAME_REL_ALT, CMD_WAYPOINT, 0, 0, 0, 0, P[0, 0], P[0, 1],
+                                     float(P[0, 2] + FLOOR_AGL_M))] + list(m["items"][-2:])
+    start_item = 5                                           # home is item 0; takeoff..lead-in are 1-4
+    m2 = dict(m, items=items, first_plan_item=start_item, follower="guided", n_waypoints_flown=1,
+              guided_start_item=start_item, guided_exit_item=start_item + 1)
+    reference = {"lat": [float(a) for a in np.atleast_1d(lat)], "lon": [float(a) for a in np.atleast_1d(lon)],
+                 "alt_cmd": [float(z + FLOOR_AGL_M) for z in ref["z_cmd"]],
+                 "alt_plan": [float(z + FLOOR_AGL_M) for z in ref["z_plan"]],
+                 "v": [float(a) for a in ref["v"]], "s": [float(a) for a in ref["s"]],
+                 "i_start": int(ref["i_start"]), "i_end": int(ref["i_end"]), "alt_comp": bool(alt_comp)}
+    return m2, reference
+
+
 def build_mission(env, r, chord_tol=None, speed_profile=None, max_waypoints=None, alt_lead_s=0.0,
                   min_spacing=None, arcs=False, track_comp=None, wp_spacing=None, speed_lead_s=0.0):
     """Everything `make` writes for one SCP plan: the mission items, where SITL's home
@@ -853,7 +918,9 @@ def write_mission(mission, out, env_file, results_file, index, chord_tol, flight
     meta = {"envs": env_file, "results": results_file, "index": index,
             "floor_agl_m": FLOOR_AGL_M, "origin": [fly.ORIGIN_LAT_DEG, fly.ORIGIN_LON_DEG],
             "home_lat_lon": [hlat, hlon], "home_heading_deg": mission["home_heading_deg"],
-            "first_plan_item": mission["first_plan_item"], "n_plan_waypoints": len(mission["W"]),
+            "first_plan_item": mission["first_plan_item"],
+            "n_plan_waypoints": mission.get("n_waypoints_flown", len(mission["W"])),
+            "follower": mission.get("follower", "waypoints"),
             "chord_tol_m": chord_tol, "commanded_airspeed_ms": mission["commanded_mean_ms"],
             "max_waypoints": mission.get("max_waypoints"), "alt_lead_s": mission.get("alt_lead_s", 0.0),
             "min_spacing_m": mission.get("min_spacing_m"), "arcs": mission.get("arcs", False),
@@ -1726,9 +1793,25 @@ def batch_make(args):
     track_comp = None if track_comp == "none" else track_comp
     if getattr(args, "arcs", False) or getattr(args, "max_waypoints", None) or getattr(args, "alt_lead", 0.0):
         wp_spacing, track_comp = None, None
+    follower = getattr(args, "follower", None) or "waypoints"
+    guided = None
+    if follower == "guided":
+        # the plan itself is streamed in GUIDED (guided_follower.py); the 30 m waypoints are built only for
+        # the flyability check and the preview, without the tracking correction (nothing flies them)
+        wp_spacing, track_comp = wp_spacing or BATCH_WP_SPACING_M, None
+        guided = {"lookahead_m": getattr(args, "lookahead", None) or GUIDED_LOOKAHEAD_M,
+                  "alt_comp": getattr(args, "guided_alt_comp", "on") != "off",
+                  "speed_lead_m": 0.0,
+                  "alt_lead_m": float(GUIDED_ALT_LEAD_M if getattr(args, "guided_alt_lead", None) is None
+                                      else args.guided_alt_lead),
+                  "speed_ramp": getattr(args, "guided_speed_ramp", "off") == "on",
+                  "alt_rate_ms": float(getattr(args, "guided_alt_rate", GUIDED_ALT_RATE_MS)),
+                  "alt_step_m": float(getattr(args, "guided_alt_step", GUIDED_ALT_STEP_M))}
     # tracking setup v4: the plan's speed on every leg, but only with dense waypoints (with long legs it
     # tracked worse); --speed-profile overrides
     speed_profile = getattr(args, "speed_profile", None) or (BATCH_SPEED_PROFILE if wp_spacing else "constant")
+    if guided:
+        speed_profile = "constant"                           # the follower streams the plan's airspeed itself
     if (batch_path(args.name) / "manifest.json").exists() and not args.overwrite:
         raise SystemExit(f"Batch '{args.name}' already exists ({batch_path(args.name)}). Pick a new --name, "
                          f"or add --overwrite to rebuild its missions (flown logs are kept).")
@@ -1751,6 +1834,15 @@ def batch_make(args):
                               getattr(args, "min_spacing", None), getattr(args, "arcs", False),
                               track_comp, wp_spacing, getattr(args, "speed_lead", 0.0) or 0.0)
             out = batch_path(args.name, "missions", f"{iid}.waypoints")
+            reference = None
+            if guided:
+                _, xs_ = dense_plan(r)
+                m, reference = guided_mission(m, xs_[:, :3], xs_[:, 3], xs_[:, 5], guided["alt_comp"])
+                ref_out = batch_path(args.name, "missions", f"{iid}.guided.json")
+                with open(ref_out, "w") as fh:
+                    json.dump(reference, fh)
+                rec.update(reference=str(ref_out), reference_wsl=wsl_path(ref_out),
+                           guided_start_item=m["guided_start_item"], guided_exit_item=m["guided_exit_item"])
             write_mission(m, out, envs_file, results_file, i, chord_tol, r["flight_time"])
             try:
                 plot_mission_preview(env, m, str(out).replace(".waypoints", "_preview.png"),
@@ -1762,7 +1854,7 @@ def batch_make(args):
             if fly_all and m["rejects"]:
                 rec["rejects_ignored"] = m["rejects"]          # --fly-all: flown anyway, for experiments
             rec.update(status="flyable" if (not m["rejects"] or fly_all) else "not_flyable",
-                       n_plan_waypoints=len(m["W"]), first_plan_item=m["first_plan_item"],
+                       n_plan_waypoints=m.get("n_waypoints_flown", len(m["W"])), first_plan_item=m["first_plan_item"],
                        n_mission_items=len(m["items"]), n_speed_commands=m["n_speed_commands"],
                        rejects=m["rejects"], warnings=m["warnings"], checks=m["checks"],
                        mission=str(out), mission_wsl=wsl_path(out), home=sitl_home(m),
@@ -1784,7 +1876,9 @@ def batch_make(args):
                 "fly_all": getattr(args, "fly_all", False),
                 "speed_profile": speed_profile,
                 "speed_lead_s": getattr(args, "speed_lead", 0.0) or 0.0,
-                "param_overrides": parse_param_overrides(getattr(args, "param", None) or []),
+                "follower": follower, "guided": guided,
+                "param_overrides": ({**GUIDED_PARAM_OVERRIDES, **parse_param_overrides(getattr(args, "param", None) or [])}
+                                    if guided else parse_param_overrides(getattr(args, "param", None) or [])),
                 "param_overrides_in_plan": parse_param_overrides(getattr(args, "param_in_plan", None) or []),
                 "parm_wsl": wsl_path(project_root() / SITL_PARAM_FILE), "instances": instances}
     mf = batch_path(args.name) / "manifest.json"
@@ -2035,6 +2129,26 @@ def main():
                     help="fly missions that fail the flyability check too (for experiments; the reasons are "
                          "kept in the manifest as rejects_ignored)")
     bm.add_argument("--overwrite", action="store_true", help="rebuild the missions of an existing batch")
+    bm.add_argument("--follower", choices=["waypoints", "guided"], default="waypoints",
+                    help="waypoints: upload the plan as a mission (tracking setup v4); guided: stream it in GUIDED "
+                         "mode from guided_follower.py, the 'companion computer' (experimental)")
+    bm.add_argument("--lookahead", type=float, default=None,
+                    help=f"--follower guided: L1 aim point distance along the plan, m (default {GUIDED_LOOKAHEAD_M:g})")
+    bm.add_argument("--guided-alt-comp", choices=["on", "off"], default="on",
+                    help="--follower guided: lead the altitude on climbs with the tracking correction's vertical part")
+    bm.add_argument("--guided-alt-lead", type=float, default=None,
+                    help=f"--follower guided: command the altitude this many metres further along the plan "
+                         f"(default GUIDED_ALT_LEAD_M = {GUIDED_ALT_LEAD_M:g}). GUIDED batches also get "
+                         f"GUIDED_PARAM_OVERRIDES (TECS_CLMB_MAX 6.5); --param overrides them")
+    bm.add_argument("--guided-speed-ramp", choices=["on", "off"], default="off",
+                    help="--follower guided: ramp each airspeed change at about the plan's acceleration "
+                         "(tried in batches h0-h2: ArduPlane restarts the ramp at every command, so the "
+                         "speed stopped following the plan)")
+    bm.add_argument("--guided-alt-rate", type=float, default=GUIDED_ALT_RATE_MS,
+                    help="--follower guided: climb rate sent with each altitude command, m/s (large, so "
+                         "ArduPlane never clips the altitude target towards the current altitude)")
+    bm.add_argument("--guided-alt-step", type=float, default=GUIDED_ALT_STEP_M,
+                    help="--follower guided: send a new altitude when it changes by this much, m")
     ba = sub.add_parser("batch-analyze", help="Tier 3: score every flown instance of a batch and summarize")
     ba.add_argument("--name", required=True)
     ba.add_argument("--plot", action="store_true", help="show the summary plot (saved either way)")

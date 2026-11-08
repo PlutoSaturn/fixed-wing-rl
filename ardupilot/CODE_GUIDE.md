@@ -12,12 +12,13 @@ ardupilot_mission.py make / batch-make  -> mission file (.waypoints) + flyabilit
    |
    v
 run_batch.py (WSL)                       -> starts ArduPlane SITL + JSBSim C172, uploads, flies, records the .tlog
+   |  (GUIDED batches, --follower guided: guided_follower.py streams the plan during the flight)
    |
    v
 ardupilot_mission.py analyze / batch-analyze -> distance from the plan, clearance, oscillation, PASS/FAIL, plots, archive
 ```
 
-The autopilot's settings live in `c172_sitl.parm`, loaded every time SITL starts. `autotune_inputs.py` and `wobble_sweep.py` are tuning tools used during a live SITL session. `fix_sweep.py` and `speed_lead_test.py` compare candidate setups as batches. `test_ardupilot_mission.py` checks all of it without ArduPilot.
+The autopilot's settings live in `c172_sitl.parm`, loaded every time SITL starts. `autotune_inputs.py` and `wobble_sweep.py` are tuning tools used during a live SITL session. `fix_sweep.py`, `speed_lead_test.py` and `guided_test.py` compare candidate setups as batches. `test_ardupilot_mission.py` checks all of it without ArduPilot.
 
 | File | Runs in | In one line |
 | --- | --- | --- |
@@ -27,6 +28,8 @@ The autopilot's settings live in `c172_sitl.parm`, loaded every time SITL starts
 | `wobble_sweep.py` | WSL, during a SITL session | Flies straight and level and steps through autopilot settings to measure the wobble |
 | `fix_sweep.py` | PyCharm | Builds and scores several candidate setups on the same plans |
 | `speed_lead_test.py` | PyCharm | Builds and scores dense_1 with the plan's speeds commanded 0, 4 or 8 s early |
+| `guided_follower.py` | WSL, inside `run_batch.py` | Tracking setup v5: streams the plan to ArduPlane in GUIDED mode (the "companion computer") |
+| `guided_test.py` | PyCharm | Builds and scores GUIDED follower settings on chosen plans |
 | `test_ardupilot_mission.py` | PyCharm | Tests (`python -m ardupilot.test_ardupilot_mission`) |
 
 ## `ardupilot_mission.py`
@@ -53,6 +56,7 @@ All tunable numbers are named constants near the top, each with a comment saying
 - **Tracking correction:** `TRACK_COMP_K_M2` (sideways shift = K / radius), `TRACK_COMP_SLOPE_M`, `TRACK_COMP_CURV_M2`, `TRACK_COMP_BIAS_M` (altitude shift), and the caps. Fitted from flight data at ~52 m/s; refit if the autopilot settings change.
 - **Arcs (`--arcs`):** `ARC_MAX_RADIUS_M`, `ARC_MIN_TURN_DEG`, `ARC_GAP_M`, `ARC_ENTRY_ACCEPT_M`, and so on.
 - **Speed:** `SPEED_PROFILE` (`"constant"`; `"plan"` was tested and was worse).
+- **GUIDED follower (`--follower guided`, tracking setup v5):** `GUIDED_LOOKAHEAD_M` (150 m), `GUIDED_ALT_LEAD_M` (30 m), `GUIDED_ALT_RATE_MS` and `GUIDED_ALT_STEP_M` (how the altitude is sent), `GUIDED_PARAM_OVERRIDES` (`TECS_CLMB_MAX` 6.5, GUIDED batches only), `GUIDED_REF_STEP_M`, `GUIDED_EXTEND_BACK_M` / `GUIDED_EXTEND_FWD_M` (the reference trajectory).
 - **Flyability:** `FLY_MIN_CLEARANCE_FRAC` (the expected path must keep half the planner's margin), `AP_ROLL_LIMIT_DEG`.
 - **Pass/fail:** `PASS_MAX_ERROR_FRAC`, `PASS_RMS_M`, `PASS_GOAL_M`, `PASS_TIME_FRAC`, `NEAR_MISS_FRAC`.
 - **Measurement:** `OSC_WINDOW_S`, `OSC_SKIP_S` (how oscillation is measured).
@@ -71,6 +75,8 @@ All tunable numbers are named constants near the top, each with a comment saying
 - `plan_arcs`, `fit_circle`, `arc_sequence`, `arc_path`, `loiter_radius_command`: the `--arcs` option: finds the plan's curves, fits a circle to each, writes them as fractional loiter turns, and corrects the radius for ArduPilot's air-density scaling.
 - `leg_speeds`: per-leg airspeeds for `--speed-profile plan` (the batch default since v4).
 - `lead_speeds`: the plan's airspeed a given number of seconds ahead, for `--speed-lead` (tried, not used).
+- `guided_reference`: the trajectory the GUIDED follower flies: the plan every 5 m, with the commanded altitude (plus the climb lead), the airspeed, and straight extensions before the start and after the goal.
+- `guided_mission`: turns a waypoint mission into a GUIDED one (takeoff, climb, lead-in, the plan's start, exit, final loiter) and builds its reference.
 
 **Building and checking a mission:**
 - `build_mission`: everything for one plan: the waypoints (by any of the rules above), the lead-in, climb loiter, exit route and final loiter, the speed command, and the flyability checks (expected path clearance, corner bank).
@@ -110,7 +116,9 @@ For each instance:
 4. **`fly`** uploads the mission (`Link.upload`), arms in AUTO, follows the flight, sets any `--param-in-plan` parameters once the plan starts, and decides when it is done (30 s circling in the final loiter) or what went wrong.
 5. **`stop_sitl`** shuts SITL and JSBSim down and writes `logs/<id>.run.json`.
 
-Statuses: `completed`, `timeout`, `crashed`, `sitl_died`, `arm_failed`, `upload_failed`, `param_failed`, `sitl_failed`, `error`, `interrupted`. Options: `--only ID ...`, `--redo`, `--speedup N`, `--ardupilot DIR`. Running it again skips the instances already completed.
+For GUIDED batches (`--follower guided`), `fly` also starts a `GuidedFollower` (from `guided_follower.py`), asks for position at 20 Hz (simulated), and hands every position and command acknowledgement to it; fly these at `--speedup 3`.
+
+Statuses: `completed`, `timeout`, `crashed`, `sitl_died`, `arm_failed`, `upload_failed`, `param_failed`, `sitl_failed`, `guided_failed`, `error`, `interrupted`. Options: `--only ID ...`, `--redo`, `--speedup N`, `--ardupilot DIR`. Running it again skips the instances already completed.
 
 ## `autotune_inputs.py`
 
@@ -132,6 +140,17 @@ Compare several candidate setups on the same three plans (easy_0, nominal_2, den
 
 The v4 experiment: dense_1 on tracking setup v3 with the plan's airspeed on every leg, commanded 0, 4 or 8 s early (batches `spd0`, `spd4`, `spd8`). `python -m ardupilot.speed_lead_test make` builds them, `fly_speed_lead.sh` (WSL) flies them, `python -m ardupilot.speed_lead_test analyze` compares them with `tier3_v3b`. No lead was best (max error 9.5 m, against 15.5 m with 4 s and 14.4 m with 8 s), which became tracking setup v4.
 
+## `guided_follower.py`
+
+Tracking setup v5: the plan flown by streaming setpoints in GUIDED mode instead of uploading waypoints (the way a companion computer drives a flight controller). Pure Python, no numpy, so it runs in ArduPilot's environment. The `GuidedFollower` class:
+- **`on_position`** (called for every `GLOBAL_POSITION_INT`): switches to GUIDED near the plan's start; then each update finds the aircraft's place on the plan (`project`) and sends the roll (L1 law aimed `lookahead_m` along the curved plan; `send_roll`, `SET_ATTITUDE_TARGET` with only the roll used), the altitude (`send_alt`, `MAV_CMD_GUIDED_CHANGE_ALTITUDE`) and the airspeed (`send_speed`, `MAV_CMD_GUIDED_CHANGE_SPEED`); at the goal it hands back to AUTO at the exit waypoint.
+- **`on_ack`**: fails the flight if ArduPlane keeps rejecting the GUIDED commands (they need ArduPlane 4.3+).
+- Writes `logs/<id>.guided.csv`: per update, the distance along the plan, sideways error, aim angle and the roll, airspeed and altitude it commanded.
+
+## `guided_test.py` and `fly_guided_test.sh`
+
+The v5 experiments: GUIDED follower settings flown on chosen plans and compared with `tier3_v4`, including the throttle (travel in %/min and time at 0 or 100%). `python -m ardupilot.guided_test make`, `fly_guided_test.sh` (WSL), `python -m ardupilot.guided_test analyze`. Its docstring records the three rounds (lookahead; speed ramp; altitude rate and lead).
+
 ## `test_ardupilot_mission.py`
 
 Checks the module without ArduPilot, using synthetic flights and logs written by the test itself. Run `python -m ardupilot.test_ardupilot_mission`; it prints `ok` per test and ends with the count.
@@ -143,7 +162,7 @@ Checks the module without ArduPilot, using synthetic flights and logs written by
 
 | File | What it is |
 | --- | --- |
-| `c172_sitl.parm` | ArduPlane parameters for the JSBSim C172: ArduPilot's SITL defaults, the airframe's speeds and limits, and the tuned gains (tracking setup v3). Every tuned value has a comment with the test that justified it |
+| `c172_sitl.parm` | ArduPlane parameters for the JSBSim C172: ArduPilot's SITL defaults, the airframe's speeds and limits, and the tuned gains (tracking setup v3, used by v3-v5; v5 adds `TECS_CLMB_MAX` 6.5 per batch). Every tuned value has a comment with the test that justified it |
 | `setup_c172_sitl.sh` | One-time setup (WSL): copies JSBSim's c172x model into ArduPilot and checks it loads |
 | `figures/` | Images used in the README |
 | `README.md` | Results and how the tracking setup evolved |

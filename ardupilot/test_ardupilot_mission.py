@@ -32,6 +32,7 @@ Synthetic flights are written as .tlog files exactly as MAVProxy records them
 
 Run from the project root:  python -m ardupilot.test_ardupilot_mission
 """
+import csv
 import json
 import os
 import struct
@@ -763,6 +764,90 @@ def tier2_analyze_detects_collision():
         M.analyze(SimpleNamespace(mission=mission, log=log, plot=False))
         s = json.load(open(os.path.join(tmp, "bad_summary.json")))
     assert not s["collision_free"] and s["samples_in_collision"] > 0 and s["min_clearance_m"] < -1000
+
+
+
+class _FakeMav:
+    def __init__(self):
+        self.roll, self.speed, self.alt = None, None, None
+
+    def set_attitude_target_send(self, t, ts, tc, mask, q, *rest):
+        import math
+        self.roll = 2.0 * math.atan2(q[1], q[0])
+
+    def command_int_send(self, ts, tc, frame, cmd, cur, auto, p1, p2, p3, p4, x, y, z):
+        if cmd == 43000:
+            self.speed = p2
+        elif cmd == 43001:
+            self.alt = z
+
+    def mission_set_current_send(self, *a):
+        pass
+
+
+def _fly_follower(P, V, lookahead, steps, dt=0.05, tau=0.8, start_offset=(0.0, 0.0), climb=0.0):
+    """Kinematic aircraft (bank lag tau) flown by GuidedFollower along plan P; returns (xtrack, roll) per step."""
+    import math
+    import os
+    import tempfile
+    from types import SimpleNamespace
+    from ardupilot.guided_follower import GuidedFollower
+    chi = np.unwrap(np.arctan2(np.gradient(P[:, 1]), np.gradient(P[:, 0])))
+    m2, ref = M.guided_mission({"items": [None] * 6}, P, V, chi)
+    d = tempfile.mkdtemp()
+    json.dump(ref, open(os.path.join(d, "ref.json"), "w"))
+    f = GuidedFollower(os.path.join(d, "ref.json"), {"lookahead_m": lookahead}, 5, 6, os.path.join(d, "g.csv"))
+    link = SimpleNamespace(m=SimpleNamespace(mav=_FakeMav()), mode=15, seq=5, command=lambda *a: None)
+    f.state = "active"
+    x, y = P[0, 0] + start_offset[0], P[0, 1] + start_offset[1]
+    psi, phi, v = chi[0], 0.0, float(V[0])
+    out = []
+    for k in range(steps):
+        lat, lon = M.enu_to_geo(x, y)
+        msg = SimpleNamespace(lat=int(round(float(lat) * 1e7)), lon=int(round(float(lon) * 1e7)),
+                              vx=v * math.sin(psi) * 100, vy=v * math.cos(psi) * 100,
+                              relative_alt=100000, time_boot_ms=int(k * dt * 1000))
+        f.on_position(link, msg)
+        if f.state != "active":
+            break
+        out.append((f.k, link.m.mav.roll))
+        phi += (link.m.mav.roll - phi) * dt / tau
+        psi -= 9.80665 * math.tan(phi) / v * dt               # right bank (phi > 0) turns clockwise
+        x += v * math.cos(psi) * dt
+        y += v * math.sin(psi) * dt
+    f.close()
+    xs, ys = np.array(f.x), np.array(f.y)
+    return f, out, (x, y)
+
+
+def test_guided_follower_holds_a_curve():
+    """On a 800 m counter-clockwise circle the L1 aim point on the curved path asks for the turn's bank
+    (left, about atan(V^2/gR) = 19 deg), and a lagging aircraft stays within a few metres of the path."""
+    import math
+    R_, V_ = 800.0, 52.0
+    a = np.linspace(-np.pi / 2, np.pi / 2, 400)                 # half circle, counter-clockwise
+    P = np.c_[R_ * np.cos(a), R_ * np.sin(a), np.full_like(a, 200.0)]
+    V = np.full(len(a), V_)
+    f, out, _ = _fly_follower(P, V, 150.0, 1200, start_offset=(0.0, 0.0))
+    rolls = np.degrees([r for _, r in out[400:]])
+    expect = -math.degrees(math.atan(V_ ** 2 / (9.80665 * R_)))
+    assert np.all(rolls < 0), "a counter-clockwise curve needs a left (negative) bank"
+    assert abs(np.median(rolls) - expect) < 2.0, (np.median(rolls), expect)
+    # the follower's own cross-track log, after the start-up transient
+    rows = list(csv.DictReader(open(f.log_fh.name)))
+    xt = np.abs([float(r["xtrack_m"]) for r in rows[400:]])
+    assert xt.max() < 5.0, xt.max()
+
+
+def test_guided_follower_recovers_from_an_offset():
+    """Starting 40 m to the side of a straight plan, the follower steers back and settles on the line."""
+    P = np.c_[np.linspace(0, 8000, 800), np.zeros(800), np.full(800, 200.0)]
+    f, out, (x, y) = _fly_follower(P, np.full(800, 50.0), 150.0, 1600, start_offset=(0.0, 40.0))
+    rows = list(csv.DictReader(open(f.log_fh.name)))
+    xt = [float(r["xtrack_m"]) for r in rows]
+    assert xt[0] > 30.0                                          # started left of the path
+    assert max(abs(v) for v in xt[-200:]) < 1.0                  # settled on it
+    assert min(xt) > -15.0                                       # without a large overshoot
 
 
 if __name__ == "__main__":

@@ -490,6 +490,121 @@ def test_autopilot_path_cuts_corners():
     assert bank_short > 45.0, bank_short                                    # 150 m turn radius at 50 m/s
 
 
+def test_select_waypoints_keeps_the_shape():
+    """With a fixed count, the corners of the plan are chosen first (largest deviation),
+    start and goal are always kept, and asking for more points than the plan has returns all."""
+    s = np.linspace(0, 1, 101)[:, None]
+    leg1 = np.hstack([2000 * s, 0 * s, 300 + 0 * s])                     # east
+    leg2 = np.hstack([2000 + 0 * s, 1000 * s, 300 + 0 * s])              # then north
+    leg3 = np.hstack([2000 - 1500 * s, 1000 + 0 * s, 300 + 0 * s])       # then west
+    P = np.vstack([leg1, leg2[1:], leg3[1:]])
+    c1, c2 = 100, 200                                                    # the two corners
+    assert M.select_waypoints(P, 2) == [0, len(P) - 1]
+    assert M.select_waypoints(P, 4) == [0, c1, c2, len(P) - 1]
+    k = M.select_waypoints(P, 3)
+    assert k[0] == 0 and k[-1] == len(P) - 1 and k[1] in (c1, c2)
+    assert M.select_waypoints(P, 10 ** 6) == list(range(len(P)))
+    k = M.select_waypoints(P, 9)
+    assert len(k) == 9 and k == sorted(set(k))
+
+
+def test_lead_altitudes_and_min_spacing():
+    """lead_altitudes gives the plan's altitude lead_s ahead (held at the goal), keeps start
+    and goal; resample's min_spacing keeps waypoints at least that far apart along the path."""
+    t = np.linspace(0, 100, 1001)
+    z = np.where(t < 50, 300.0, 300.0 + 5.0 * (t - 50))            # level, then a 5 m/s climb at t = 50
+    idx = [0, 400, 450, 500, 600, 1000]                               # t = 0, 40, 45, 50, 60, 100
+    zk = M.lead_altitudes(t, z, idx, 8.0)
+    assert zk[0] == z[0] and zk[-1] == z[-1]
+    assert abs(zk[1] - 300.0) < 1e-9 and abs(zk[2] - 315.0) < 1e-6 and abs(zk[4] - 390.0) < 1e-6
+    assert np.allclose(M.lead_altitudes(t, z, idx, 0.0), z[idx])
+    s = np.linspace(0, 1, 2001)[:, None]
+    P = np.hstack([6000 * s, 300 * np.sin(6 * np.pi * s), 300 + 0 * s])
+    chi = np.unwrap(np.arctan2(np.gradient(P[:, 1]), np.gradient(P[:, 0])))
+    for sp in (200.0, 400.0):
+        k = M.resample(P, chi, 1.0, sp)
+        cum = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(P, axis=0), axis=1))]
+        gaps = np.diff(cum[k])                                        # along the path
+        assert gaps[:-1].min() >= sp - 1e-6, (sp, gaps.min())
+    assert len(M.resample(P, chi, 1.0, 400.0)) < len(M.resample(P, chi, 1.0, 200.0))
+
+
+def test_lead_speeds():
+    """lead_speeds gives the plan's airspeed lead_s ahead, held at the goal's speed past the end."""
+    t = np.linspace(0.0, 100.0, 1001)
+    V = 45.0 + 0.1 * t                                  # 45 -> 55 m/s
+    assert np.allclose(M.lead_speeds(t, V, 0.0), V)
+    v = M.lead_speeds(t, V, 8.0)
+    assert np.allclose(v[:900], V[:900] + 0.8)          # 8 s ahead = +0.8 m/s on this ramp
+    assert np.allclose(v[-1], V[-1]) and v.max() <= V.max() + 1e-12
+
+
+def test_plan_arcs_finds_the_curves():
+    """A plan made of straight - left arc (R 1200 m, 60 deg) - straight - right arc (R 900 m, 40 deg)
+    - straight: plan_arcs finds both arcs with about the right radius, side and sweep, and
+    arc_sequence gives start, a waypoint at each arc's start, the arcs, and ends at the goal."""
+    def arc(p0, h0, R, deg, n=200):
+        sgn = np.sign(deg); a = np.radians(abs(deg)) * np.linspace(0, 1, n)[1:]
+        c = p0 + sgn * R * np.array([-np.sin(h0), np.cos(h0)])
+        pts = c + sgn * R * np.c_[np.sin(h0 + sgn * a), -np.cos(h0 + sgn * a)]
+        return pts, h0 + sgn * a
+    def line(p0, h0, L, n=100):
+        d = np.linspace(0, L, n)[1:, None]
+        return p0 + d * np.array([np.cos(h0), np.sin(h0)]), np.full(n - 1, h0)
+    pts, hs = [np.zeros((1, 2))], [np.zeros(1)]
+    for kind, *a in (("l", 2000.0), ("a", 1200.0, 60.0), ("l", 1500.0), ("a", 900.0, -40.0), ("l", 1000.0)):
+        p0, h0 = pts[-1][-1], hs[-1][-1]
+        q, h = line(p0, h0, a[0]) if kind == "l" else arc(p0, h0, a[0], a[1])
+        pts.append(q); hs.append(h)
+    P2, chi = np.vstack(pts), np.concatenate(hs)
+    P = np.c_[P2, np.full(len(P2), 400.0)]
+    arcs = M.plan_arcs(P, chi)
+    assert len(arcs) == 2, [(a["radius"], a["turn_deg"]) for a in arcs]
+    assert abs(arcs[0]["radius"] - 1200) < 60 and arcs[0]["ccw"] and 45 < arcs[0]["turn_deg"] <= 61
+    assert abs(arcs[1]["radius"] - 900) < 45 and not arcs[1]["ccw"] and 28 < arcs[1]["turn_deg"] <= 41
+    seq, _ = M.arc_sequence(P, chi, 1.0)
+    kinds = [k for k, _ in seq]
+    assert kinds[0] == "wp" and seq[0][1] == 0 and kinds[-1] == "wp" and seq[-1][1] == len(P) - 1
+    for j, (k, e) in enumerate(seq):
+        if k == "arc":
+            assert seq[j - 1] == ("wp", e["i0"])               # each arc starts at a waypoint on the plan
+    est = M.arc_path(P, seq)
+    d, _ = M.point_to_polyline(P, est)
+    assert d.max() < 25.0, d.max()                             # the arcs follow the plan's curves
+
+
+def test_loiter_radius_command_matches_the_flight():
+    """The six arcs of the 2026-11-05 flight: commanded radius, altitude (= MSL), radius ArduPlane flew.
+    The model (density scaling, 10 m steps) predicts what it flew; the command for the plan's radius
+    then flies that radius."""
+    flown = [(2214.86, 684.8, 2370), (1295.88, 622.0, 1370), (1590.97, 575.0, 1680), (1158.67, 408.9, 1202),
+             (845.443, 377.2, 871), (700.72, 368.3, 725)]
+    for r_cmd, h, r_flown in flown:
+        sigma = (1.0 - 2.25577e-5 * h) ** 4.25588
+        assert abs((r_cmd // 10 * 10) / sigma - r_flown) < 10.0
+        rc = M.loiter_radius_command(r_cmd, h)
+        assert rc % 10 == 0 and abs(rc / sigma - r_cmd) < 6.0     # what ArduPlane will fly ~ the plan's radius
+
+
+def test_uniform_indices_and_track_compensate():
+    """Even spacing keeps start and goal and spaces the rest evenly; the compensation moves waypoints
+    towards a curve's centre by K / radius and leaves start and goal on the plan."""
+    R = 1000.0
+    a = np.linspace(0, np.pi / 2, 2001)
+    P = np.c_[R * np.sin(a), R * (1 - np.cos(a)), 400 + 0 * a]           # left turn, centre (0, R)
+    chi = a.copy()
+    idx = M.uniform_indices(P, 30.0)
+    s = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(P[:, :2], axis=0), axis=1))]
+    gaps = np.diff(s[idx])
+    assert idx[0] == 0 and idx[-1] == len(P) - 1 and abs(np.median(gaps) - 30.0) < 1.0 and gaps.max() < 32.0
+    W = P[idx]
+    Wc = M.track_compensate(P, chi, idx, W, vertical=False)
+    assert np.allclose(Wc[[0, -1]], W[[0, -1]])
+    mid = len(idx) // 2
+    r_before = np.hypot(W[mid, 0], W[mid, 1] - R); r_after = np.hypot(Wc[mid, 0], Wc[mid, 1] - R)
+    assert abs((r_before - r_after) - M.TRACK_COMP_K_M2 / R) < 1.0       # moved inwards by K / R
+
+
 def test_param_overrides_parsing():
     assert M.parse_param_overrides(["TECS_SINK_MAX=7", "navl1_period = 15"]) == \
         {"TECS_SINK_MAX": 7.0, "NAVL1_PERIOD": 15.0}
@@ -573,7 +688,8 @@ def tier2_batch_end_to_end():
             M.batch_make(SimpleNamespace(name="t", pair=[[envs_f, res_f]], chord_tol=1.0, speedup=5,
                                          note="test", overwrite=False, param=["tecs_sink_max=7"]))
             man = json.load(open(os.path.join(M.BATCH_DIR, "t", "manifest.json")))
-            assert man["param_overrides"] == {"TECS_SINK_MAX": 7.0} and man["speed_profile"] == "constant"
+            assert man["param_overrides"] == {"TECS_SINK_MAX": 7.0} and man["speed_profile"] == M.BATCH_SPEED_PROFILE
+            assert man["wp_spacing_m"] == M.BATCH_WP_SPACING_M and man["track_comp"] == M.BATCH_TRACK_COMP   # v3 defaults
             st = {i["id"]: i for i in man["instances"]}
             assert [st[k]["status"] for k in ("envs_0", "envs_1", "envs_2")] == ["flyable", "flyable", "not_solved"]
             env, r, F, t = synthetic_flight(lateral=5.0, vertical=0.0)

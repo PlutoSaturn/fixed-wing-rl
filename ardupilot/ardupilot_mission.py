@@ -78,12 +78,14 @@ SITL_PARAM_FILE      = "ardupilot/c172_sitl.parm"           # relative to the pr
 AIRFRAME_FILE        = "aircraftmodel/c172_params.json"     # the planner's C172 (speeds, bank limit)
 TRIM_THROTTLE_PCT    = 71.0             # as in c172_sitl.parm (summary compares the flight with it)
 AP_ROLL_LIMIT_DEG    = 45.0             # ROLL_LIMIT_DEG in c172_sitl.parm (most bank the autopilot may use)
-SPEED_PROFILE        = "constant"       # "constant": one airspeed for the whole mission, the plan's mean.
+SPEED_PROFILE        = "constant"       # `make` (one plan, chord-tolerance waypoints): one airspeed for the
+                                        #   whole mission, the plan's mean.
                                         # "plan": before each waypoint leg, command the plan's mean airspeed
-                                        #   over that leg (DO_CHANGE_SPEED). Tried in the Tier 3 pilot
-                                        #   (batch tier3_v2_speed): ArduPilot followed the speeds 5-10 s late,
-                                        #   the throttle swung 0-100%, and the hardest plan tracked worse,
-                                        #   so "constant" is the default (tracking setup v2)
+                                        #   over that leg (DO_CHANGE_SPEED). With legs a few hundred metres long
+                                        #   (tracking setup v2, batch tier3_v2_speed / v2_dense_speed) ArduPilot
+                                        #   reached each speed 5-10 s late and dense_1 tracked worse. With a
+                                        #   waypoint every 30 m the commands are nearly continuous and arrive on
+                                        #   time, so batches use "plan" (BATCH_SPEED_PROFILE, tracking setup v4)
 SPEED_CMD_STEP_MS    = 0.5              # "plan": only add a speed command when it changes by at least this
 SPEED_HEADROOM_MS    = 1.5              # "plan": stay this far below the C172's V_MAX (TECS needs some margin)
 SPEED_SPREAD_WARN_MS = 12.0             # "constant": warn when the plan's speed range is wider than this
@@ -123,7 +125,28 @@ RUNS_DIR             = "runs"
 
 # ---- Tier 3: batches of generated environments (batch-make, run_batch.py, batch-analyze) ----
 BATCH_DIR            = "batches"         # localstore/batches/<batch name>/
-BATCH_CHORD_TOL_M    = 1.0               # waypoint chord tolerance for batch missions (tracking setup v1)
+BATCH_CHORD_TOL_M    = 1.0               # waypoint chord tolerance for batch missions (tracking setup v1, v2)
+BATCH_WP_SPACING_M   = 30.0              # tracking setup v3: a waypoint every 30 m along the plan ...
+BATCH_TRACK_COMP     = "both"            #   ... shifted by the measured tracking correction (TRACK_COMP_*)
+BATCH_SPEED_PROFILE  = "plan"            # tracking setup v4: the plan's airspeed on every leg, no lead. Batch
+                                         #   tier3_v4 (2026-11-06) vs v3's one constant airspeed: 7/7 pass both;
+                                         #   worst max error 24.8 -> 9.9 m; dense_1's near miss gone (clearance
+                                         #   5.5 -> 20.5 m), because the plane now has the speed the plan trades
+                                         #   for height on steep climbs. Cost: the throttle moves 1.3-3x more
+                                         #   (a TECS step at each speed command). Commanding the speeds 4 or 8 s
+                                         #   early (speed_lead_test.py) was worse than no lead.
+GUIDED_LOOKAHEAD_M   = 150.0             # --follower guided: the L1 aim point this far along the curved plan
+GUIDED_ALT_LEAD_M    = 30.0              #   altitude commanded this far ahead along the plan (guided_test round 3:
+                                         #   dense_1 max altitude error 8.6 m with none, 5.8 m with 30 m, 7.7 m with 60 m)
+GUIDED_PARAM_OVERRIDES = {"TECS_CLMB_MAX": 6.5}  # GUIDED batches only (tracking setup v5): 5.0 m/s capped the
+                                         #   plan's 6 deg climbs at 47-57 m/s (5.1-5.9 m/s); with 6.5, dense_2's
+                                         #   end climb 13.1 -> 5.0 m (batch tier3_guided_clmb). Not in
+                                         #   c172_sitl.parm, so the waypoint setups (v1-v4) keep their results
+GUIDED_ALT_RATE_MS   = 100000.0          #   climb rate sent with each altitude (so ArduPlane never clips the target)
+GUIDED_ALT_STEP_M    = 0.5               #   send a new altitude when it changes by this much
+GUIDED_REF_STEP_M    = 5.0               #   reference trajectory sample spacing (guided_follower.py interpolates)
+GUIDED_EXTEND_BACK_M = 3000.0            #   straight extension before the start (the lead-in) ...
+GUIDED_EXTEND_FWD_M  = 1000.0            #   ... and after the goal, so the aim point always exists
 BATCH_SPEEDUP        = 5                 # SITL --speedup used by run_batch.py (JSBSim manages about 2x)
 # pass / fail for one flight (see evaluate_flight); every check must pass
 PASS_MAX_ERROR_FRAC  = 1.0               # max distance from the plan < this x the planner's margin
@@ -222,12 +245,13 @@ def chord_deviation(P, i, k):
     return float(np.linalg.norm(q - t[:, None] * ab, axis=1).max())
 
 
-def resample(P, chi, chord_tol=CHORD_TOL_M):
+def resample(P, chi, chord_tol=CHORD_TOL_M, min_spacing=None):
     """Indices of dense plan points to use as waypoints. A new waypoint is placed
     when the leg from the last one reaches MAX_WP_SPACING_M, when the heading has
     turned MAX_WP_TURN_DEG, or when the straight leg would stray more than
     chord_tol (default CHORD_TOL_M) from the plan; never closer than MIN_WP_SPACING_M (so the
-    autopilot cannot skip one)."""
+    autopilot cannot skip one). min_spacing overrides MIN_WP_SPACING_M."""
+    MIN_WP_SPACING_M = globals()["MIN_WP_SPACING_M"] if min_spacing is None else min_spacing
     keep, last, s = [0], 0, 0.0
     seg = np.linalg.norm(np.diff(P, axis=0), axis=1)
     cum = np.r_[0.0, np.cumsum(seg)]
@@ -247,6 +271,252 @@ def resample(P, chi, chord_tol=CHORD_TOL_M):
         keep.pop()                                   # do not crowd the goal, if the merged leg still fits
     keep.append(end)
     return keep
+
+
+def select_waypoints(P, n):
+    """Indices of the n plan points (start and goal included) that best keep the plan's
+    shape: start with the straight line start -> goal, then repeatedly add the plan point
+    farthest from the current waypoint path (Douglas-Peucker, stopped at a count instead of
+    a distance). Ignores the spacing and turn rules of resample(): used to test how the
+    autopilot flies with few, long legs."""
+    n = max(2, min(int(n), len(P)))
+    keep = [0, len(P) - 1]
+    while len(keep) < n:
+        best, best_d = None, -1.0
+        for a, b in zip(keep, keep[1:]):
+            if b - a < 2:
+                continue
+            ab = P[b] - P[a]
+            L2 = float(ab @ ab)
+            q = P[a + 1:b] - P[a]
+            t = np.clip(q @ ab / L2, 0.0, 1.0) if L2 > 1e-12 else np.zeros(len(q))
+            d = np.linalg.norm(q - t[:, None] * ab, axis=1)
+            j = int(np.argmax(d))
+            if d[j] > best_d:
+                best, best_d = a + 1 + j, float(d[j])
+        if best is None:
+            break
+        keep = sorted(keep + [best])
+    return keep
+
+
+def lead_altitudes(t, z, idx, lead_s):
+    """Waypoint altitudes taken lead_s seconds ahead along the plan: the plan's altitude
+    at (time of each waypoint + lead_s), held at the goal's altitude past the end. TECS
+    answers an altitude change about one time constant late; asking for the coming
+    altitude early makes it start the climb (or descent) when the plan does.
+
+    Tried 2026-11-05 (fix_sweep round 1, 5 s lead) and NOT used: the shifted waypoints sit
+    ~30 m off the plan, so the flyability check rejected the nominal/dense missions, and on
+    easy_0 the vertical error got worse (6 -> 9-11 m; a fixed lead suits only one climb rate)."""
+    tk = np.minimum(np.asarray(t)[idx] + lead_s, t[-1])
+    zk = np.interp(tk, t, z)
+    zk[0], zk[-1] = z[idx[0]], z[idx[-1]]               # start and goal stay where the plan has them
+    return zk
+
+
+# --------------------------------------------------------------------------
+# arcs: curved stretches of the plan flown as fractional NAV_LOITER_TURNS
+# --------------------------------------------------------------------------
+# ArduPlane flies straight legs between waypoints, passes (almost) over each waypoint and only then
+# turns, swinging ~1.3 m per degree of turn outside the next leg (measured, 2026-11-05). On a curved
+# plan that gives on-off roll (level, bank, level, ...). Plane's one curved mission command is
+# NAV_LOITER_TURNS: fractional turns (0-1) are supported, with a radius (negative = counter-clockwise,
+# capped at 2550 m) and, with param4 = 1, an exit along the tangent towards the next waypoint. A
+# fraction of a loiter is an arc flown at a steady bank. --arcs turns the plan's curves into those.
+ARC_MAX_RADIUS_M = 2500.0     # gentler curves stay straight legs (the loiter radius is capped at 2550 m)
+ARC_MIN_TURN_DEG = 4.0        # a curve must turn at least this much to become an arc
+ARC_MIN_LEN_M = 150.0         # ... and be at least this long
+ARC_GAP_M = 100.0             # straight gap kept between back-to-back arcs and before the goal, so the
+                              #   tangent exit has a waypoint ahead of it to aim at
+ARC_SMOOTH_M = 120.0          # turn rate is averaged over this distance before finding the curves
+ARC_ALT_WARN_M = 20.0         # warn when the plan's altitude changes more than this along one arc
+ARC_ENTRY_ACCEPT_M = 5.0      # acceptance radius of the waypoint at each arc's start (NAV_WAYPOINT param2).
+                              #   With WP_RADIUS (120 m) the arcs started ~110-125 m early (2026-11-05 flight).
+SITL_HOME_ALT_MSL_M = 0.0     # sitl_home() puts home at 0 m above sea level
+
+
+def loiter_radius_command(radius_m, alt_msl_m):
+    """Radius to put in NAV_LOITER_TURNS so ArduPlane actually flies radius_m. ArduPlane enlarges the
+    loiter radius by the air-density ratio (EAS2TAS^2, ISA) and stores radii over 255 m in 10 m steps
+    (rounded down). Measured on the 2026-11-05 arcs flight: the six arcs flew 3.0-7.0 % wide, and
+    this model predicts each actual radius within 0-9 m."""
+    sigma = (1.0 - 2.25577e-5 * alt_msl_m) ** 4.25588          # ISA density ratio rho / rho0
+    r = radius_m * sigma
+    return float(round(r / 10.0) * 10.0) if r > 255.0 else float(round(r))
+
+
+def fit_circle(Q):
+    """Least-squares circle through 2-D points Q: (centre, radius)."""
+    m = Q.mean(axis=0)
+    x, y = (Q - m).T
+    A = np.c_[2 * x, 2 * y, np.ones(len(x))]
+    (cx, cy, c0), *_ = np.linalg.lstsq(A, x**2 + y**2, rcond=None)
+    return m + np.array([cx, cy]), float(np.sqrt(max(c0 + cx**2 + cy**2, 0.0)))
+
+
+def plan_arcs(P, chi, max_radius=ARC_MAX_RADIUS_M, min_turn_deg=ARC_MIN_TURN_DEG, min_len=ARC_MIN_LEN_M,
+              gap=ARC_GAP_M, smooth_m=ARC_SMOOTH_M):
+    """The plan's curved stretches: runs where it keeps turning one way at a radius below max_radius.
+    Each: dict(i0, i1 (plan indices), centre, radius, ccw (left turn), turn_deg (heading change))."""
+    seg = np.linalg.norm(np.diff(P[:, :2], axis=0), axis=1)
+    s = np.r_[0.0, np.cumsum(seg)]
+    if len(P) < 5 or s[-1] < min_len:
+        return []
+    ch = np.unwrap(chi)
+    ds = np.maximum(np.gradient(s), 1e-6)
+    k = np.gradient(ch) / ds                                      # turn rate, rad per metre (+ = left)
+    n = max(1, int(round(smooth_m / max(float(np.median(seg)), 1e-6))))
+    if n > 1:
+        k = np.convolve(k, np.ones(n) / n, mode="same")
+    sgn = np.where(k > 1.0 / max_radius, 1, np.where(k < -1.0 / max_radius, -1, 0))
+    runs, i = [], 0
+    while i < len(sgn):
+        if sgn[i] == 0:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(sgn) and sgn[j + 1] == sgn[i]:
+            j += 1
+        runs.append((i, j, int(sgn[i])))
+        i = j + 1
+    arcs = []
+    for i0, i1, d in runs:
+        if arcs and s[i0] < s[arcs[-1]["i1"]] + gap:              # room for a straight gap after the last arc
+            i0 = int(np.searchsorted(s, s[arcs[-1]["i1"]] + gap))
+        if s[i1] > s[-1] - gap:                                    # ... and before the goal
+            i1 = int(np.searchsorted(s, s[-1] - gap)) - 1
+        if i1 <= i0 + 2 or s[i1] - s[i0] < min_len:
+            continue
+        c, R = fit_circle(P[i0:i1 + 1, :2])
+        if not np.isfinite(R) or R > max_radius:
+            continue
+        turn = float(np.degrees(ch[i1] - ch[i0]))                 # heading change (straight bits add none)
+        if abs(turn) < min_turn_deg or np.sign(turn) != d:
+            continue
+        arcs.append({"i0": i0, "i1": i1, "centre": c, "radius": R, "ccw": d > 0, "turn_deg": abs(turn)})
+    return arcs
+
+
+def arc_sequence(P, chi, chord_tol, min_spacing=None):
+    """The plan as mission entries: ("wp", plan index) and ("arc", arc dict). Straight stretches get
+    waypoints by resample() (so climbs keep their shape), ending at each arc's start point."""
+    arcs = plan_arcs(P, chi)
+    seq, prev = [], 0
+    for a in arcs + [None]:
+        end = (len(P) - 1) if a is None else a["i0"]
+        k = resample(P[prev:end + 1], chi[prev:end + 1], chord_tol, min_spacing) if end > prev else [0]
+        for kk in k:
+            if kk == 0 and seq:                       # the arc's end point: ArduPilot leaves the arc there
+                continue
+            seq.append(("wp", prev + kk))
+        if a is not None:
+            seq.append(("arc", a))
+            prev = a["i1"]
+    return seq, arcs
+
+
+# (Tried and removed, 2026-11-05: "--smooth", the whole plan as a chain of ~150 m loiter arcs with no
+#  corners. ArduPlane's loiter exit rule made two of 53 arcs loop a full circle and every short arc
+#  added an entry/exit jolt (roll 13.6 deg rms from the plan's bank, vs 2.6 with dense waypoints).)
+# --track-comp: with dense waypoints (e.g. --chord-tol 0.2 --min-spacing 30, ~40-60 m apart) ArduPlane's
+# roll follows the plan's bank closely (2.6 deg rms on dense_1, 2026-11-05), but it flies a steady offset:
+#   sideways: outside each curve by K / radius, ~150 m behind the curvature (fit: residual 1.3 m rms,
+#             raw 10.3 m);
+#   altitude: behind the plan's climb, -SLOPE * dz/ds - CURV * d2z/ds2 - BIAS, ~225 m behind (residual
+#             2.3 m rms, raw 9.1 m).
+# The plane follows a shifted waypoint path with the same delay, so shifting each waypoint by the
+# opposite of that offset, at its own position, cancels it. Measured at ~52 m/s with NAVL1_PERIOD 15,
+# TECS_TIME_CONST 8, TECS_SPDWEIGHT 0 and the v3 pitch gains; refit if those change.
+TRACK_COMP_K_M2 = 16950.0     # sideways shift towards the curve's centre = K * curvature (= K / radius)
+TRACK_COMP_SLOPE_M = 164.0    # altitude shift = SLOPE * dz/ds + CURV * d2z/ds2 + BIAS
+TRACK_COMP_CURV_M2 = 4536.0
+TRACK_COMP_BIAS_M = 0.0       # the dense_1 fit also had a constant +2.4 m; on the straight plans (easy_0,
+                              #   easy_2, tier3_v3) it only made the aircraft fly ~2.4 m high, so it is off
+TRACK_COMP_MAX_SIDE_M = 40.0  # caps on the shifts
+TRACK_COMP_MAX_ALT_M = 25.0
+
+
+def uniform_indices(P, spacing_m):
+    """Plan indices about every spacing_m along the plan (start and goal included): evenly spaced
+    waypoints, i.e. the plan resampled at equal time steps at constant speed. Even spacing makes
+    ArduPlane's waypoint switches small and regular, so they blur into a steady bank."""
+    s = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(P[:, :2], axis=0), axis=1))]
+    n = max(1, int(round(s[-1] / spacing_m)))
+    idx = np.searchsorted(s, np.linspace(0.0, s[-1], n + 1))
+    return sorted(set(int(i) for i in np.clip(idx, 0, len(P) - 1)) | {0, len(P) - 1})
+
+
+def track_compensate(P, chi, idx, W, smooth_m=ARC_SMOOTH_M, lateral=True, vertical=True):
+    """Waypoints W (at plan indices idx) shifted to cancel ArduPlane's measured tracking offsets
+    (see TRACK_COMP_K_M2): towards each curve's centre, and the altitude ahead of the climb."""
+    seg = np.linalg.norm(np.diff(P[:, :2], axis=0), axis=1)
+    s = np.r_[0.0, np.cumsum(seg)]
+    n = max(1, int(round(smooth_m / max(float(np.median(seg)), 1e-6))))
+    sm = (lambda v: np.convolve(v, np.ones(n) / n, mode="same")) if n > 1 else (lambda v: v)
+    ds = np.maximum(np.gradient(s), 1e-6)
+    ch = np.unwrap(chi)
+    kap = sm(np.gradient(ch) / ds)                                   # + = turning left
+    slope = sm(np.gradient(P[:, 2]) / ds)
+    curv = np.gradient(slope) / ds
+    W = W.copy()
+    for k, i in enumerate(idx):
+        if k == 0 or k == len(idx) - 1:
+            continue                                                  # start and goal stay on the plan
+        if lateral:
+            side = float(np.clip(TRACK_COMP_K_M2 * kap[i], -TRACK_COMP_MAX_SIDE_M, TRACK_COMP_MAX_SIDE_M))
+            W[k, :2] += side * np.array([-np.sin(ch[i]), np.cos(ch[i])])
+        if vertical:
+            W[k, 2] += float(np.clip(TRACK_COMP_SLOPE_M * slope[i] + TRACK_COMP_CURV_M2 * curv[i] + TRACK_COMP_BIAS_M,
+                                     -TRACK_COMP_MAX_ALT_M, TRACK_COMP_MAX_ALT_M))
+    return W
+
+
+def arc_path(P, seq, step_deg=1.0):
+    """Expected flown path of a sequence: straight between waypoints, round each arc's circle."""
+    pts = []
+    for kind, e in seq:
+        if kind == "wp":
+            pts.append(P[e])
+            continue
+        c, R, i0, i1 = e["centre"], e["radius"], e["i0"], e["i1"]
+        a0 = np.arctan2(P[i0, 1] - c[1], P[i0, 0] - c[0])
+        sweep = np.radians(e["turn_deg"]) * (1 if e["ccw"] else -1)
+        ang = a0 + np.linspace(0.0, sweep, max(3, int(e["turn_deg"] / step_deg) + 2))
+        z = np.linspace(P[i0, 2], P[i1, 2], len(ang))
+        pts.extend(np.c_[c[0] + R * np.cos(ang), c[1] + R * np.sin(ang), z])
+    return np.array(pts)
+
+
+def plot_mission_preview(env, m, path, title=""):
+    """Top view of a mission's plan part before flying it: the plan, the expected flown path, the
+    waypoints and (with --arcs) the arcs' centres, plus the obstacles."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    P, est = m["P"], m["est_path"]
+    fig, ax = plt.subplots(figsize=(14, 4.5))
+    lo, hi = P[:, :2].min(0) - 400, P[:, :2].max(0) + 400
+    gx, gy = np.meshgrid(np.arange(lo[0], hi[0], 40.0), np.arange(lo[1], hi[1], 40.0))
+    o = np.argsort(P[:, 0])                                        # obstacles at the plan's altitude there
+    gz = np.interp(gx.ravel(), P[o, 0], P[o, 2])
+    clr = body_clearance(env, np.c_[gx.ravel(), gy.ravel(), gz]).reshape(gx.shape)
+    ax.contourf(gx, gy, clr, levels=[-1e9, 0.0], colors=["0.75"])
+    ax.contour(gx, gy, clr, levels=[env.margin], colors=["0.6"], linewidths=0.7, linestyles="dotted")
+    ax.plot(P[:, 0], P[:, 1], "k--", lw=1.2, label="plan")
+    ax.plot(est[:, 0], est[:, 1], color="tab:purple", lw=1.4, label="expected flown path")
+    for it in m["items"]:
+        if it[1] == CMD_WAYPOINT and it[6] is not None:
+            ax.plot(it[6], it[7], "o", ms=3, color="tab:blue")
+        elif it[1] == CMD_LOITER_TURNS:
+            ax.plot(it[6], it[7], "x", ms=6, color="tab:red")
+    ax.plot([], [], "o", ms=3, color="tab:blue", label="waypoints")
+    if m.get("n_arcs"):
+        ax.plot([], [], "x", color="tab:red", label=f"arc centres ({m['n_arcs']} arcs)")
+    ax.set_xlim(lo[0], hi[0]); ax.set_ylim(lo[1], hi[1]); ax.set_aspect("equal")
+    ax.set_xlabel("east [m]"); ax.set_ylabel("north [m]"); ax.legend(fontsize=8, loc="upper left")
+    ax.set_title(title or "mission preview"); ax.grid(alpha=0.3)
+    fig.tight_layout(); fig.savefig(path, dpi=110); plt.close(fig)
 
 
 def point_to_polyline(P, Q):
@@ -331,6 +601,7 @@ def exit_route(env, g, chi_end, radius):
 # --------------------------------------------------------------------------
 CMD_WAYPOINT, CMD_LOITER_UNLIM, CMD_TAKEOFF, CMD_LOITER_TO_ALT, CMD_CHANGE_SPEED = 16, 17, 22, 31, 178
 CMD_RTL, CMD_DO_JUMP = 20, 177
+CMD_LOITER_TURNS = 18
 FRAME_GLOBAL, FRAME_REL_ALT = 0, 3
 
 
@@ -387,12 +658,77 @@ def densify(Q, spacing=10.0):
     return np.vstack(pts)
 
 
+def lead_speeds(t, V, lead_s):
+    """The plan's airspeed lead_s seconds ahead of each plan sample (held at the goal's speed past
+    the end). Written because ArduPilot reached each commanded airspeed 5-10 s late in batch
+    v2_dense_speed (legs a few hundred metres long).
+
+    Tried 2026-11-06 (speed_lead_test.py, dense_1 on tracking setup v3) and NOT used: with a waypoint
+    every 30 m the speeds already arrive on time; a 4 or 8 s lead made the plane slow down before the
+    top of the climb (max error 9.5 m with no lead, 15.5 m with 4 s, 14.4 m with 8 s)."""
+    return np.interp(np.minimum(np.asarray(t) + lead_s, t[-1]), t, V)
+
+
 def leg_speeds(V, idx, v_lo, v_hi):
     """The plan's mean airspeed over each waypoint leg idx[k] -> idx[k+1], clipped to [v_lo, v_hi]."""
     return np.array([np.clip(np.mean(V[a:b + 1]), v_lo, v_hi) for a, b in zip(idx[:-1], idx[1:])])
 
 
-def build_mission(env, r, chord_tol=None, speed_profile=None):
+def guided_reference(P, V, chi, v_lo, v_hi, alt_comp=True, step=GUIDED_REF_STEP_M):
+    """The trajectory guided_follower.py flies (--follower guided): the dense plan resampled every
+    `step` m of horizontal distance, with the commanded altitude (the plan's, plus the climb lead of
+    the tracking correction when alt_comp), the plan's airspeed clipped to [v_lo, v_hi], and straight
+    extensions before the start and after the goal. s = 0 at the plan's start."""
+    seg = np.linalg.norm(np.diff(P[:, :2], axis=0), axis=1)
+    keep = np.r_[True, seg > 1e-6]                                   # drop repeated points
+    P, V, chi = P[keep], V[keep], np.unwrap(chi[keep])
+    s = np.r_[0.0, np.cumsum(np.linalg.norm(np.diff(P[:, :2], axis=0), axis=1))]
+    sg = np.r_[np.arange(0.0, s[-1], step), s[-1]]
+    x, y, z = (np.interp(sg, s, P[:, k]) for k in range(3))
+    v = np.clip(np.interp(sg, s, V), v_lo, v_hi)
+    z_cmd = z.copy()
+    if alt_comp:
+        n = max(1, int(round(ARC_SMOOTH_M / step)))
+        sm = (lambda a: np.convolve(np.pad(a, n, mode="edge"), np.ones(n) / n, mode="same")[n:-n]) if n > 1 else (lambda a: a)
+        slope = sm(np.gradient(z, sg))
+        curv = np.gradient(slope, sg)
+        z_cmd = z + np.clip(TRACK_COMP_SLOPE_M * slope + TRACK_COMP_CURV_M2 * curv + TRACK_COMP_BIAS_M,
+                            -TRACK_COMP_MAX_ALT_M, TRACK_COMP_MAX_ALT_M)
+        z_cmd[0], z_cmd[-1] = z[0], z[-1]
+    nb, nf = int(GUIDED_EXTEND_BACK_M / step), int(GUIDED_EXTEND_FWD_M / step)
+    kb, kf = np.arange(nb, 0, -1) * step, np.arange(1, nf + 1) * step
+    u0 = np.array([np.cos(chi[0]), np.sin(chi[0])])
+    u1 = np.array([np.cos(chi[-1]), np.sin(chi[-1])])
+    X = np.r_[x[0] - kb * u0[0], x, x[-1] + kf * u1[0]]
+    Y = np.r_[y[0] - kb * u0[1], y, y[-1] + kf * u1[1]]
+    cat = lambda a: np.r_[np.full(nb, a[0]), a, np.full(nf, a[-1])]
+    return {"x": X, "y": Y, "z_plan": cat(z), "z_cmd": cat(z_cmd), "v": cat(v),
+            "s": np.r_[-kb, sg, sg[-1] + kf], "i_start": nb, "i_end": nb + len(sg) - 1}
+
+
+def guided_mission(m, P, V, chi, alt_comp=True):
+    """Turn a build_mission() result into a GUIDED-follower mission: takeoff, climb loiter and lead-in
+    as before, then only the plan's start waypoint (the follower switches to GUIDED before it), the
+    exit and the final loiter (the follower switches back to AUTO at the exit). Returns the new
+    mission dict and the reference trajectory (lat, lon, altitudes above home, airspeed, s)."""
+    R_, params = turn_radius()
+    ref = guided_reference(P, V, chi, params["V_MIN"] + 2, params["V_MAX"] - SPEED_HEADROOM_MS, alt_comp)
+    lat, lon = enu_to_geo(ref["x"], ref["y"])
+    items = list(m["items"][:4]) + [(FRAME_REL_ALT, CMD_WAYPOINT, 0, 0, 0, 0, P[0, 0], P[0, 1],
+                                     float(P[0, 2] + FLOOR_AGL_M))] + list(m["items"][-2:])
+    start_item = 5                                           # home is item 0; takeoff..lead-in are 1-4
+    m2 = dict(m, items=items, first_plan_item=start_item, follower="guided", n_waypoints_flown=1,
+              guided_start_item=start_item, guided_exit_item=start_item + 1)
+    reference = {"lat": [float(a) for a in np.atleast_1d(lat)], "lon": [float(a) for a in np.atleast_1d(lon)],
+                 "alt_cmd": [float(z + FLOOR_AGL_M) for z in ref["z_cmd"]],
+                 "alt_plan": [float(z + FLOOR_AGL_M) for z in ref["z_plan"]],
+                 "v": [float(a) for a in ref["v"]], "s": [float(a) for a in ref["s"]],
+                 "i_start": int(ref["i_start"]), "i_end": int(ref["i_end"]), "alt_comp": bool(alt_comp)}
+    return m2, reference
+
+
+def build_mission(env, r, chord_tol=None, speed_profile=None, max_waypoints=None, alt_lead_s=0.0,
+                  min_spacing=None, arcs=False, track_comp=None, wp_spacing=None, speed_lead_s=0.0):
     """Everything `make` writes for one SCP plan: the mission items, where SITL's home
     goes, and the checks that say whether the plan can be flown as waypoints.
 
@@ -404,11 +740,28 @@ def build_mission(env, r, chord_tol=None, speed_profile=None):
         c172_sitl.parm, AP_ROLL_LIMIT_DEG here) because the legs around it are short.
     Warnings (flown anyway): lead-in / exit near an obstacle (outside the scored
     segment; obstacles are not physical in SITL), climb or sink beyond TECS limits,
-    and a wide speed range (ArduPilot flies one airspeed, so timing drifts)."""
+    and a wide speed range (ArduPilot flies one airspeed, so timing drifts).
+
+    max_waypoints: if given, use exactly this many plan waypoints (start and goal included),
+    chosen by select_waypoints(), instead of the chord-tolerance rule.
+    alt_lead_s: waypoint altitudes are the plan's altitude this many seconds ahead
+    (lead_altitudes()), so TECS starts climbs and descents on time.
+    min_spacing: closest two waypoints may be, m (default MIN_WP_SPACING_M).
+    arcs: fly the plan's curves as arcs (fractional NAV_LOITER_TURNS, steady bank) instead of
+    straight legs; straight stretches keep waypoints (see plan_arcs()).
+    track_comp: None, "lateral" or "both": shift the waypoints to cancel ArduPlane's measured tracking
+    offsets (see TRACK_COMP_K_M2; meant for dense waypoints). The flyability check still uses the
+    unshifted waypoints, i.e. the path the shifts are meant to produce.
+    wp_spacing: a waypoint every wp_spacing m along the plan (uniform_indices()) instead of the
+    chord-tolerance rule.
+    speed_lead_s: with speed_profile "plan", each leg's speed command is the plan's speed this many
+    seconds ahead (lead_speeds()), so ArduPilot reaches it when the plan does."""
     chord_tol = CHORD_TOL_M if chord_tol is None else chord_tol
     speed_profile = SPEED_PROFILE if speed_profile is None else speed_profile
     if speed_profile not in ("plan", "constant"):
         raise ValueError(f"speed_profile must be 'plan' or 'constant', not {speed_profile!r}")
+    if speed_lead_s and speed_profile != "plan":
+        raise ValueError("speed_lead_s needs speed_profile 'plan'")
     R, params = turn_radius()
     t, xs = dense_plan(r)
     P, V, gam, chi = xs[:, :3], xs[:, 3], xs[:, 4], xs[:, 5]
@@ -416,9 +769,31 @@ def build_mission(env, r, chord_tol=None, speed_profile=None):
     warnings_, rejects = [], []
 
     # ---- plan waypoints
-    idx = resample(P, chi, chord_tol)
-    W = P[idx]
-    chord, _ = point_to_polyline(P, W)
+    if wp_spacing:
+        idx = uniform_indices(P, wp_spacing)
+    else:
+        idx = resample(P, chi, chord_tol, min_spacing) if max_waypoints is None else select_waypoints(P, max_waypoints)
+    W = P[idx].copy()
+    if alt_lead_s:
+        W[:, 2] = lead_altitudes(t, P[:, 2], idx, alt_lead_s)
+    seq, arc_list = None, []
+    if arcs:
+        if speed_profile == "plan" or max_waypoints is not None or alt_lead_s:
+            raise ValueError("arcs needs the constant speed profile, and no max_waypoints or alt_lead")
+        seq, arc_list = arc_sequence(P, chi, chord_tol, min_spacing)
+        idx = [e if k == "wp" else e["i1"] for k, e in seq]
+        W = P[idx].copy()                                   # where each plan item ends (count, timing)
+        for a in arc_list:
+            dz = float(np.ptp(P[a["i0"]:a["i1"] + 1, 2]))
+            if dz > ARC_ALT_WARN_M:
+                warnings_.append(f"an arc ({a['turn_deg']:.0f} deg, radius {a['radius']:.0f} m) spans {dz:.0f} m of "
+                                 f"altitude change; ArduPilot targets one altitude per arc")
+    W_cmd = W
+    if track_comp:
+        if seq is not None or max_waypoints is not None or alt_lead_s:
+            raise ValueError("track_comp is for plain (dense) waypoints only")
+        W_cmd = track_compensate(P, chi, idx, W, vertical=(track_comp == "both"))
+    chord, _ = point_to_polyline(P, W if seq is None else arc_path(P, seq))
 
     # ---- lead-in, climb loiter and home, upstream of the start
     s0, u0 = P[0], np.array([np.cos(chi[0]), np.sin(chi[0]), 0.0])
@@ -460,7 +835,12 @@ def build_mission(env, r, chord_tol=None, speed_profile=None):
                          f"({speed:.1f} m/s): expect the flight time to differ from the plan's")
 
     # ---- can the plan be flown as waypoints? (the scored part: start to goal)
-    flown_est, worst_bank = autopilot_path(W, ap_radius, AP_ROLL_LIMIT_DEG, speed)
+    if seq is None:
+        flown_est, worst_bank = autopilot_path(W, ap_radius, AP_ROLL_LIMIT_DEG, speed)
+    else:
+        flown_est = arc_path(P, seq)
+        worst_bank = max([float(np.degrees(np.arctan(speed**2 / (GRAVITY * a["radius"])))) for a in arc_list]
+                         + [0.0])
     est = densify(flown_est)
     inside = np.all((est >= lo) & (est <= hi), axis=1)
     est_clear = float(body_clearance(env, est[inside]).min()) if inside.any() else float("inf")
@@ -485,8 +865,9 @@ def build_mission(env, r, chord_tol=None, speed_profile=None):
     alt = lambda z: float(z + FLOOR_AGL_M)
     v_lo, v_hi = params["V_MIN"] + 2, params["V_MAX"] - SPEED_HEADROOM_MS
     if speed_profile == "plan":
-        v_leg = leg_speeds(V, idx, v_lo, v_hi)
-        v_start = float(np.clip(V[0], v_lo, v_hi))
+        V_cmd = lead_speeds(t, V, speed_lead_s) if speed_lead_s else V
+        v_leg = leg_speeds(V_cmd, idx, v_lo, v_hi)
+        v_start = float(np.clip(V_cmd[0], v_lo, v_hi))
     else:
         v_leg, v_start = np.full(len(W) - 1, speed), speed
     items = [(FRAME_REL_ALT, CMD_TAKEOFF, TAKEOFF_PITCH_DEG, 0, 0, 0, home_xy[0], home_xy[1], TAKEOFF_ALT_M),
@@ -495,9 +876,18 @@ def build_mission(env, r, chord_tol=None, speed_profile=None):
              (FRAME_REL_ALT, CMD_WAYPOINT, 0, 0, 0, 0, lead[0], lead[1], alt(lead[2]))]
     first_plan_item = len(items) + 1                         # +1: item 0 is home
     plan_items, last_v, n_speed_cmds = [], v_start, 0
-    for k, w in enumerate(W):
+    for k, w in enumerate(W_cmd):
         plan_items.append(len(items) + 1)
-        items.append((FRAME_REL_ALT, CMD_WAYPOINT, 0, 0, 0, 0, w[0], w[1], alt(w[2])))
+        if seq is not None and seq[k][0] == "arc":
+            a = seq[k][1]                                   # turns (fraction), radius (- = counter-clockwise),
+            rc = loiter_radius_command(a["radius"], alt(w[2]) + SITL_HOME_ALT_MSL_M)
+            items.append((FRAME_REL_ALT, CMD_LOITER_TURNS,  # tangent exit towards the next waypoint
+                          round(a["turn_deg"] / 360.0, 4), 0, -rc if a["ccw"] else rc, 1,
+                          a["centre"][0], a["centre"][1], alt(w[2])))
+            continue
+        arc_next = seq is not None and k + 1 < len(seq) and seq[k + 1][0] == "arc"
+        items.append((FRAME_REL_ALT, CMD_WAYPOINT, 0, ARC_ENTRY_ACCEPT_M if arc_next else 0, 0, 0,
+                      w[0], w[1], alt(w[2])))
         if k >= 1 and abs(v_leg[k - 1] - last_v) >= SPEED_CMD_STEP_MS:
             items.append((FRAME_REL_ALT, CMD_CHANGE_SPEED, 0, float(v_leg[k - 1]), -1, 0, None, None, 0))
             last_v, n_speed_cmds = float(v_leg[k - 1]), n_speed_cmds + 1
@@ -514,7 +904,11 @@ def build_mission(env, r, chord_tol=None, speed_profile=None):
             "home_lat_lon": (float(hlat), float(hlon)), "home_heading_deg": home_heading,
             "first_plan_item": first_plan_item, "start_alt_rel_m": alt(s0[2]),
             "exit_turn_deg": exit_turn, "exit_clearance_m": exit_clear,
-            "warnings": warnings_, "rejects": rejects, "checks": checks, "expected_sim_s": expected_s}
+            "warnings": warnings_, "rejects": rejects, "checks": checks, "expected_sim_s": expected_s,
+            "max_waypoints": max_waypoints, "alt_lead_s": alt_lead_s, "min_spacing_m": min_spacing,
+            "speed_lead_s": speed_lead_s, "arcs": bool(arcs), "track_comp": track_comp, "n_arcs": len(arc_list),
+            "est_path": flown_est,
+            "arc_list": [{"turn_deg": a["turn_deg"], "radius_m": a["radius"], "ccw": a["ccw"]} for a in arc_list]}
 
 
 def write_mission(mission, out, env_file, results_file, index, chord_tol, flight_time):
@@ -524,9 +918,16 @@ def write_mission(mission, out, env_file, results_file, index, chord_tol, flight
     meta = {"envs": env_file, "results": results_file, "index": index,
             "floor_agl_m": FLOOR_AGL_M, "origin": [fly.ORIGIN_LAT_DEG, fly.ORIGIN_LON_DEG],
             "home_lat_lon": [hlat, hlon], "home_heading_deg": mission["home_heading_deg"],
-            "first_plan_item": mission["first_plan_item"], "n_plan_waypoints": len(mission["W"]),
+            "first_plan_item": mission["first_plan_item"],
+            "n_plan_waypoints": mission.get("n_waypoints_flown", len(mission["W"])),
+            "follower": mission.get("follower", "waypoints"),
             "chord_tol_m": chord_tol, "commanded_airspeed_ms": mission["commanded_mean_ms"],
+            "max_waypoints": mission.get("max_waypoints"), "alt_lead_s": mission.get("alt_lead_s", 0.0),
+            "min_spacing_m": mission.get("min_spacing_m"), "arcs": mission.get("arcs", False),
+            "track_comp": mission.get("track_comp"),
+            "n_arcs": mission.get("n_arcs", 0), "arc_list": mission.get("arc_list", []),
             "speed_profile": mission["speed_profile"], "leg_speeds_ms": mission["leg_speeds"],
+            "speed_lead_s": mission.get("speed_lead_s", 0.0), "n_speed_commands": mission["n_speed_commands"],
             "plan_items": mission["plan_items"],
             "plan_flight_time_s": flight_time, "flyable": not mission["rejects"],
             "rejects": mission["rejects"], "warnings": mission["warnings"], "checks": mission["checks"],
@@ -547,7 +948,10 @@ def make(args):
     if not r["success"]:
         raise SystemExit(f"Environment {args.index} has no feasible plan (status {r['status']}).")
     chord_tol = CHORD_TOL_M if getattr(args, "chord_tol", None) is None else args.chord_tol
-    m = build_mission(env, r, chord_tol, getattr(args, "speed_profile", None))
+    m = build_mission(env, r, chord_tol, getattr(args, "speed_profile", None),
+                      getattr(args, "max_waypoints", None), getattr(args, "alt_lead", 0.0) or 0.0,
+                      getattr(args, "min_spacing", None), getattr(args, "arcs", False),
+                      getattr(args, "track_comp", None), getattr(args, "wp_spacing", None))
     name = args.out or f"{os.path.splitext(os.path.basename(args.envs))[0]}{args.index}.waypoints"
     out = localstore_path(name)
     write_mission(m, out, args.envs, args.results, args.index, chord_tol, r["flight_time"])
@@ -1380,6 +1784,34 @@ def batch_make(args):
     from solvers.scp_aircraft import load_plan
     import datetime
     chord_tol = args.chord_tol
+    # tracking setup v3 by default: a waypoint every BATCH_WP_SPACING_M, shifted by the tracking correction.
+    # --wp-spacing 0 goes back to the chord-tolerance rule (--chord-tol), --track-comp none drops the
+    # correction; --arcs and --max-waypoints use neither.
+    wp_spacing = getattr(args, "wp_spacing", None)
+    wp_spacing = BATCH_WP_SPACING_M if wp_spacing is None else (wp_spacing or None)
+    track_comp = getattr(args, "track_comp", None) or BATCH_TRACK_COMP
+    track_comp = None if track_comp == "none" else track_comp
+    if getattr(args, "arcs", False) or getattr(args, "max_waypoints", None) or getattr(args, "alt_lead", 0.0):
+        wp_spacing, track_comp = None, None
+    follower = getattr(args, "follower", None) or "waypoints"
+    guided = None
+    if follower == "guided":
+        # the plan itself is streamed in GUIDED (guided_follower.py); the 30 m waypoints are built only for
+        # the flyability check and the preview, without the tracking correction (nothing flies them)
+        wp_spacing, track_comp = wp_spacing or BATCH_WP_SPACING_M, None
+        guided = {"lookahead_m": getattr(args, "lookahead", None) or GUIDED_LOOKAHEAD_M,
+                  "alt_comp": getattr(args, "guided_alt_comp", "on") != "off",
+                  "speed_lead_m": 0.0,
+                  "alt_lead_m": float(GUIDED_ALT_LEAD_M if getattr(args, "guided_alt_lead", None) is None
+                                      else args.guided_alt_lead),
+                  "speed_ramp": getattr(args, "guided_speed_ramp", "off") == "on",
+                  "alt_rate_ms": float(getattr(args, "guided_alt_rate", GUIDED_ALT_RATE_MS)),
+                  "alt_step_m": float(getattr(args, "guided_alt_step", GUIDED_ALT_STEP_M))}
+    # tracking setup v4: the plan's speed on every leg, but only with dense waypoints (with long legs it
+    # tracked worse); --speed-profile overrides
+    speed_profile = getattr(args, "speed_profile", None) or (BATCH_SPEED_PROFILE if wp_spacing else "constant")
+    if guided:
+        speed_profile = "constant"                           # the follower streams the plan's airspeed itself
     if (batch_path(args.name) / "manifest.json").exists() and not args.overwrite:
         raise SystemExit(f"Batch '{args.name}' already exists ({batch_path(args.name)}). Pick a new --name, "
                          f"or add --overwrite to rebuild its missions (flown logs are kept).")
@@ -1397,11 +1829,33 @@ def batch_make(args):
                            reason="no result" if r0 is None else f"SCP status {r0.get('status')}")
                 instances.append(rec); print(f"  {iid}: not solved ({rec['reason']})"); continue
             env, r, _ = load_plan(envs_file, results_file, i)
-            m = build_mission(env, r, chord_tol, getattr(args, "speed_profile", None))
+            m = build_mission(env, r, chord_tol, speed_profile,
+                              getattr(args, "max_waypoints", None), getattr(args, "alt_lead", 0.0) or 0.0,
+                              getattr(args, "min_spacing", None), getattr(args, "arcs", False),
+                              track_comp, wp_spacing, getattr(args, "speed_lead", 0.0) or 0.0)
             out = batch_path(args.name, "missions", f"{iid}.waypoints")
+            reference = None
+            if guided:
+                _, xs_ = dense_plan(r)
+                m, reference = guided_mission(m, xs_[:, :3], xs_[:, 3], xs_[:, 5], guided["alt_comp"])
+                ref_out = batch_path(args.name, "missions", f"{iid}.guided.json")
+                with open(ref_out, "w") as fh:
+                    json.dump(reference, fh)
+                rec.update(reference=str(ref_out), reference_wsl=wsl_path(ref_out),
+                           guided_start_item=m["guided_start_item"], guided_exit_item=m["guided_exit_item"])
             write_mission(m, out, envs_file, results_file, i, chord_tol, r["flight_time"])
+            try:
+                plot_mission_preview(env, m, str(out).replace(".waypoints", "_preview.png"),
+                                     f"{iid}: {len(m['W'])} plan items" + (f", {m['n_arcs']} arcs" if m.get("n_arcs") else ""))
+            except Exception as e:                                  # a preview must never stop the batch
+                print(f"  (no preview for {iid}: {e})")
             log = batch_path(args.name, "logs", f"{iid}.tlog")
-            rec.update(status="flyable" if not m["rejects"] else "not_flyable",
+            fly_all = getattr(args, "fly_all", False)
+            if fly_all and m["rejects"]:
+                rec["rejects_ignored"] = m["rejects"]          # --fly-all: flown anyway, for experiments
+            rec.update(status="flyable" if (not m["rejects"] or fly_all) else "not_flyable",
+                       n_plan_waypoints=m.get("n_waypoints_flown", len(m["W"])), first_plan_item=m["first_plan_item"],
+                       n_mission_items=len(m["items"]), n_speed_commands=m["n_speed_commands"],
                        rejects=m["rejects"], warnings=m["warnings"], checks=m["checks"],
                        mission=str(out), mission_wsl=wsl_path(out), home=sitl_home(m),
                        log=str(log), log_wsl=wsl_path(log), margin_m=env.margin,
@@ -1409,18 +1863,31 @@ def batch_make(args):
                        n_obstacles=len(env.obstacles))
             instances.append(rec)
             c = m["checks"]
-            print(f"  {iid}: {rec['status']:<11} {len(m['W'])} waypoints, expected path keeps "
+            print(f"  {iid}: {rec['status']:<11} {len(m['W'])} plan items"
+                  + (f" ({m['n_arcs']} arcs)" if m.get("n_arcs") else "") + ", expected path keeps "
                   f"{c['est_min_clearance_m']:.1f} m (plan {c['plan_min_clearance_m']:.1f} m)"
-                  + "".join(f"\n      NOT FLYABLE: {x}" for x in m["rejects"]))
+                  + "".join(f"\n      {'FLOWN ANYWAY (--fly-all)' if fly_all else 'NOT FLYABLE'}: {x}"
+                            for x in m["rejects"]))
     manifest = {"name": args.name, "created": datetime.datetime.now().isoformat(timespec="seconds"),
                 "note": args.note or "", "chord_tol_m": chord_tol, "speedup": args.speedup,
-                "speed_profile": getattr(args, "speed_profile", None) or SPEED_PROFILE,
-                "param_overrides": parse_param_overrides(getattr(args, "param", None) or []),
+                "max_waypoints": getattr(args, "max_waypoints", None),
+                "alt_lead_s": getattr(args, "alt_lead", 0.0) or 0.0, "min_spacing_m": getattr(args, "min_spacing", None),
+                "arcs": getattr(args, "arcs", False), "track_comp": track_comp, "wp_spacing_m": wp_spacing,
+                "fly_all": getattr(args, "fly_all", False),
+                "speed_profile": speed_profile,
+                "speed_lead_s": getattr(args, "speed_lead", 0.0) or 0.0,
+                "follower": follower, "guided": guided,
+                "param_overrides": ({**GUIDED_PARAM_OVERRIDES, **parse_param_overrides(getattr(args, "param", None) or [])}
+                                    if guided else parse_param_overrides(getattr(args, "param", None) or [])),
+                "param_overrides_in_plan": parse_param_overrides(getattr(args, "param_in_plan", None) or []),
                 "parm_wsl": wsl_path(project_root() / SITL_PARAM_FILE), "instances": instances}
     mf = batch_path(args.name) / "manifest.json"
     with open(mf, "w") as fh:
         json.dump(manifest, fh, indent=2)
     n = {k: sum(x["status"] == k for x in instances) for k in ("flyable", "not_flyable", "not_solved")}
+    if manifest["param_overrides_in_plan"]:
+        print("  parameters set in flight when the plan starts: "
+              + ", ".join(f"{k}={v:g}" for k, v in manifest["param_overrides_in_plan"].items()))
     if manifest["param_overrides"]:
         print("  parameters for this batch (set before arming, on top of c172_sitl.parm): "
               + ", ".join(f"{k}={v:g}" for k, v in manifest["param_overrides"].items()))
@@ -1482,7 +1949,7 @@ def batch_analyze(args):
     rows = []
     for inst in manifest["instances"]:
         row = {"id": inst["id"], "status": inst["status"], "outcome": "", "reasons": "", "near_miss": "",
-               "warnings": len(inst.get("warnings", []))}
+               "warnings": len(inst.get("warnings", [])), "n_plan_waypoints": inst.get("n_plan_waypoints")}
         if inst["status"] == "not_solved":
             row.update(outcome="NOT_SOLVED", reasons=inst.get("reason", ""))
         elif inst["status"] == "not_flyable":
@@ -1514,7 +1981,7 @@ def batch_analyze(args):
                     row[k] = s.get(k)
         rows.append(row)
 
-    cols = ["id", "outcome", "reasons", "near_miss", "status", "run_status", "rms_error_m", "max_error_m",
+    cols = ["id", "outcome", "reasons", "near_miss", "status", "run_status", "n_plan_waypoints", "rms_error_m", "max_error_m",
             "min_clearance_m", "plan_min_clearance_m", "goal_miss_m", "flight_time_s", "plan_flight_time_s",
             "roll_oscillation_deg", "pitch_oscillation_deg", "altitude_oscillation_m", "max_horizontal_error_m",
             "max_vertical_error_m", "airspeed_vs_plan_rms_ms", "warnings"]
@@ -1605,6 +2072,19 @@ def main():
                    help=f"airspeed: follow the plan per leg, or one constant speed (default {SPEED_PROFILE})")
     m.add_argument("--chord-tol", type=float, default=None,
                    help=f"how far a straight leg may stray from the plan, m (default CHORD_TOL_M = {CHORD_TOL_M:g})")
+    m.add_argument("--wp-spacing", type=float, default=None,
+                   help="a waypoint every this many metres along the plan (even spacing), instead of --chord-tol")
+    m.add_argument("--track-comp", choices=["lateral", "both"], default=None,
+                   help="shift the waypoints to cancel ArduPlane's measured offsets (outside curves; altitude "
+                        "behind climbs); for dense waypoints, e.g. --chord-tol 0.2 --min-spacing 30")
+    m.add_argument("--arcs", action="store_true",
+                   help="fly the plan's curves as arcs (fractional loiter turns, steady bank) instead of straight legs")
+    m.add_argument("--alt-lead", type=float, default=0.0,
+                   help="waypoint altitudes from this many seconds ahead along the plan (TECS starts climbs on time)")
+    m.add_argument("--min-spacing", type=float, default=None,
+                   help=f"closest two plan waypoints may be, m (default MIN_WP_SPACING_M = {MIN_WP_SPACING_M:g})")
+    m.add_argument("--max-waypoints", type=int, default=None,
+                   help="use exactly this many plan waypoints (start and goal included) instead of --chord-tol")
     a = sub.add_parser("analyze", help="Tier 2: check a flown SCP mission against the plan and the obstacles")
     a.add_argument("--mission", required=True, help="the .waypoints file written by make")
     a.add_argument("--log", required=True, help="MAVProxy .tlog (or DataFlash .BIN with pymavlink)")
@@ -1618,13 +2098,57 @@ def main():
                     help="an environments file and the SCP results solved on it; repeat for several")
     bm.add_argument("--chord-tol", type=float, default=BATCH_CHORD_TOL_M)
     bm.add_argument("--speed-profile", choices=["plan", "constant"], default=None,
-                    help=f"airspeed: follow the plan per leg, or one constant speed (default {SPEED_PROFILE})")
+                    help=f"airspeed: follow the plan per leg, or one constant speed (default {BATCH_SPEED_PROFILE} "
+                         f"with --wp-spacing waypoints, constant otherwise)")
+    bm.add_argument("--speed-lead", type=float, default=0.0,
+                    help="with --speed-profile plan: command each leg's speed this many seconds early")
     bm.add_argument("--speedup", type=int, default=BATCH_SPEEDUP, help="SITL speedup for run_batch.py")
     bm.add_argument("--note", default=None, help='e.g. "tracking setup v1"')
     bm.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
                     help="autopilot parameter for this batch only, set by run_batch.py before arming "
                          "(on top of c172_sitl.parm); repeat for several")
+    bm.add_argument("--wp-spacing", type=float, default=None,
+                   help=f"a waypoint every this many metres along the plan (default BATCH_WP_SPACING_M = "
+                        f"{BATCH_WP_SPACING_M:g}); 0 = the chord-tolerance rule (--chord-tol) instead")
+    bm.add_argument("--track-comp", choices=["none", "lateral", "both"], default=None,
+                   help=f"shift the waypoints to cancel ArduPlane's measured offsets (outside curves; altitude "
+                        f"behind climbs). Default for batch-make: {BATCH_TRACK_COMP}")
+    bm.add_argument("--arcs", action="store_true",
+                   help="fly the plan's curves as arcs (fractional loiter turns, steady bank) instead of straight legs")
+    bm.add_argument("--alt-lead", type=float, default=0.0,
+                   help="waypoint altitudes from this many seconds ahead along the plan (TECS starts climbs on time)")
+    bm.add_argument("--min-spacing", type=float, default=None,
+                   help=f"closest two plan waypoints may be, m (default MIN_WP_SPACING_M = {MIN_WP_SPACING_M:g})")
+    bm.add_argument("--param-in-plan", action="append", default=[], metavar="NAME=VALUE",
+                    help="autopilot parameter set IN FLIGHT when the aircraft reaches the plan's first "
+                         "waypoint (e.g. a throttle lock that would starve the takeoff); repeat for several")
+    bm.add_argument("--max-waypoints", type=int, default=None,
+                    help="use exactly this many plan waypoints per mission (start and goal included), "
+                         "chosen to keep the plan's shape, instead of --chord-tol")
+    bm.add_argument("--fly-all", action="store_true",
+                    help="fly missions that fail the flyability check too (for experiments; the reasons are "
+                         "kept in the manifest as rejects_ignored)")
     bm.add_argument("--overwrite", action="store_true", help="rebuild the missions of an existing batch")
+    bm.add_argument("--follower", choices=["waypoints", "guided"], default="waypoints",
+                    help="waypoints: upload the plan as a mission (tracking setup v4); guided: stream it in GUIDED "
+                         "mode from guided_follower.py, the 'companion computer' (experimental)")
+    bm.add_argument("--lookahead", type=float, default=None,
+                    help=f"--follower guided: L1 aim point distance along the plan, m (default {GUIDED_LOOKAHEAD_M:g})")
+    bm.add_argument("--guided-alt-comp", choices=["on", "off"], default="on",
+                    help="--follower guided: lead the altitude on climbs with the tracking correction's vertical part")
+    bm.add_argument("--guided-alt-lead", type=float, default=None,
+                    help=f"--follower guided: command the altitude this many metres further along the plan "
+                         f"(default GUIDED_ALT_LEAD_M = {GUIDED_ALT_LEAD_M:g}). GUIDED batches also get "
+                         f"GUIDED_PARAM_OVERRIDES (TECS_CLMB_MAX 6.5); --param overrides them")
+    bm.add_argument("--guided-speed-ramp", choices=["on", "off"], default="off",
+                    help="--follower guided: ramp each airspeed change at about the plan's acceleration "
+                         "(tried in batches h0-h2: ArduPlane restarts the ramp at every command, so the "
+                         "speed stopped following the plan)")
+    bm.add_argument("--guided-alt-rate", type=float, default=GUIDED_ALT_RATE_MS,
+                    help="--follower guided: climb rate sent with each altitude command, m/s (large, so "
+                         "ArduPlane never clips the altitude target towards the current altitude)")
+    bm.add_argument("--guided-alt-step", type=float, default=GUIDED_ALT_STEP_M,
+                    help="--follower guided: send a new altitude when it changes by this much, m")
     ba = sub.add_parser("batch-analyze", help="Tier 3: score every flown instance of a batch and summarize")
     ba.add_argument("--name", required=True)
     ba.add_argument("--plot", action="store_true", help="show the summary plot (saved either way)")

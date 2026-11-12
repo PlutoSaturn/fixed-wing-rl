@@ -21,6 +21,8 @@ ArduPilot Python environment (pymavlink) is active:
     python3 /mnt/c/Users/isaia/fixed-wing-rl/ardupilot/run_batch.py \\
         /mnt/c/Users/isaia/fixed-wing-rl/localstore/batches/<name>/manifest.json
 Options: --only ID [ID ...], --redo, --speedup N, --ardupilot DIR.
+Batches made with `batch-make --follower guided` fly the plan itself in GUIDED mode, streamed by
+guided_follower.py (the "companion computer"); takeoff, lead-in, exit and final loiter stay in AUTO.
 Needs no packages besides pymavlink (no numpy), so it runs in ArduPilot's environment.
 """
 import argparse
@@ -36,8 +38,12 @@ from pathlib import Path
 os.environ.setdefault("MAVLINK20", "1")                 # talk MAVLink 2, like MAVProxy
 from pymavlink import mavutil  # noqa: E402
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from guided_follower import GuidedFollower  # noqa: E402
+
 SITL_HOST, SITL_PORT = "127.0.0.1", 5760   # SITL's first serial port (what MAVProxy normally connects to)
 AUTO_MODE = 10                           # ArduPlane custom_mode for AUTO
+GUIDED_POSITION_HZ = 20                  # GLOBAL_POSITION_INT rate (simulated) = the GUIDED follower's update rate
 DONE_HOLD_S = 30.0                       # simulated seconds in the final loiter before a flight is done
 TIMEOUT_FACTOR = 2.0                     # give up after this x the expected simulated duration ...
 TIMEOUT_EXTRA_S = 600.0                  # ... plus this many simulated seconds
@@ -127,6 +133,7 @@ class Link:
         self.last_msg = time.time()
         self.last_hb_sent = 0.0
         self.texts = []
+        self.follower = None                                # a GuidedFollower, for GUIDED batches
 
     def heartbeat(self):
         if time.time() - self.last_hb_sent >= 1.0:
@@ -148,6 +155,11 @@ class Link:
             if msg.lat or msg.lon:
                 self.alt_rel = msg.relative_alt / 1000.0
                 self.max_alt = max(self.max_alt, self.alt_rel)
+            if self.follower is not None:
+                self.follower.on_position(self, msg)
+        elif t == "COMMAND_ACK":
+            if self.follower is not None:
+                self.follower.on_ack(msg)
         elif t == "MISSION_CURRENT":
             self.seq = msg.seq
         elif t == "STATUSTEXT":
@@ -230,10 +242,16 @@ def set_params(link, overrides):
     return True, ""
 
 
-def fly(inst, link, items, overrides=None):
-    """Upload, arm, and follow the flight. Returns (status, detail)."""
+def fly(inst, link, items, overrides=None, in_plan=None, guided=None, tlog=None):
+    """Upload, arm, and follow the flight. Returns (status, detail).
+    in_plan: parameters set in flight, once the aircraft heads for the plan's first waypoint
+    (e.g. a throttle lock that would starve the takeoff and climb if set before arming).
+    guided: the batch's GUIDED follower settings (batches made with --follower guided)."""
     link.m.target_system, link.m.target_component = 1, 1
     link.m.mav.request_data_stream_send(1, 1, mavutil.mavlink.MAV_DATA_STREAM_ALL, 10, 1)
+    if guided:
+        link.command(mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                     mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, 1e6 / GUIDED_POSITION_HZ)
     link.m.mav.param_request_list_send(1, 1)               # the log records every parameter
     link.pump(5.0)
     if overrides:
@@ -257,13 +275,35 @@ def fly(inst, link, items, overrides=None):
         link.pump(4.0)
     arm_sim = link.boot_s or 0.0
     log("  armed in AUTO; flying")
+    if guided:
+        link.follower = GuidedFollower(inst["reference_wsl"], guided, inst["guided_start_item"],
+                                       inst["guided_exit_item"], str(Path(tlog).with_suffix(".guided.csv")))
+        log(f"  GUIDED follower ready: lookahead {link.follower.L:g} m; engages near the plan's start")
 
     last_seq = len(items) - 1                                # the final loiter
     sim_limit = TIMEOUT_FACTOR * inst["expected_sim_s"] + TIMEOUT_EXTRA_S
     wall_end = time.time() + sim_limit / MIN_SIM_RATE
     in_loiter_since, last_report = None, 0.0
+    first_plan_item = inst.get("first_plan_item")
+    in_plan_done = not in_plan
+    if in_plan and first_plan_item is None:
+        return "param_failed", "in-plan parameters need first_plan_item in the manifest (rebuild the batch)"
+    last_state = None
     while True:
         link.pump(1.0)
+        if link.follower is not None:
+            st = link.follower.state
+            if st != last_state:
+                log(f"  GUIDED follower: {st}")
+                last_state = st
+            if st == "failed":
+                return "guided_failed", link.follower.detail
+        if not in_plan_done and link.seq is not None and link.seq >= first_plan_item:
+            log(f"  reached the plan (item {link.seq}); setting in-plan parameters")
+            ok, detail = set_params(link, in_plan)
+            if not ok:
+                return "param_failed", f"in flight: {detail}"
+            in_plan_done = True
         now_sim = (link.boot_s or arm_sim) - arm_sim
         if time.time() - link.last_msg > SILENCE_TIMEOUT_S:
             return "sitl_died", f"no messages for {SILENCE_TIMEOUT_S:.0f} s (at {now_sim:.0f} s simulated)"
@@ -309,6 +349,9 @@ def main():
     log(f"Batch '{manifest['name']}': {len(todo)} instances to fly at --speedup {speedup}")
     if manifest.get("param_overrides"):
         log("  parameters for this batch: " + ", ".join(f"{k}={v:g}" for k, v in manifest["param_overrides"].items()))
+    if manifest.get("param_overrides_in_plan"):
+        log("  set in flight at the plan's start: "
+            + ", ".join(f"{k}={v:g}" for k, v in manifest["param_overrides_in_plan"].items()))
     results = []
     for k, inst in enumerate(todo, 1):
         tlog = Path(inst["log_wsl"])
@@ -334,13 +377,18 @@ def main():
                     status, detail = "sitl_failed", "no heartbeat from SITL"
                 else:
                     status, detail = fly(inst, link, read_wpl(inst["mission_wsl"]),
-                                         manifest.get("param_overrides") or {})
+                                         manifest.get("param_overrides") or {},
+                                         manifest.get("param_overrides_in_plan") or {},
+                                         manifest.get("guided") if manifest.get("follower") == "guided" else None,
+                                         tlog)
         except KeyboardInterrupt:
             status, detail = "interrupted", "stopped by the user"
         except Exception as e:                                   # keep going with the next instance
             status, detail = "error", f"{type(e).__name__}: {e}"
         finally:
             if link is not None:
+                if link.follower is not None:
+                    link.follower.close()
                 try:
                     link.m.close()
                 except Exception:
@@ -348,6 +396,8 @@ def main():
             stop_sitl(proc, fh)
         rec = {"id": inst["id"], "status": status, "detail": detail, "wall_s": round(time.time() - t0, 1),
                "speedup": speedup, "param_overrides": manifest.get("param_overrides") or {},
+               "param_overrides_in_plan": manifest.get("param_overrides_in_plan") or {},
+               "follower": manifest.get("follower", "waypoints"), "guided": manifest.get("guided"),
                "finished": time.strftime("%Y-%m-%dT%H:%M:%S")}
         json.dump(rec, open(run_json, "w"), indent=2)
         results.append(rec)

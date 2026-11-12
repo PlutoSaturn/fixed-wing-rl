@@ -144,7 +144,13 @@ AUTOTUNE without a transmitter: in MAVProxy run output add 127.0.0.1:14552, take
 
 python3 /mnt/c/Users/isaia/fixed-wing-rl/ardupilot/autotune_inputs.py --axis pitch
 
-(or --axis roll). It sets AUTOTUNE_LEVEL 0, holds 80% throttle, sends the stick inputs, and ends in LOITER, which keeps the new gains. Copy the new values (param show PTCH_RATE* or RLL_RATE*) into ardupilot/c172_sitl.parm; SITL started with -w forgets them otherwise. The pitch and roll gains in c172_sitl.parm come from this.
+(or --axis roll). It holds 80% throttle, sends the stick inputs, and ends in LOITER, which keeps the new gains. --level sets AUTOTUNE_LEVEL: 0 (the script's default) keeps the current time constant and rate limit and tunes only the PID gains; 6 (ArduPilot's recommended level) also picks the time constant and rate limit. Run AUTOTUNE at real time (no --speedup): the stick inputs are timed in real seconds. Copy the new values (param show PTCH_RATE* PTCH2SRV* or RLL_RATE*) into ardupilot/c172_sitl.parm; SITL started with -w forgets them otherwise. The roll gains in c172_sitl.parm come from level 0; the pitch gains from level 6, but with the time constant kept at 0.25 s (level 6 chose 0.75 s, which made TECS cycle).
+
+To measure the wobble in straight flight, or try several settings in one flight, without typing param set: take off (e.g. the box mission), run output add 127.0.0.1:14552 in MAVProxy, then in a second Ubuntu terminal:
+
+python3 /mnt/c/Users/isaia/fixed-wing-rl/ardupilot/wobble_sweep.py --baseline-only
+
+It flies CRUISE (straight and level) for 150 simulated seconds per setting and puts every parameter back at the end. Without --baseline-only it steps through the settings listed at the top of wobble_sweep.py (--preset v2: TECS and pitch-damping candidates; --preset l6: the level-6 pitch gains with several time constants). Copy mav.tlog and run wobble on it for one row per setting. SITL may run at --speedup 5 for this; the script times each setting in simulated seconds.
 
 ____
 
@@ -170,18 +176,30 @@ python -m solvers.scp_aircraft --envs tier3_dense_envs.json --out tier3_dense_re
 
 PyCharm, step 3: build the batch:
 
-python -m ardupilot.ardupilot_mission batch-make --name tier3_pilot --pair tier3_easy_envs.json tier3_easy_results.json --pair tier3_nominal_envs.json tier3_nominal_results.json --pair tier3_dense_envs.json tier3_dense_results.json --note "tracking setup v1"
+python -m ardupilot.ardupilot_mission batch-make --name tier3_v4 --pair tier3_easy_envs.json tier3_easy_results.json --pair tier3_nominal_envs.json tier3_nominal_results.json --pair tier3_dense_envs.json tier3_dense_results.json --note "tracking setup v4"
 
-For each environment it prints flyable, not_flyable (with the reason) or not_solved. A plan is not flyable as waypoints when the expected flown path (the waypoint legs plus the autopilot's turns at each waypoint) comes closer to an obstacle than half the planner's margin, or when a corner needs more bank than the autopilot may use. Missions use 1 m chord tolerance (BATCH_CHORD_TOL_M) and one airspeed, the plan's mean (SPEED_PROFILE = "constant"). --speed-profile plan instead puts a DO_CHANGE_SPEED with the plan's mean airspeed before each waypoint leg; in the pilot it made tracking worse (ArduPilot followed the speeds late and the throttle swung 0-100%), so it is off by default. make takes the same option. --param NAME=VALUE (repeatable) gives a batch its own autopilot parameters, on top of c172_sitl.parm: run_batch.py sets them before arming, and they are recorded in each flight's log, params.parm and runs.csv. Use it to test a setting on a batch without editing c172_sitl.parm.
+For each environment it prints flyable, not_flyable (with the reason) or not_solved. A plan is not flyable as waypoints when the expected flown path comes closer to an obstacle than half the planner's margin, or when a corner needs more bank than the autopilot may use.
+
+Missions use tracking setup v4 by default (v3 plus the plan's airspeed on every leg): a waypoint every 30 m along the plan (BATCH_WP_SPACING_M; the plan resampled at small equal steps, so ArduPilot's roll follows the plan's bank instead of jumping at each waypoint), each shifted by the tracking correction (BATCH_TRACK_COMP = "both"): towards the curve's centre by TRACK_COMP_K_M2 / radius, and the altitude ahead of the climb, cancelling the offsets ArduPlane was measured to fly. The flyability check uses the unshifted waypoints, the path the shifts are meant to produce. --wp-spacing N changes the spacing; --wp-spacing 0 goes back to the chord-tolerance rule (--chord-tol, 1 m: tracking setups v1 and v2); --track-comp none or lateral drops all or the altitude part of the correction. The correction's constants were fitted at ~52 m/s with c172_sitl.parm's settings; refit them if NAVL1_PERIOD, TECS_TIME_CONST, TECS_SPDWEIGHT or the pitch gains change. Other mission options: --arcs flies the plan's curves as fractional loiter turns (a steady bank per curve; passed dense_1 but roll spiked between arcs), --max-waypoints N uses exactly N waypoints (an experiment: tracking gets much worse), --fly-all flies missions even when the flyability check rejects them (for experiments). With the 30 m waypoints, batch missions follow the plan's airspeed (BATCH_SPEED_PROFILE = "plan", tracking setup v4): a DO_CHANGE_SPEED with the plan's mean airspeed over each leg, added wherever it changes by 0.5 m/s. On the 7 Tier 3 plans this cut the worst max error from 24.8 to 9.9 m and removed dense_1's near miss, at the cost of a busier throttle (1.3-3x more throttle movement). --speed-profile constant flies one airspeed, the plan's mean (tracking setups v1-v3); with --wp-spacing 0, --arcs, --max-waypoints or --alt-lead the default is constant too, because with long legs the speed commands arrived 5-10 s late and tracking got worse. --speed-lead S commands each speed S seconds early (tried: worse than no lead). make takes the same option. --param NAME=VALUE (repeatable) gives a batch its own autopilot parameters, on top of c172_sitl.parm: run_batch.py sets them before arming, and they are recorded in each flight's log, params.parm and runs.csv. Use it to test a setting on a batch without editing c172_sitl.parm. --param-in-plan NAME=VALUE is set in flight instead, when the aircraft heads for the plan's first waypoint (e.g. a throttle lock, THR_MIN=80 and THR_MAX=80, that would starve the takeoff if set before arming).
 
 WSL, step 4: fly every flyable one, unattended (close any running SITL first; a terminal with your ArduPilot Python environment active, where sim_vehicle.py works):
 
-python3 /mnt/c/Users/isaia/fixed-wing-rl/ardupilot/run_batch.py /mnt/c/Users/isaia/fixed-wing-rl/localstore/batches/tier3_pilot/manifest.json
+python3 /mnt/c/Users/isaia/fixed-wing-rl/ardupilot/run_batch.py /mnt/c/Users/isaia/fixed-wing-rl/localstore/batches/tier3_v4/manifest.json
 
 For each instance it starts SITL at that mission's home (no MAVProxy), records the log, uploads the mission, arms in AUTO, waits until the aircraft has circled in the final loiter for 30 s (simulated), and stops SITL. Each flight is about 10 simulated minutes (about 5 real minutes at --speedup 5). Ctrl-C stops it; running the same command again skips the instances already completed (--redo flies them again, --only ID flies just one). If an instance fails to start, logs/<id>.sitl.txt has SITL's output.
 
 PyCharm, step 5: score the batch:
 
-python -m ardupilot.ardupilot_mission batch-analyze --name tier3_pilot --plot
+python -m ardupilot.ardupilot_mission batch-analyze --name tier3_v4 --plot
 
 Each flown instance PASSES if it never touched an obstacle or left the workspace, came within 50 m of the goal, stayed within the planner's margin (30 m) of the plan, kept the rms distance to the plan at or under 10 m, and took within 10% of the plan's flight time (PASS_* settings in ardupilot_mission.py). Flown clearance under half the margin is flagged as a near miss. Outcomes: PASS, FAIL, REJECTED (not flyable as waypoints), NOT_FLOWN (e.g. never armed) and NOT_SOLVED.
+
+Tracking setup v5 (GUIDED follower): instead of uploading the plan as waypoints, stream it in GUIDED mode, as a companion computer would. Every solved plan stayed within 8.1 m of its plan and 1.8 m sideways (v4: 9.9 m), at the cost of a busier throttle. Needs ArduPlane 4.3 or newer (cd ~/ardupilot && git describe --tags). Build the batch with --follower guided (lookahead 150 m, altitude lead 30 m and TECS_CLMB_MAX 6.5 are the defaults: GUIDED_* in ardupilot_mission.py):
+
+python -m ardupilot.ardupilot_mission batch-make --name tier3_v5 --follower guided --note "tracking setup v5" --pair tier3_easy_envs.json tier3_easy_results.json --pair tier3_nominal_envs.json tier3_nominal_results.json --pair tier3_dense_envs.json tier3_dense_results.json
+
+Fly it at --speedup 3 (not 5), so guided_follower.py keeps up with its 20 Hz stream:
+
+python3 /mnt/c/Users/isaia/fixed-wing-rl/ardupilot/run_batch.py /mnt/c/Users/isaia/fixed-wing-rl/localstore/batches/tier3_v5/manifest.json --speedup 3
+
+Each flight logs the follower's states (wait, engaging, active, leaving, done) and writes logs/<id>.guided.csv with what it commanded. Score it as usual (batch-analyze --name tier3_v5). Other options: --lookahead, --guided-alt-lead, --guided-alt-comp on/off, --guided-alt-rate, --guided-alt-step, --guided-speed-ramp (tried, worse). In a Windows terminal, don't click inside the window while a batch runs: QuickEdit mode pauses the script until you press Esc.

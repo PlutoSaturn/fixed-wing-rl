@@ -39,6 +39,12 @@ Obstacle token (TOKEN_DIM = 17), one per convex piece (walls are split into thei
 
 Run (from the fixed-wing-rl folder):
     python supervised-learning-main/build_cache.py --dataset c172_envs_v1 --run birkhoff_v1
+
+--failed: the same cache for the environments the solver did NOT solve (no valid start), saved as
+cache/<RUN>_failed.npz. Each gets one placeholder label (zeros) whose flight time is the straight-line
+time at cruise (distance / V_cruise), so pilots can be flown on them (bench_pilot.py / plot_pilot.py
+--run <RUN>_failed); "speed vs bench" there is vs that straight-line time, not a solver benchmark.
+    python supervised-learning-main/build_cache.py --dataset c172_envs_v1 --run birkhoff_v1 --failed
 """
 
 # ==========================================================================
@@ -174,7 +180,7 @@ def distinct_routes(cands, scale, dedup_m, max_labels):
 
 def read_part(args):
     """Everything needed from one .h5 part: a list of per-environment records."""
-    path, scale, af, dedup_m, max_labels, splits = args
+    path, scale, af, dedup_m, max_labels, splits, failed = args
     import h5py
     from environment.envgen import Environment
     out, skipped = [], 0
@@ -182,12 +188,24 @@ def read_part(args):
         if not h5.attrs.get("complete", False):
             return out, 0
         for fp, g in h5.items():
-            if not bool(g.attrs["success"]):
+            if bool(g.attrs["success"]) == bool(failed):         # normal: solved only; --failed: unsolved only
                 skipped += 1
                 continue
             env = Environment.from_dict(json.loads(g["env_json"][()]))
             start_state = g["start_state"][:]
             origin, yaw = frame_of(env.start_pos, env.goal_pos)
+            if failed:                                       # no solution: one placeholder label
+                dist = np.linalg.norm(env.goal_pos - env.start_pos)
+                idx = int(g.attrs["index"])
+                out.append({
+                    "fp": fp, "index": idx, "split": splits.get(idx, str(g.attrs.get("split", ""))),
+                    "origin": origin, "yaw": yaw,
+                    "ctx": context_for(env, start_state, origin, yaw, scale, af["V_CRUISE"]),
+                    "tok": tokens_for(env, origin, yaw, scale), "n_valid": 0,
+                    "x": np.zeros((1, 64, 6), np.float32), "u": np.zeros((1, 64, 3), np.float32),
+                    "sigma": np.array([dist / af["V_CRUISE"]], np.float32), "sigma_n": np.ones(1, np.float32),
+                    "cost": np.full(1, np.nan, np.float32)})
+                continue
             cands = []
             for k, a in g["attempts"].items():
                 if not bool(a.attrs["success"]):
@@ -241,7 +259,7 @@ def load_splits(env_root):
         return {int(r["index"]): r.get("split", "") for r in csv.DictReader(f)}
 
 
-def build(dataset, run, workers=None):
+def build(dataset, run, workers=None, failed=False):
     t0 = time.time()
     env_root = datasets_root() / dataset
     sol_root = env_root / "solutions" / run
@@ -251,7 +269,7 @@ def build(dataset, run, workers=None):
     af = airframe()
     scale = float(LENGTH_SCALE_M or af["turn_radius_m"])
     splits = load_splits(env_root)
-    jobs = [(str(p), scale, af, DEDUP_M, MAX_LABELS, splits) for p in parts]
+    jobs = [(str(p), scale, af, DEDUP_M, MAX_LABELS, splits, failed) for p in parts]
     print(f"Reading {len(parts)} parts from {sol_root} (length scale {scale:.1f} m)")
 
     recs, skipped = [], 0
@@ -269,7 +287,7 @@ def build(dataset, run, workers=None):
             recs += r; skipped += s
     recs.sort(key=lambda r: r["index"])
     if not recs:
-        raise SystemExit("No solved environments found.")
+        raise SystemExit("No unsolved environments found." if failed else "No solved environments found.")
 
     E = len(recs)
     n_tok = np.array([len(r["tok"]) for r in recs])
@@ -295,14 +313,15 @@ def build(dataset, run, workers=None):
     }
     out_dir = env_root / "cache"
     out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"{run}.npz"
+    name = f"{run}_failed" if failed else run
+    out = out_dir / f"{name}.npz"
     tmp = out.with_name(out.stem + ".tmp.npz")
     np.savez_compressed(tmp, **arrays)
     os.replace(tmp, out)
 
     splits_count = {str(s): int(np.sum(arrays["split"] == s)) for s in sorted(set(arrays["split"]))}
     summary = {
-        "dataset": dataset, "run": run, "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "dataset": dataset, "run": name, "failed_only": bool(failed), "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "length_scale_m": scale, "v_cruise": af["V_CRUISE"], "t_max": af["T_MAX"],
         "dedup_m": DEDUP_M, "max_labels": MAX_LABELS, "token_dim": TOKEN_DIM, "ctx_dim": CTX_DIM,
         "environments": E, "unsolved_skipped": int(skipped), "labels": int(n_lab.sum()),
@@ -311,9 +330,10 @@ def build(dataset, run, workers=None):
         "distinct_routes_per_env": _hist(n_lab),
         "tokens_per_env": {"min": int(n_tok.min()), "median": float(np.median(n_tok)), "max": int(n_tok.max())},
     }
-    (out_dir / f"{run}.json").write_text(json.dumps(summary, indent=1))
+    (out_dir / f"{name}.json").write_text(json.dumps(summary, indent=1))
     print(f"\nCache: {out}  ({out.stat().st_size / 1e6:.1f} MB, {time.time() - t0:.0f} s)")
-    print(f"  solved environments: {E}   (unsolved skipped: {skipped})")
+    print(f"  unsolved environments: {E}   (solved skipped: {skipped})" if failed else
+          f"  solved environments: {E}   (unsolved skipped: {skipped})")
     print(f"  labels (distinct valid routes): {int(n_lab.sum())}   splits: {splits_count}")
     print(f"  valid starts per env:     {summary['valid_starts_per_env']}")
     print(f"  distinct routes per env:  {summary['distinct_routes_per_env']}")
@@ -339,5 +359,6 @@ if __name__ == "__main__":
     ap.add_argument("--dataset", default=DATASET)
     ap.add_argument("--run", default=RUN)
     ap.add_argument("--workers", type=int, default=WORKERS)
+    ap.add_argument("--failed", action="store_true", help="cache the UNSOLVED environments instead (<run>_failed)")
     a = ap.parse_args()
-    build(a.dataset, a.run, a.workers)
+    build(a.dataset, a.run, a.workers, a.failed)

@@ -24,18 +24,35 @@ What the agent senses (only what its own scans have shown it; nothing else about
         inflated obstacle or box wall it hits, up to RAY_RANGE_M (cheap: done every step), and
     a FAR SCAN every FAR_EVERY_S seconds (and at the start): FAR_AZ x FAR_EL rays in a narrow cone
         (+-FAR_AZ[1] deg x +-FAR_EL[1] deg) centred on the line to the goal, out to FAR_RANGE_M, to
-        learn how the course opens up kilometres ahead (costlier: done now and then).
-
-The map it builds as it flies: every flight starts with an empty 3D map of SEEN_CELL_M cells
-(everything unknown). Each ray of either scan marks the cells it passes through as free and the cell
-where it hits as occupied (occupied wins: obstacles do not move). The map only ever gains detail, so
-its view of the environment improves as it flies. It sees that map twice:
-    a local view ahead: LOCAL_NF x LOCAL_NS cells (LOCAL_AHEAD_M along its heading, +-LOCAL_SIDE_M
-        to the sides) at three altitudes (LOCAL_DZ_M below / level / above), occupied and unknown
-        channels, turning with the aircraft, and
-    an overview of the whole map: MAP_NX x MAP_NY cells of MAP_CELL m, three altitude bands, share
-        of each cell seen occupied and share still unknown, with its own position and the goal marked.
+        see how the course opens up kilometres ahead (costlier: done now and then). The strategist
+        (stage 2) sees the last FAR_KEEP far scans as depth images, each with where it was taken
+        relative to the aircraft now, the heading change since and its age: its memory of the course
+        ahead. The flier sees only the short scan.
+No map is built (it made each step too slow): nothing about the obstacles is remembered except
+those last far scans.
 No rewinds: a crash ends the flight.
+
+Two learning systems (hierarchical RL), trained one after the other (STAGE):
+    1. "flier": the agent above flies to a TARGET, a waypoint 1-3 km ahead or, at the end, the goal.
+       It sees the target's direction / distance / height and the projected miss of its current
+       line of flight at the target (not the goal's), whether the target is the goal, and how far
+       the goal still is. In training it is given a series of random waypoints (WP_DIST_M ahead,
+       within +-WP_ANG_DEG of the line to the goal, +-WP_DZ_M in height, in free air) that end at
+       the goal, so it learns to fly anywhere it is sent.
+    2. "strategy": a second agent picks the waypoints; the flier from stage 1 is FROZEN and flies to
+       them. The strategist decides when a flight starts, when a waypoint is reached or passed, and
+       at least every STRAT_EVERY_S seconds (right after the far scan). It sees its own state
+       relative to the GOAL, the short scan, and its last FAR_KEEP far scans (with where / when they
+       were taken), and outputs the next waypoint: a heading offset from the line to the goal
+       (+-STRAT_ANG_DEG), a distance (WP_DIST_M) and a height change (+-STRAT_DZ_M); a waypoint
+       beyond the goal means "go to the goal". Each decision is one PPO step; its reward is what the
+       flight earns until the next decision: progress toward the goal, time, and the outcome.
+    Alternating rounds (each round is one run): a basic flier (--stop-at-keep 0.5 ends it once it
+    has mastered half the obstacles) -> a strategist on it -> the flier again, continuing from its
+    weights (--init-from), now practising on that frozen strategist's waypoints (--strategy; a
+    WP_MIX_RANDOM share of its flights keep random practice waypoints so it does not forget them)
+    -> the strategist again on the new flier (--init-from) -> ... Each continued run starts from the
+    previous run's weights and curriculum position.
 
 It also sees the projected miss at the goal plane (lateral and vertical, in MISS_SCALE_M), so it
 can line up its arrival early, including climbing or descending in time.
@@ -50,20 +67,27 @@ goal are removed, both in the simulator and in the environments the solver evalu
 and the agent always see the same obstacles; the benchmark flight times were solved with them, so the
 flight-time gap can be slightly optimistic for the affected environments).
 
-Reward each step
-    + PROG_W  * (reduction in distance to the goal / starting distance)   (progress)
+Reward each step (flier)
+    + PROG_W  * (reduction in distance to the target / starting distance)   (progress)
+    + WP_R for reaching a waypoint (within WP_RADIUS_M); - WP_MISS_R x min(1, distance / MISS_SCALE_M)
+      for passing one (it ends up behind the aircraft, within WP_PASS_M); either way the next comes
     - TIME_W  * (dt / straight-line flight time)               (fly fast)
     - PROX_W  * dt * (how deep it is inside a PROX_M soft zone around the inflated obstacles)
-    - TTC_W   * dt * (1 - time to impact / TTC_S)   when heading at an obstacle (central rays) with
-                less than TTC_S seconds to impact: turn away early, not at the last moment
+    + danger shaping: the change in -TTC_K * (1 - time to impact / TTC_S) (central rays, 0 beyond TTC_S
+                seconds): turning away from an obstacle pays, heading at one costs; potential-based, so
+                it adds up to the same total however the flight ends (no reason to end it early)
     - SMOOTH_W * dt * (commanded change of n_v and n_h)^2      (no porpoising / weaving)
     + AIM_K * (improvement of min(1, projected miss / MISS_SCALE_M))   within APPROACH_M of the goal
                 (potential-based shaping: 0 ... +AIM_K per flight), where the projected miss is how
                 far the current velocity would pass from the goal when it crosses the goal plane
                 (the plane through the goal across the start-goal line)
-    and at the end: + SUCCESS_R + PRECISION_R * (1 - aim error / GOAL_RADIUS_M) for arriving (coming
-                    within GOAL_RADIUS_M), where the aim error is how close its line of flight passes
-                    to the goal centre: dead centre earns the full bonus,
+    and at the end: + SUCCESS_R + PRECISION_R * (1 - closest approach / GOAL_RADIUS_M) ^ PRECISION_POW
+                    for arriving. Entering the arrival sphere (GOAL_RADIUS_M around the goal) while the
+                    goal is the current target makes the flight a success (flying through it while still
+                    on waypoints does not count); it then keeps flying until it is past its closest point to the goal
+                    (or leaves the sphere), and the bonus is graded by how close it actually got (0 m:
+                    +PRECISION_R, 50 m: +6.4, 125 m: +2.5, 250 m: 0 with the defaults). For the solver, the
+                    flight is cut at that closest point.
                     - MISS_R * min(1, miss / MISS_SCALE_M) for crossing the goal plane without arriving
                     (the flight ends there, so a near miss costs less than a wide one),
                     - CRASH_R for an obstacle / the box / a stall, - TIMEOUT_R for running out of time.
@@ -73,17 +97,21 @@ Multi-GPU: the N_ENVS flights are split across N_GPUS GPUs; each simulates its s
 gradients on its share of every minibatch with its own copy of the agent; the gradients are
 averaged, one optimizer step is taken, and the copies are re-synchronized. The result is the
 same update as on one GPU, computed in parallel.
-Curriculum, in two parts; each step is taken when the success rate (last 10 updates) on the
-current setting exceeds CURRICULUM_SUCCESS:
-    1. obstacle thinning on the least cluttered CURRICULUM_START share of the training environments:
-       every flight keeps a random KEEP_STAGES share of its environment's obstacles (a new subset
-       each flight), starting with none - open sky, to learn to fly the envelope to the goal fast
-    2. then all obstacles, adding more cluttered environments (by occupancy) CURRICULUM_STEP at a time.
-The scans (so its map) and collisions always reflect the obstacles the flight actually has.
+Curriculum: a smooth difficulty dial, in two parts:
+    1. obstacle share: every flight keeps a random share of its environment's obstacles (a new subset
+       each flight), rising continuously from KEEP_START (0 = open sky, to learn to fly the envelope)
+       to all of them, on the least cluttered CURRICULUM_START share of the training environments;
+    2. then the environment pool widens continuously toward the more cluttered ones (by occupancy).
+The dial is driven by the training flights themselves (no extra flying): once CURRICULUM_MIN_FLIGHTS
+flights that STARTED at the current difficulty have finished (every update or two), it moves up by
+CURRICULUM_GAIN x the margin by which their success beats CURRICULUM_SUCCESS: at 85 % success,
+1/3 x 15 points = 5 points more obstacles (or 5 % more of the environments); at 100 %, 10 points; at
+or below the threshold it holds. For the flier the margin is the smaller of its goal margin and its
+waypoint margin (above CURRICULUM_WP). Flights started before a bump never count toward the next one.
+The scans and collisions always reflect the obstacles the flight actually has.
 Solver evaluations always use the full environments.
-Progress is judged on the agent's real flying: every CHECK_EVERY updates it flies CHECK_FLIGHTS
-flights of the current stage with its mean action (no exploration noise); that success rate decides
-the curriculum steps and plateaus. (The training flights' own success rate includes the noise.)
+Every CHECK_EVERY updates it also flies CHECK_FLIGHTS flights at the current difficulty with its mean
+action (no exploration noise), for the log and to detect a stall (plateau).
 Against stagnation: exploration noise has a floor (LOG_STD_MIN) and a small entropy bonus; at a
 plateau (no better noise-free success for PLATEAU_UPDATES updates) the noise is raised back to its
 starting level, but only if it has collapsed below BOOST_BELOW of it. After MAX_BOOSTS plateaus in
@@ -109,8 +137,14 @@ Output on the Volume at /rl_pilot/<NAME>/ and copied to supervised-learning-main
 
 Run (from the fixed-wing-rl folder):
     modal run supervised-learning-main/rl_pilot.py --name pilot_smoke --updates 6 --n-envs 64 --eval-every 3 --val-envs 20 --test-envs 20
-    modal run --detach supervised-learning-main/rl_pilot.py --name pilot_v1
-    modal run supervised-learning-main/rl_pilot.py --name pilot_v1 --download-only
+    modal run --detach supervised-learning-main/rl_pilot.py --name flier_v1                    stage 1
+    modal run --detach supervised-learning-main/rl_pilot.py --name strat_v1 --stage strategy --flier flier_v1   stage 2
+    modal run supervised-learning-main/rl_pilot.py --name flier_v1 --download-only
+  alternating rounds:
+    modal run --detach supervised-learning-main/rl_pilot.py --name flier_r1 --stop-at-keep 0.5
+    modal run --detach supervised-learning-main/rl_pilot.py --name strat_r1 --stage strategy --flier flier_r1
+    modal run --detach supervised-learning-main/rl_pilot.py --name flier_r2 --init-from flier_r1 --strategy strat_r1
+    modal run --detach supervised-learning-main/rl_pilot.py --name strat_r2 --stage strategy --flier flier_r2 --init-from strat_r1
 Rerunning the same command resumes from the last checkpoint.
 """
 import os
@@ -129,7 +163,7 @@ NAME           = "pilot_v1"
 # simulator
 DT             = 0.5                 # s per agent step
 TIME_LIMIT_X   = 2.0                 # flight ends (timeout) after this x the straight-line time
-GOAL_RADIUS_M  = 100.0
+GOAL_RADIUS_M  = 250.0               # arrival sphere: passing within this of the goal = reaching it
 ACTION_MODE    = "attitude"          # "attitude": the agent commands target bank and climb angles (an autopilot
                                      #   moves n_v, n_h toward them within the rate limits); "rate": the agent
                                      #   commands the change of n_v, n_h directly (earlier runs)
@@ -141,35 +175,74 @@ FAN_DEG        = 75.0                #   (forward field of view only)
 N_RAYS_TILT    = 7                   # raised and lowered fans (+-TILT_DEG), -45 ... +45 deg
 TILT_DEG       = 8.0
 RAY_RANGE_M    = 1500.0
-MAP_NX, MAP_NY = 26, 10              # overview of its map: cells (500 m) along / across the start-goal line
-MAP_X0, MAP_Y0 = -1000.0, -2500.0    # overview corner in the flight frame, m
-MAP_CELL       = 500.0
-
-# the map it builds from its scans (starts all unknown)
-SEEN_CELL_M    = 100.0               # cell size (x, y, z), flight frame
-SEEN_X_M       = (-1000.0, 13000.0)  # extent along the start-goal line ...
-SEEN_Y_M       = (-2500.0, 2500.0)   #   ... and across it (z: the whole box)
-SCAN_STEP_M    = 50.0                # free space is marked every this far along each ray
 FAR_EVERY_S    = 10.0                # a far scan every this many seconds (and at the start): a cone ...
 FAR_AZ         = (31, 15.0)          #   ... of this many rays across +- this azimuth (deg) ...
 FAR_EL         = (11, 5.0)           #   ... x this many across +- this elevation (deg), around the line
 FAR_RANGE_M    = 5000.0              #   to the goal, out to this range
 FAR_EL_MAX_DEG = 10.0                # the cone's centre is tilted toward the goal by at most this
 FAR_CHUNK      = 24                  # rays per batch in the far scan (memory)
-LOCAL_AHEAD_M  = (-500.0, 3000.0)    # local view: from behind to ahead of the aircraft ...
-LOCAL_SIDE_M   = 1000.0              #   ... +- this to the sides ...
-LOCAL_DZ_M     = (-100.0, 0.0, 100.0)   # ... at these altitudes relative to it (cells of SEEN_CELL_M)
+FAR_KEEP       = 3                   # the strategist sees this many most recent far scans (30 s)
+
+
+# targets: waypoints, then the goal (both stages)
+WP_RADIUS_M    = 150.0               # a waypoint is reached when the flight passes within this
+WP_PASS_M      = 800.0               # ... and passed (missed) when it is behind the aircraft and this close
+WP_R           = 2.0                 # flier: reaching a waypoint
+WP_MISS_R      = 2.0                 # flier: passing one, up to this (graded by the miss distance)
+WP_NORM_M      = 3000.0              # distance scale of the target inputs
+WP_DIST_M      = (1000.0, 3000.0)    # waypoint distance from the aircraft (both stages)
+WP_ALT_MARGIN_M = 80.0               # waypoints stay this far inside the floor and ceiling
+# stage 1 (flier): random waypoints to practise on
+WP_ANG_DEG     = 60.0                # within +- this of the line to the goal
+WP_DZ_M        = 150.0               # +- this from the current height
+WP_CLEAR_M     = 100.0               # in free air: at least this far from the inflated obstacles, and so is
+                                     #   the straight path to it (sampled at WP_PATH_PTS points)
+WP_PATH_PTS    = 12
+WP_RUNOUT_M    = 600.0               # and the air beyond it, along the approach, for this far (room to turn
+                                     #   after reaching it: no waypoint just in front of an obstacle)
+WP_AROUND_FRAC = 0.3                 # ... except this share of practice waypoints: in free air, but with an
+                                     #   obstacle across the straight path (first hit >= WP_AROUND_MIN_M away)
+                                     #   and a one-turn detour that is clear: they must be flown AROUND
+WP_AROUND_MIN_M = 500.0
+WP_AROUND_OFF_M = (400.0, 800.0)     # detour check: via the midpoint, offset sideways by these (both sides)
+WP_TRIES       = 32                  # candidates tried per waypoint (else the clearest one)
+WP_GOAL_PROB   = 0.2                 # share of practice flights that fly straight to the goal instead
+WP_MIX_RANDOM  = 0.15                # flier rounds with a strategist: this share of flights get random
+                                     #   practice waypoints, the rest the strategist's ...
+PRACTICE_KEEP_MAX = 0.4              # ... and those practice flights keep at most this obstacle share (in
+                                     #   heavy clutter random waypoints are near-certain crashes); the
+                                     #   curriculum then judges the strategist's flights only (goal rate)
+WP_LINE_M      = 2000.0              # "line" mode (stage-1 evaluations): waypoints this far apart on the
+                                     #   straight line to the goal
+# stage 2 (strategy): the strategist picks the waypoints
+STRAT_EVERY_S  = 10.0                # decides at least this often (also at the start and at each waypoint)
+STRAT_ANG_DEG  = 75.0                # heading offset from the line to the goal, +- this
+STRAT_DZ_M     = 200.0               # height change, +- this
+STRAT_ROLLOUT  = 256                 # simulator steps per update (each flight makes ~13+ decisions)
+GAMMA_S        = 0.97                # discount per decision (~10 s)
+LAMBDA_S       = 0.9
+STRAT_PROG_W   = 10.0                # strategist reward: progress toward the GOAL / starting distance ...
+STRAT_TIME_W   = 6.0                 #   ... minus time (the route's speed is the strategist's job), plus the
+                                     #   flight's outcome (same terms as the flier's)
+STAGE          = "flier"             # "flier" (stage 1) or "strategy" (stage 2, needs a trained flier run)
 
 # reward
 PROG_W         = 10.0
-TIME_W         = 4.0
+TIME_W         = 1.0                 # flier: light time pressure, so following the waypoints is not punished
 PROX_W         = 0.2
 PROX_M         = 60.0
-TTC_W          = 0.5                 # per second while heading at an obstacle with < TTC_S to impact
-TTC_S          = 10.0                #   (time to impact = distance along the central rays / speed)
+TTC_W          = 0.0                 # (old per-second form: it piled up in heavy clutter, and ending the flight
+                                     #   with a stall became the cheapest way out - replaced by TTC_K)
+TTC_K          = 10.0                # danger shaping, potential-based: reward = change in -TTC_K x danger,
+                                     #   danger = (1 - time to impact / TTC_S), 0 ... 1. Turning away pays up
+                                     #   to +TTC_K, heading in costs it; summed over a flight it is the same
+                                     #   however and whenever the flight ends, so ending early never pays
+TTC_S          = 20.0                #   (time to impact = distance along the central rays / speed); ~1.1 km,
+                                     #   early enough to turn gently around it
 SMOOTH_W       = 0.05                # per second, on the squared change of the bank / climb targets per step
-SUCCESS_R      = 10.0                # reaching the goal (within GOAL_RADIUS_M) ...
-PRECISION_R    = 10.0                #   ... plus up to this much more, the closer to its centre
+SUCCESS_R      = 10.0                # reaching the goal (entering the GOAL_RADIUS_M sphere) ...
+PRECISION_R    = 10.0                #   ... plus up to this much more, the closer it actually gets to the centre:
+PRECISION_POW  = 2.0                 #   PRECISION_R x (1 - closest approach / GOAL_RADIUS_M) ^ this
 APPROACH_M     = 5000.0              # within this distance of the goal, aiming is shaped: each step earns
 AIM_K          = 5.0                 #   AIM_K * (reduction in min(1, projected miss / MISS_SCALE_M)); over a
 MISS_SCALE_M   = 500.0               #   flight this sums to 0 ... +AIM_K, so it can never reward giving up
@@ -189,21 +262,35 @@ LR             = 3e-4
 GAMMA_RL       = 0.995
 GAE_LAMBDA     = 0.95
 CLIP           = 0.2
-ENT_COEF       = 0.001               # small: lets the noise shrink once the agent knows what to do
+ENT_COEF       = 0.01                # keeps exploring (0.001 let the bank noise collapse before it found
+                                     #   that turning away from obstacles pays)
 VF_COEF        = 0.5
 HIDDEN         = 256
 LOG_STD_INIT   = -0.5                # exploration noise on the actions (in [-1, 1] units)
-LOG_STD_MIN    = -2.5
+LOG_STD_MIN    = -1.6                # noise floor ~0.2 (in [-1, 1] action units): large enough to try evasive turns
+ENT_COEF_END   = 0.001               # flier: over each run's first STD_ANNEAL_UPDATES updates, the entropy bonus
+LOG_STD_MIN_END = -3.0               #   and the noise floor fall from ENT_COEF / LOG_STD_MIN to these (floor
+STD_ANNEAL_UPDATES = 300             #   0.2 -> 0.05): explore early in a round, settle late
+STD_LR_MULT_S  = 10.0                # strategist: its noise learns this much faster than the weights (it makes
+                                     #   few decisions -> few optimizer steps per update: at the base rate
+                                     #   the noise took ~300 updates to halve)
+ENT_COEF_S     = 0.001               # strategist: small, so its noise can shrink (a heading noise of 0.6 =
+LOG_STD_MIN_S  = -2.5                #   +-45 deg per decision held its training flights far below its
+                                     #   noise-free ones, and the curriculum judges the training flights)
 SEED           = 0
 
 # curriculum and stagnation
-KEEP_STAGES        = (0.0, 0.25, 0.5, 0.75, 1.0)   # obstacle thinning first: each flight keeps this random
-                                     #   share of its environment's obstacles (0 = open sky: learn to fly)
+KEEP_START         = 0.0             # obstacle share a new flier starts with (0 = open sky); a new strategist
+                                     #   starts at the share its flier reached, and climbs from there
 CURRICULUM_START   = 0.3             # least cluttered share of the training envs to start with
-CURRICULUM_STEP    = 0.1
-CURRICULUM_SUCCESS = 0.7             # NOISE-FREE success rate on the current stage
-                                     #   needed to move on
-CHECK_EVERY        = 10              # updates between noise-free check flights on the current stage
+CURRICULUM_SUCCESS = 0.7             # NOISE-FREE goal success above which the difficulty rises ...
+CURRICULUM_WP      = 0.8             # ... and for the flier, NOISE-FREE share of waypoints reached above which
+CURRICULUM_GAIN    = 1.0 / 3.0       # rise per check = this x the margin above the threshold (smaller of the
+                                     #   two for the flier), in obstacle share, then in share of environments
+CURRICULUM_MIN_FLIGHTS = 256         # finished flights at the current difficulty needed for each decision
+_OLD_KEEP_STAGES   = (0.0, 0.25, 0.5, 0.75, 1.0)   # (stage-based checkpoints: their obstacle shares)
+CHECK_EVERY        = 50              # updates between noise-free check flights (logging and stall detection
+                                     #   only; the curriculum uses the training flights)
 CHECK_FLIGHTS      = 256             # flights per check (the last 2 checks are averaged)
 PLATEAU_UPDATES    = 100             # updates without a better noise-free success rate = a plateau
 BOOST_BELOW        = 0.5             # at a plateau, boost exploration only if the noise has fallen below this
@@ -249,17 +336,18 @@ for _p in (str(PROJECT), str(_HERE)):
 
 VOLUME_MOUNT = "/data"
 CODE_DIRS = ("environment", "solvers", "aircraftmodel")
-_CFG_KEYS = ("dataset", "run", "n_envs", "seed")
+_CFG_KEYS = ("dataset", "run", "n_envs", "seed", "stage", "flier", "strategy", "init_from")
 N_RAYS = N_RAYS_FAN + 2 * N_RAYS_TILT
-OBS_VERSION = 8                      # 1: old lidar; 2: forward exact lidar; 3: + projected miss; 5: + difficulty field;
+OBS_VERSION = 11                      # 1: old lidar; 2: forward exact lidar; 3: + projected miss; 5: + difficulty field;
                                      # 6: + look-ahead manoeuvres; 7: learned penalty map; 8: maps it builds from
-                                     #   its own scans (short + far scan; local view + overview)
-OBS_DIM = 15 + N_RAYS
-LOCAL_NF = int(round((LOCAL_AHEAD_M[1] - LOCAL_AHEAD_M[0]) / SEEN_CELL_M))
-LOCAL_NS = int(round(2 * LOCAL_SIDE_M / SEEN_CELL_M))
-GMAP_SHAPE = (8, MAP_NX, MAP_NY)                     # overview: occupied x3, unknown x3, own position, goal
-LMAP_SHAPE = (2 * len(LOCAL_DZ_M), LOCAL_NF, LOCAL_NS)   # local view: occupied, unknown per altitude
-MAP_FLAT = math.prod(GMAP_SHAPE) + math.prod(LMAP_SHAPE)
+                                     #   its own scans (short + far scan; local view + overview); 10: + waypoint targets
+                                     #   (flier) and the strategist; 11: no map (flier: short scan only;
+                                     #   strategist: + the last FAR_KEEP far scans)
+OBS_DIM = 17 + N_RAYS                 # flier: state, target (6), miss at the target (2), rays, final flag, goal dist
+STRAT_DIM = 10 + N_RAYS + 6 * FAR_KEEP   # strategist: state relative to the goal, rays, where / when
+                                         #   each kept far scan was taken
+FAR_SHAPE = (FAR_KEEP, FAR_EL[0], FAR_AZ[0])   # the kept far scans as depth images (elevation x azimuth)
+MAP_FLAT = math.prod(FAR_SHAPE)        # image inputs per flight (the strategist's far scans; the flier has none)
 STATUS = {0: "flying", 1: "goal", 2: "crash", 3: "out_of_bounds", 4: "stall", 5: "timeout", 6: "missed"}
 
 
@@ -422,10 +510,6 @@ def build_world(cache, scale, bounds_lo, bounds_hi, vehicle_radius, clearance, d
          "lo": tt(np.asarray(bounds_lo) + vehicle_radius), "hi": tt(np.asarray(bounds_hi) - vehicle_radius),
          "clearance": float(clearance), "E": E}
     W["removed"] = clear_start_goal(W, CLEAR_RADIUS_M)          # departure / arrival areas kept clear
-    H = float(W["hi"][2] - W["lo"][2])
-    W["seen_shape"] = (int(round((SEEN_X_M[1] - SEEN_X_M[0]) / SEEN_CELL_M)),
-                       int(round((SEEN_Y_M[1] - SEEN_Y_M[0]) / SEEN_CELL_M)),
-                       max(3, int(math.ceil(H / SEEN_CELL_M))))
     return W
 
 
@@ -594,7 +678,7 @@ def cast_rays(pos, chi, env_ids, W, drop=None):
 
 class Sim:
     """N parallel flights. State per flight: x (6: px py pz V gamma chi, flight frame), controls
-    (T, n_v, n_h), time, environment id, and the map it has built from its scans."""
+    (T, n_v, n_h), time, environment id, target, and its last far scans."""
 
     def __init__(self, W, maps, bench_tf, af, n, device, seed=0):
         import torch
@@ -611,10 +695,11 @@ class Sim:
         self.prev_phi = torch.full((n,), -AIM_K, device=device)
         self.prev_act = torch.zeros((n, 3), device=device)
         self.rows = torch.arange(n, device=device)
-        # the map each flight builds: 0 unknown, 1 seen free, 2 seen occupied
-        self.SX, self.SY, self.SZ = W["seen_shape"]
-        self.C = self.SX * self.SY * self.SZ
-        self.seen = torch.zeros((n, self.C), dtype=torch.uint8, device=device)
+        # the last FAR_KEEP far scans: depth images (newest first), where / which way / when taken
+        self.far = torch.ones((n,) + FAR_SHAPE, device=device)
+        self.far_pos = torch.zeros((n, FAR_KEEP, 3), device=device)
+        self.far_dir = torch.zeros((n, FAR_KEEP), device=device)
+        self.far_t = torch.full((n, FAR_KEEP), -1e3, device=device)
         self.steps = torch.zeros(n, dtype=torch.long, device=device)            # steps since the flight started
         self.far_every = max(1, int(round(FAR_EVERY_S / DT)))
         self.crashes = torch.zeros(n, dtype=torch.long, device=device)           # (always 0: no rewinds)
@@ -630,56 +715,199 @@ class Sim:
         self.hist_r = None
         self.pool = None
         self.keep_frac = 1.0                                  # share of obstacles each new flight keeps
+        self.level = 0                                        # curriculum difficulty counter (bumps so far) ...
+        self.start_level = torch.zeros(n, dtype=torch.long, device=device)   # ... when each flight started
+        self.clock = 0                                        # simulator steps so far (all flights step together)
+        self.wp_around = torch.zeros(n, dtype=torch.bool, device=device)     # current waypoint must be flown around
+        self.start_step = torch.zeros(n, dtype=torch.long, device=device)    # clock when each flight started
         T = W["tok"].shape[1]
         self.drop = torch.zeros((n, T), dtype=torch.bool, device=device)
         self.rays = None
         # far-scan directions (relative to the line to the goal): azimuth x elevation
         az = torch.linspace(-math.radians(FAR_AZ[1]), math.radians(FAR_AZ[1]), FAR_AZ[0], device=device)
         el = torch.linspace(-math.radians(FAR_EL[1]), math.radians(FAR_EL[1]), FAR_EL[0], device=device)
-        A_, E_ = torch.meshgrid(az, el, indexing="ij")
+        E_, A_ = torch.meshgrid(el, az, indexing="ij")                             # image order: elevation x azimuth
         self.far_az, self.far_el = A_.reshape(-1), E_.reshape(-1)
         self.far_hits = None                                  # fly(record=True): what each far scan hit
-        # local view sample offsets (forward, side, up) in the heading frame
-        f = LOCAL_AHEAD_M[0] + SEEN_CELL_M * (torch.arange(LOCAL_NF, device=device) + 0.5)
-        sd = -LOCAL_SIDE_M + SEEN_CELL_M * (torch.arange(LOCAL_NS, device=device) + 0.5)
-        dz = torch.tensor(LOCAL_DZ_M, device=device)
-        Z_, F_, S_ = torch.meshgrid(dz, f, sd, indexing="ij")                     # (3, NF, NS)
-        self.loc_f, self.loc_s, self.loc_z = F_.reshape(-1), S_.reshape(-1), Z_.reshape(-1)
+        # targets: a waypoint or the goal. wp_mode: "goal" (always the goal), "random" (stage 1
+        # practice waypoints), "external" (stage 2: set by the strategist when need_wp)
+        self.wp_mode = "goal"
+        self.mix_random = WP_MIX_RANDOM                       # "mixed" mode: share of flights on random waypoints
+        self.ext = torch.zeros(n, dtype=torch.bool, device=device)   # this flight's waypoints come from the strategist
+        self.tgt = torch.zeros((n, 3), device=device)
+        self.tgt_final = torch.ones(n, dtype=torch.bool, device=device)
+        self.need_wp = torch.zeros(n, dtype=torch.bool, device=device)
+        self.since_wp = torch.zeros(n, dtype=torch.long, device=device)
+        self.prev_dt = torch.ones(n, device=device)
+        self.prev_danger = torch.zeros(n, device=device)            # danger potential at the previous step
+        self.r_goal = torch.zeros(n, device=device)          # the strategist's reward this step
+        self.wp_reached = torch.zeros(n, dtype=torch.long, device=device)
+        self.in_goal = torch.zeros(n, dtype=torch.bool, device=device)        # inside the arrival sphere (a success)
+        self.goal_best = torch.full((n,), 1e9, device=device)                 # closest approach to the goal so far
+        self.wp_missed = torch.zeros(n, dtype=torch.long, device=device)
+        self.strat_every = max(1, int(round(STRAT_EVERY_S / DT)))
+        self.wp_log = None                                    # fly(record=True): (flight, time, waypoint)
 
-    # ---- the map it builds ----
-    def cell_index(self, p, env_ids):
-        """Flat map cell of flight-frame points p (..., 3) of flights with environments env_ids
-        (broadcast over the leading dim); -1 outside the map."""
-        import torch
-        sh = (-1,) + (1,) * (p.dim() - 2)
-        zw = p[..., 2] + self.W["origin"][env_ids, 2].view(sh) - self.W["lo"][2]
-        ix = torch.floor((p[..., 0] - SEEN_X_M[0]) / SEEN_CELL_M).long()
-        iy = torch.floor((p[..., 1] - SEEN_Y_M[0]) / SEEN_CELL_M).long()
-        iz = torch.floor(zw / SEEN_CELL_M).long()
-        ok = (ix >= 0) & (ix < self.SX) & (iy >= 0) & (iy < self.SY) & (iz >= 0) & (iz < self.SZ)
-        return torch.where(ok, (ix * self.SY + iy) * self.SZ + iz, torch.full_like(ix, -1))
+    # ---- targets ----
+    def set_targets(self, rows, p, final, log_it=True):
+        self.tgt[rows] = p
+        self.tgt_final[rows] = final
+        self.need_wp[rows] = False
+        self.since_wp[rows] = 0
+        self.prev_dt[rows] = (p - self.x[rows, :3]).norm(dim=-1)
+        self.prev_phi[rows] = -AIM_K
+        if log_it and self.record and self.wp_log is not None:
+            for b in range(len(rows)):
+                self.wp_log.append((int(rows[b]), float(self.t[rows[b]]), p[b].cpu().numpy(), bool(final[b])))
 
-    def mark(self, rows, pos, dirs, dist, rng):
-        """Rays from pos (B, 3) along dirs (B, R, 3) that hit at dist (B, R) (= rng: nothing hit):
-        cells along each ray before the hit become free, the hit cell occupied."""
+    def z_band(self, rows):
+        """Flight-frame heights a waypoint may have (inside the box, WP_ALT_MARGIN_M from floor / ceiling)."""
+        oz = self.W["origin"][self.env[rows], 2]
+        return self.W["lo"][2] - oz + WP_ALT_MARGIN_M, self.W["hi"][2] - oz - WP_ALT_MARGIN_M
+
+    def sample_wp(self, rows):
+        """Stage 1: a random waypoint in free air ahead, or the goal when it is close. In "line" mode:
+        the next point WP_LINE_M along the straight line to the goal."""
         import torch
+        if len(rows) == 0:
+            return
+        if self.wp_mode == "line":
+            pos = self.x[rows, :3]
+            g = self.W["goal"][self.env[rows]]
+            rel = g - pos
+            dist = rel.norm(dim=-1)
+            final = dist <= WP_LINE_M * 1.2
+            wp = pos + rel * (WP_LINE_M / dist.clamp_min(1.0))[:, None]
+            self.set_targets(rows, torch.where(final[:, None], g, wp), final)
+            return
+        B, K = len(rows), WP_TRIES
+        pos = self.x[rows, :3]
+        g = self.W["goal"][self.env[rows]]
+        rel = g - pos
+        beta = torch.atan2(rel[:, 1], rel[:, 0])
+        rnd = torch.rand((3, B, K), generator=self.gen).to(self.dev)
+        th = beta[:, None] + (2 * rnd[0] - 1) * math.radians(WP_ANG_DEG)
+        d = WP_DIST_M[0] + rnd[1] * (WP_DIST_M[1] - WP_DIST_M[0])
+        lo, hi = self.z_band(rows)
+        z = torch.minimum(torch.maximum(pos[:, 2:3] + (2 * rnd[2] - 1) * WP_DZ_M, lo[:, None]), hi[:, None])
+        cand = torch.stack([pos[:, 0:1] + d * torch.cos(th), pos[:, 1:2] + d * torch.sin(th), z], -1)   # (B, K, 3)
+        cand[..., 0] = torch.minimum(cand[..., 0], g[:, 0:1] - 300.0)
+        # clearance of the waypoint AND of the straight path to it (a waypoint behind an obstacle it
+        # cannot get around teaches crashing, not waypoint flying) ...
+        M = WP_PATH_PTS
+        env_r, drop_r = self.env[rows], self.drop[rows]
+
+        def path_clr(a_, b_, t0):                                   # (B, K, 3) x2 -> (B, K, M) clearances
+            tt = torch.linspace(t0, 1.0, M, device=self.dev)
+            p_ = a_[:, :, None, :] + tt[None, None, :, None] * (b_ - a_)[:, :, None, :]
+            return sdf(p_.reshape(B, K * M, 3), env_r, self.W, drop=drop_r).reshape(B, K, M)
+        pos_k = pos[:, None, :].expand(B, K, 3)
+        cp = path_clr(pos_k, cand, 0.15)
+        clr = cp.amin(-1)                                                                              # (B, K)
+        dvec = cand - pos_k
+        u_ = dvec / dvec.norm(dim=-1, keepdim=True).clamp_min(1.0)
+        ro = path_clr(cand, cand + WP_RUNOUT_M * u_, 0.1).amin(-1)                                    # beyond it
+        ro_ok = ro > 0.5 * WP_CLEAR_M
+        ok = (clr > WP_CLEAR_M) & ro_ok
+        pick = torch.where(ok.any(-1), ok.float().argmax(-1), torch.minimum(clr, 2 * ro).argmax(-1))
+        # ... except some that must be flown around: clear at the waypoint, an obstacle across the
+        # straight path far enough ahead to turn, and a clear one-turn detour via a sideways offset
+        around = torch.rand(B, generator=self.gen).to(self.dev) < WP_AROUND_FRAC
+        if bool(around.any()):
+            d_k = (cand - pos_k).norm(dim=-1)                                                          # (B, K)
+            tt = torch.linspace(0.15, 1.0, M, device=self.dev)
+            hit = cp < 0.0
+            first = torch.where(hit, tt[None, None, :] * d_k[..., None], torch.full_like(cp, 1e9)).amin(-1)
+            blocked = hit.any(-1) & (first >= WP_AROUND_MIN_M) & (cp[..., -1] > WP_CLEAR_M) & ro_ok
+            perp = torch.stack([-dvec[..., 1], dvec[..., 0], torch.zeros_like(dvec[..., 0])], -1)
+            perp = perp / perp.norm(dim=-1, keepdim=True).clamp_min(1.0)
+            mid = pos_k + 0.5 * dvec
+            detour = torch.zeros_like(blocked)
+            for off in WP_AROUND_OFF_M:
+                for sgn in (1.0, -1.0):
+                    via = mid + sgn * off * perp
+                    c1 = path_clr(pos_k, via, 0.15).amin(-1)
+                    c2 = path_clr(via, cand, 0.0).amin(-1)
+                    detour |= (c1 > 0.5 * WP_CLEAR_M) & (c2 > 0.5 * WP_CLEAR_M)
+            good = blocked & detour
+            use = around & good.any(-1)
+            pick = torch.where(use, good.float().argmax(-1), pick)
+            self.wp_around[rows] = use
+        wp = cand[torch.arange(B, device=self.dev), pick]
+        final = rel.norm(dim=-1) < WP_DIST_M[1]
+        self.set_targets(rows, torch.where(final[:, None], g, wp), final)
+
+    def wp_from_action(self, rows, a):
+        """Stage 2: the strategist's action in [-1, 1]^3 -> the next waypoint (heading offset from the
+        line to the goal, distance, height change); beyond the goal = the goal."""
+        import torch
+        pos = self.x[rows, :3]
+        g = self.W["goal"][self.env[rows]]
+        rel = g - pos
+        th = torch.atan2(rel[:, 1], rel[:, 0]) + a[:, 0] * math.radians(STRAT_ANG_DEG)
+        d = WP_DIST_M[0] + (a[:, 1] + 1) / 2 * (WP_DIST_M[1] - WP_DIST_M[0])
+        lo, hi = self.z_band(rows)
+        z = torch.minimum(torch.maximum(pos[:, 2] + a[:, 2] * STRAT_DZ_M, lo), hi)
+        wp = torch.stack([pos[:, 0] + d * torch.cos(th), pos[:, 1] + d * torch.sin(th), z], -1)
+        final = rel.norm(dim=-1) <= d
+        self.set_targets(rows, torch.where(final[:, None], g, wp), final)
+
+    def decisions_due(self):
+        """Stage 2: flights that need a waypoint from the strategist now."""
+        return (self.need_wp | ((self.since_wp >= self.strat_every) & ~self.tgt_final)) & ~self.frozen & self.ext
+
+    def strat_obs(self, rows):
+        """The strategist's inputs for flights rows: state relative to the GOAL, a fresh short scan,
+        where / when its kept far scans were taken; and those far scans as images."""
+        import torch
+        a = self.af
+        x = self.x[rows]
         env = self.env[rows]
-        S = int(rng // SCAN_STEP_M)
-        sv = SCAN_STEP_M * (torch.arange(S, device=self.dev) + 0.5)
-        pts = pos[:, None, None] + dirs[:, :, None] * sv[None, None, :, None]            # (B, R, S, 3)
-        idx = self.cell_index(pts, env)
-        free = (sv[None, None] < dist[..., None] - 0.5 * SCAN_STEP_M) & (idx >= 0)
-        flat = (rows[:, None, None] * self.C + idx)[free]
-        sv_ = self.seen.view(-1)
-        sv_.scatter_reduce_(0, flat, torch.ones_like(flat, dtype=torch.uint8), reduce="amax")
-        hit = dist < rng * 0.999
-        hp = pos[:, None] + dirs * (dist + 1.0)[..., None]
-        hidx = self.cell_index(hp, env)
-        ok = hit & (hidx >= 0)
-        sv_[(rows[:, None] * self.C + hidx)[ok]] = 2
+        g = self.W["goal"][env]
+        rel = g - x[:, :3]
+        dh = rel[:, :2].norm(dim=-1).clamp_min(1.0)
+        bearing = torch.atan2(rel[:, 1], rel[:, 0]) - x[:, 5]
+        gmax = math.radians(a["GAMMA_MAX_DEG"])
+        zw = x[:, 2] + self.W["origin"][env, 2]
+        H = (self.W["hi"][2] - self.W["lo"][2])
+        rays = ray_hits(x[:, :3], ray_dirs(x[:, 5], self.dev), env, self.W, drop=self.drop[rows]) / RAY_RANGE_M
+        v = torch.stack([
+            (x[:, 3] - a["V_CRUISE"]) / (a["V_MAX"] - a["V_MIN"]), x[:, 4] / gmax,
+            torch.sin(bearing), torch.cos(bearing), torch.clamp(torch.atan2(rel[:, 2], dh) / gmax, -3, 3),
+            rel.norm(dim=-1) / self.d0[rows], (zw - self.W["lo"][2]) / H, (self.W["hi"][2] - zw) / H,
+            torch.sin(x[:, 5]), self.t[rows] / self.tref[rows]], -1)
+        return torch.cat([v, rays, self.far_inputs(rows)], -1), self.far[rows].reshape(len(rows), -1).half()
+
+    def far_inputs(self, rows):
+        """For each kept far scan: where it was taken relative to the aircraft now (heading frame,
+        km), the change of heading since (sin, cos of cone centre minus heading), its age (/ FAR_EVERY_S)."""
+        import torch
+        x = self.x[rows]
+        d = self.far_pos[rows] - x[:, None, :3]                                   # (B, K, 3)
+        c, s_ = torch.cos(x[:, 5:6]), torch.sin(x[:, 5:6])
+        rel = self.far_dir[rows] - x[:, 5:6]
+        age = ((self.t[rows, None] - self.far_t[rows]) / FAR_EVERY_S).clamp(max=10.0)
+        f = torch.stack([(c * d[..., 0] + s_ * d[..., 1]) / 1000.0, (-s_ * d[..., 0] + c * d[..., 1]) / 1000.0,
+                         d[..., 2] / 1000.0, torch.sin(rel), torch.cos(rel), age], -1)
+        return f.reshape(len(rows), -1)
+
+    @staticmethod
+    def closest_miss(x, p):
+        """How the current line of flight passes the point p: (lateral, vertical) offsets of the
+        closest approach in the heading frame (in MISS_SCALE_M, clipped +-3), the miss distance (m)
+        and how far ahead along the line it is (m; negative = behind)."""
+        import torch
+        ga, ch = x[:, 4], x[:, 5]
+        vhat = torch.stack([torch.cos(ga) * torch.cos(ch), torch.cos(ga) * torch.sin(ch), torch.sin(ga)], -1)
+        d = p - x[:, :3]
+        along = (d * vhat).sum(-1)
+        perp = d - torch.clamp(along, min=0.0)[:, None] * vhat
+        lat = (-torch.sin(ch) * perp[:, 0] + torch.cos(ch) * perp[:, 1]) / MISS_SCALE_M
+        vert = perp[:, 2] / MISS_SCALE_M
+        return lat.clamp(-3, 3), vert.clamp(-3, 3), perp.norm(dim=-1), along
 
     def far_scan(self, rows):
-        """The cone toward the goal for flights rows, added to their maps."""
+        """The cone toward the goal for flights rows: becomes the newest of their kept far scans."""
         import torch
         if len(rows) == 0:
             return
@@ -692,48 +920,22 @@ class Sim:
         el = el0[:, None] + self.far_el[None]
         dirs = torch.stack([torch.cos(el) * torch.cos(ang), torch.cos(el) * torch.sin(ang), torch.sin(el)], -1)
         env, drop = self.env[rows], self.drop[rows]
+        dists = []
         for r0 in range(0, dirs.shape[1], FAR_CHUNK):
             d_ = dirs[:, r0:r0 + FAR_CHUNK]
             dist = ray_hits(pos, d_, env, self.W, drop=drop, rng=FAR_RANGE_M)
-            self.mark(rows, pos, d_, dist, FAR_RANGE_M)
+            dists.append(dist)
             if self.record:
                 hit = dist < FAR_RANGE_M * 0.999
                 pts = pos[:, None] + d_ * dist[..., None]
                 for b in range(len(rows)):
                     self.far_hits.append((int(rows[b]), pts[b][hit[b]].cpu().numpy()))
-
-    def map_views(self):
-        """(N, MAP_FLAT) half: the overview of its map and the local view ahead, flattened."""
-        import torch
-        import torch.nn.functional as F
-        n, x = self.n, self.x
-        M = self.seen.view(n, self.SX, self.SY, self.SZ)
-        nx_ = int(round(MAP_NX * MAP_CELL / SEEN_CELL_M))
-        x0 = int(round((MAP_X0 - SEEN_X_M[0]) / SEEN_CELL_M))
-        y0 = int(round((MAP_Y0 - SEEN_Y_M[0]) / SEEN_CELL_M))
-        ny_ = int(round(MAP_NY * MAP_CELL / SEEN_CELL_M))
-        Mc = M[:, x0:x0 + nx_, y0:y0 + ny_]
-        st = torch.stack([(Mc == 2), (Mc == 0)], 1).float()                    # (n, 2, X, Y, Z)
-        pooled = F.adaptive_avg_pool3d(st, (MAP_NX, MAP_NY, 3))                 # (n, 2, MX, MY, 3)
-        g = torch.zeros((n,) + GMAP_SHAPE, device=self.dev)
-        g[:, :6] = pooled.permute(0, 1, 4, 2, 3).reshape(n, 6, MAP_NX, MAP_NY)
-        ar = self.rows
-        for ch, p in ((6, x[:, :3]), (7, self.W["goal"][self.env])):
-            ix = ((p[:, 0] - MAP_X0) / MAP_CELL).long().clamp(0, MAP_NX - 1)
-            iy = ((p[:, 1] - MAP_Y0) / MAP_CELL).long().clamp(0, MAP_NY - 1)
-            g[ar, ch, ix, iy] = 1.0
-        # local view ahead (turns with the heading)
-        c, s_ = torch.cos(x[:, 5:6]), torch.sin(x[:, 5:6])
-        px = x[:, 0:1] + c * self.loc_f[None] - s_ * self.loc_s[None]
-        py = x[:, 1:2] + s_ * self.loc_f[None] + c * self.loc_s[None]
-        pz = x[:, 2:3] + self.loc_z[None].expand(n, -1)
-        idx = self.cell_index(torch.stack([px, py, pz], -1), self.env)          # (n, K)
-        val = torch.gather(self.seen.long(), 1, idx.clamp(min=0))
-        val = torch.where(idx < 0, torch.full_like(val, 2), val)                # off the map = blocked
-        nl = len(LOCAL_DZ_M)
-        loc = torch.cat([(val == 2).float().view(n, nl, LOCAL_NF, LOCAL_NS),
-                         (val == 0).float().view(n, nl, LOCAL_NF, LOCAL_NS)], 1)
-        return torch.cat([g.reshape(n, -1), loc.reshape(n, -1)], 1).half()
+                    self.far_hits_t.append((int(rows[b]), float(self.t[rows[b]])))        # when (for videos)
+        img = (torch.cat(dists, 1) / FAR_RANGE_M).view(len(rows), 1, FAR_EL[0], FAR_AZ[0])
+        self.far[rows] = torch.cat([img, self.far[rows, :-1]], 1)                  # newest first
+        self.far_pos[rows] = torch.cat([pos[:, None], self.far_pos[rows, :-1]], 1)
+        self.far_dir[rows] = torch.cat([az0[:, None], self.far_dir[rows, :-1]], 1)
+        self.far_t[rows] = torch.cat([self.t[rows, None], self.far_t[rows, :-1]], 1)
 
     # ---- aircraft model ----
     def T_avail(self, V):
@@ -795,6 +997,7 @@ class Sim:
         self.d0[idx] = g.norm(dim=-1)
         self.tref[idx] = self.d0[idx] / a["V_CRUISE"]
         self.prev_d[idx] = self.d0[idx]
+        self.prev_danger[idx] = 0.0
         self.prev_phi[idx] = -AIM_K
         self.prev_act[idx] = 0.0
         x = torch.zeros((len(idx), 6), device=self.dev)
@@ -814,15 +1017,52 @@ class Sim:
             if self.hist_r is None:
                 self.hist_r = torch.zeros((self.n, self.L, N_RAYS), device=self.dev)
                 self.far_hits = []
+                self.far_hits_t = []
             self.hist_r[idx] = 0.0
-        if self.keep_frac >= 1.0:
+        # who sets this flight's waypoints: "external" the strategist, "random" practice waypoints,
+        # "mixed" the strategist for a (1 - mix_random) share of flights, practice waypoints for the rest
+        if self.wp_mode == "mixed":
+            ext = torch.rand(len(idx), generator=self.gen).to(self.dev) >= self.mix_random
+        else:
+            ext = torch.full((len(idx),), self.wp_mode == "external", dtype=torch.bool, device=self.dev)
+        kf = torch.full((len(idx),), float(self.keep_frac), device=self.dev)
+        if self.wp_mode == "mixed":                               # practice flights: lighter clutter
+            kf = torch.where(ext, kf, kf.clamp(max=PRACTICE_KEEP_MAX))
+        if bool((kf >= 1.0).all()):
             self.drop[idx] = False
         else:
             r = torch.rand((len(idx), self.drop.shape[1]), generator=self.gen).to(self.dev)
-            self.drop[idx] = r >= self.keep_frac
-        self.seen[idx] = 0                                       # empty map: everything unknown
+            self.drop[idx] = r >= kf[:, None]
+        self.far[idx] = 1.0                                      # no far scans yet (all "clear", age large)
+        self.far_pos[idx] = 0.0
+        self.far_dir[idx] = 0.0
+        self.far_t[idx] = -1e3
         self.steps[idx] = 0
+        self.start_level[idx] = self.level
+        self.start_step[idx] = self.clock
+        self.wp_around[idx] = False
         self.far_scan(idx)                                       # first look down the course at the start
+        self.wp_reached[idx] = 0
+        self.wp_missed[idx] = 0
+        self.in_goal[idx] = False
+        self.goal_best[idx] = 1e9
+        if self.record and self.wp_log is None:
+            self.wp_log = []
+        fin = torch.ones(len(idx), dtype=torch.bool, device=self.dev)
+        self.ext[idx] = ext
+        if self.wp_mode in ("random", "mixed", "external"):
+            ri, ei = idx[~ext], idx[ext]
+            if len(ri):
+                direct = torch.rand(len(ri), generator=self.gen).to(self.dev) < WP_GOAL_PROB
+                self.sample_wp(ri[~direct])
+                self.set_targets(ri[direct], g[~ext][direct], fin[:len(ri)][direct])   # some fly straight to the goal
+            if len(ei):                                          # the strategist decides before the first step
+                self.set_targets(ei, g[ext], ~fin[:len(ei)], log_it=False)
+                self.need_wp[ei] = True
+        elif self.wp_mode == "line":
+            self.sample_wp(idx)
+        else:
+            self.set_targets(idx, g, fin)
 
     def sample_envs(self, k):
         import torch
@@ -830,13 +1070,13 @@ class Sim:
         return self.pool[j].to(self.dev)
 
     def obs(self):
-        """-> (vector inputs (N, OBS_DIM), maps (N, MAP_FLAT) half). Runs the short scan (every
-        step) and the far scan (flights that are due), and adds both to the map first."""
+        """-> (flier inputs (N, OBS_DIM), empty image (N, 0)). Runs the short scan (every step) and
+        the far scan (flights that are due)."""
         import torch
         a = self.af
         x, u = self.x, self.u
         g = self.W["goal"][self.env]
-        rel = g - x[:, :3]
+        rel = self.tgt - x[:, :3]                                 # the target: waypoint or goal
         dh = rel[:, :2].norm(dim=-1).clamp_min(1.0)
         bearing = torch.atan2(rel[:, 1], rel[:, 0]) - x[:, 5]
         gmax = math.radians(a["GAMMA_MAX_DEG"])
@@ -845,28 +1085,19 @@ class Sim:
         dirs = ray_dirs(x[:, 5], self.dev)
         dist = ray_hits(x[:, :3], dirs, self.env, self.W, drop=self.drop)        # short scan
         self.rays = dist / RAY_RANGE_M
-        live = torch.nonzero(~self.frozen).squeeze(1)
-        if len(live):
-            self.mark(live, x[live, :3], dirs[live], dist[live], RAY_RANGE_M)
         due = torch.nonzero((self.steps % self.far_every == 0) & (self.steps > 0) & ~self.frozen).squeeze(1)
         self.far_scan(due)
         v = torch.stack([
             (x[:, 3] - a["V_CRUISE"]) / (a["V_MAX"] - a["V_MIN"]), x[:, 4] / gmax,
             torch.sin(bearing), torch.cos(bearing),
             torch.clamp(torch.atan2(rel[:, 2], dh) / gmax, -3, 3),
-            rel.norm(dim=-1) / self.d0, (zw - self.W["lo"][2]) / H, (self.W["hi"][2] - zw) / H,
+            (rel.norm(dim=-1) / WP_NORM_M).clamp(0, 4), (zw - self.W["lo"][2]) / H, (self.W["hi"][2] - zw) / H,
             u[:, 0] / self.T_avail(x[:, 3]), u[:, 1] - 1.0, u[:, 2] / math.tan(math.radians(a["BANK_MAX_DEG"])),
             torch.sin(x[:, 5]), self.t / self.tref], -1)
-        lat, vert, _ = self.projected_miss(x, g)
-        obs = torch.cat([v, torch.stack([lat, vert], -1).clamp(-3, 3), self.rays], -1)
-        return obs, self.map_views()
-
-    def known_share(self):
-        """Share of the map's cells inside the flight corridor (|y| < 1.5 km) that are no longer unknown."""
-        M = self.seen.view(self.n, self.SX, self.SY, self.SZ)
-        y0 = int(round((-1500.0 - SEEN_Y_M[0]) / SEEN_CELL_M))
-        y1 = int(round((1500.0 - SEEN_Y_M[0]) / SEEN_CELL_M))
-        return (M[:, :, y0:y1] > 0).float().mean((1, 2, 3))
+        lat, vert, _, _ = self.closest_miss(x, self.tgt)
+        extra = torch.stack([self.tgt_final.float(), (g - x[:, :3]).norm(dim=-1) / self.d0], -1)
+        obs = torch.cat([v, torch.stack([lat, vert], -1), self.rays, extra], -1)
+        return obs, torch.zeros((self.n, 0), dtype=torch.half, device=self.dev)
 
     def smooth_term(self, act):
         """attitude mode: squared change of the climb / bank targets since the last step;
@@ -881,7 +1112,7 @@ class Sim:
         """Potential-based: phi = -AIM_K * min(1, miss / scale) inside APPROACH_M, -AIM_K outside;
         the reward is phi(new) - phi(old), so a whole flight earns phi(end) + AIM_K in [0, AIM_K]."""
         import torch
-        phi = torch.where(dist < APPROACH_M, -AIM_K * torch.clamp(miss / MISS_SCALE_M, max=1.0),
+        phi = torch.where((dist < APPROACH_M) & self.tgt_final, -AIM_K * torch.clamp(miss / MISS_SCALE_M, max=1.0),
                           torch.full_like(dist, -AIM_K))
         r = phi - self.prev_phi
         self.prev_phi = phi
@@ -910,6 +1141,7 @@ class Sim:
         """-> reward (N,), done (N,) bool, status (N,) int, controls used (N, 3)."""
         import torch
         a = self.af
+        self.clock += 1
         self.u_before = self.u
         u = self.apply_envelope(act)
         x = self.x
@@ -925,7 +1157,7 @@ class Sim:
         h_min = h.min(1).values
         g = self.W["goal"][self.env]
         dist = (g - xn[:, :3]).norm(dim=-1)
-        # closest approach to the goal during this step (segment x -> xn), for arrival and precision
+        # closest approach to the goal during this step (segment x -> xn): arrival
         seg = xn[:, :3] - x[:, :3]
         s_ = (((g - x[:, :3]) * seg).sum(-1) / (seg * seg).sum(-1).clamp_min(1e-6)).clamp(0, 1)
         d_close = (x[:, :3] + s_[:, None] * seg - g).norm(dim=-1)
@@ -935,17 +1167,23 @@ class Sim:
             else torch.full_like(dist, RAY_RANGE_M)
         ttc = ahead / x[:, 3].clamp_min(1.0)
         _, _, miss_now = self.projected_miss(xn, g)
-        r = PROG_W * (self.prev_d - dist) / self.d0 - TIME_W * DT / self.tref \
+        # the target (waypoint or goal): progress, closest approach this step, passed?
+        tg = self.tgt
+        dt_ = (tg - xn[:, :3]).norm(dim=-1)
+        st_ = (((tg - x[:, :3]) * seg).sum(-1) / (seg * seg).sum(-1).clamp_min(1e-6)).clamp(0, 1)
+        dct = (x[:, :3] + st_[:, None] * seg - tg).norm(dim=-1)
+        _, _, _, along_t = self.closest_miss(xn, tg)
+        wp_hit = ~self.tgt_final & (dct < WP_RADIUS_M)
+        wp_pass = ~self.tgt_final & ~wp_hit & (along_t < 0) & (dt_ < WP_PASS_M)
+        r_goal = STRAT_PROG_W * (self.prev_d - dist) / self.d0 - STRAT_TIME_W * DT / self.tref
+        r = PROG_W * (self.prev_dt - dt_) / self.d0 - TIME_W * DT / self.tref \
+            + WP_R * wp_hit.float() - WP_MISS_R * wp_pass.float() * torch.clamp(dt_ / MISS_SCALE_M, max=1.0) \
             - PROX_W * DT * torch.clamp(1 - h_min / PROX_M, 0, 1) \
             - TTC_W * DT * torch.clamp(1 - ttc / TTC_S, 0, 1) \
             - SMOOTH_W * DT * self.smooth_term(act) \
             + self.aim_shaping(dist, miss_now)
         self.prev_d = dist
-        # precision: how close the current line of flight passes to the goal centre
-        Vn, gan, chn = xn[:, 3], xn[:, 4], xn[:, 5]
-        vhat = torch.stack([torch.cos(gan) * torch.cos(chn), torch.cos(gan) * torch.sin(chn), torch.sin(gan)], -1)
-        dv = g - xn[:, :3]
-        perp = (dv - (dv * vhat).sum(-1, keepdim=True) * vhat).norm(dim=-1)
+        self.prev_dt = dt_
         crossed = (x[:, 0] < g[:, 0]) & (xn[:, 0] >= g[:, 0])                # passed the goal plane this step
         miss_at_plane = torch.hypot(xn[:, 1] - g[:, 1], xn[:, 2] - g[:, 2])
         status = torch.zeros(self.n, dtype=torch.long, device=self.dev)
@@ -958,11 +1196,27 @@ class Sim:
         status = torch.where(h_min < 0, torch.full_like(status, 2), status)
         status = torch.where(out, torch.full_like(status, 3), status)
         status = torch.where(crossed & (status == 0), torch.full_like(status, 6), status)
-        status = torch.where(d_close < GOAL_RADIUS_M, torch.full_like(status, 1), status)
-        r = r + torch.where(status == 1, SUCCESS_R + PRECISION_R * torch.clamp(1 - perp / GOAL_RADIUS_M, 0, 1), 0.0) \
+        # arrival: entering the sphere makes it a success; it keeps flying until past its closest point
+        # (or out of the sphere), then ends; anything that ends it meanwhile still ends it as a success
+        newly = (d_close < GOAL_RADIUS_M) & ~self.in_goal & ~self.frozen & self.tgt_final   # only once the goal
+                                                                                            #   is the target
+        self.in_goal = self.in_goal | newly
+        self.goal_best = torch.where(self.in_goal, torch.minimum(self.goal_best, d_close), self.goal_best)
+        past = (dist > self.goal_best + 1.0) | (dist > GOAL_RADIUS_M)
+        goal_end = self.in_goal & (past | ((status >= 2) & (status <= 5)))     # (crossing the goal plane inside is fine)
+        status = torch.where(goal_end, torch.full_like(status, 1), torch.where(self.in_goal, torch.zeros_like(status), status))
+        prec = torch.clamp(1 - self.goal_best / GOAL_RADIUS_M, 0, 1) ** PRECISION_POW
+        term = torch.where(status == 1, SUCCESS_R + PRECISION_R * prec, 0.0) \
             - torch.where((status >= 2) & (status <= 4), CRASH_R, 0.0) \
             - torch.where(status == 5, TIMEOUT_R, 0.0) \
-            - torch.where(status == 6, MISS_R * torch.clamp(miss_at_plane / MISS_SCALE_M, max=1.0), 0.0)
+            - torch.where(status == 6, MISS_R * torch.where(self.tgt_final, torch.clamp(miss_at_plane / MISS_SCALE_M, max=1.0),
+                                                            torch.ones_like(miss_at_plane)), 0.0)   # skipped its waypoints: full penalty
+        r = r + term
+        r_goal = r_goal + term
+        # potential-based danger shaping: gamma * phi(now) - phi(before); at the end phi = 0
+        phi = -TTC_K * torch.clamp(1 - ttc / TTC_S, 0, 1)
+        r = r + torch.where(status != 0, -self.prev_danger, GAMMA_RL * phi - self.prev_danger)
+        self.prev_danger = torch.where(self.frozen, self.prev_danger, phi)
         self.last_close = d_close
         # ---- finished flights (fly) stay put ----
         live = ~self.frozen
@@ -976,6 +1230,19 @@ class Sim:
         self.ended = status > 0
         self.last_status = status
         self.steps = self.steps + live.long()
+        self.r_goal = torch.where(live, r_goal, torch.zeros_like(r_goal))
+        self.since_wp = self.since_wp + live.long()
+        nxt = (wp_hit | wp_pass) & live & (status == 0)                     # next target
+        self.wp_reached = self.wp_reached + (wp_hit & live).long()
+        self.wp_missed = self.wp_missed + (wp_pass & live).long()
+        if bool(nxt.any()):
+            rows_ = torch.nonzero(nxt).squeeze(1)
+            if self.wp_mode == "line":
+                self.sample_wp(rows_)
+            else:
+                ex = self.ext[rows_]
+                self.sample_wp(rows_[~ex])                                  # practice waypoints
+                self.need_wp[rows_[ex]] = True                              # the strategist picks the next
         ia = torch.nonzero(live).squeeze(1)                                 # record the path
         if len(ia):
             L_ = self.hist_len[ia].clamp(max=self.L - 1)
@@ -988,12 +1255,15 @@ class Sim:
         return r, status > 0, status, u
 
 
-def make_agent(device):
+def make_agent(device, obs_dim=None, bias=(0.4, 0.0, 0.0), img_shape=None):
+    """Actor-critic. The flier: make_agent(device) (OBS_DIM inputs, no images, starts near trim thrust,
+    no turn). The strategist: make_agent(device, STRAT_DIM, (0, 0, 0), FAR_SHAPE) (its far scans go
+    through a small CNN; starts with: toward the goal, 2 km, level)."""
     import torch
     import torch.nn as nn
-    n_g = math.prod(GMAP_SHAPE)
+    obs_dim = OBS_DIM if obs_dim is None else obs_dim
 
-    class MapEnc(nn.Module):
+    class ImgEnc(nn.Module):
         def __init__(self, ch, nx, ny):
             super().__init__()
             self.net = nn.Sequential(nn.Conv2d(ch, 16, 3, padding=1), nn.ReLU(),
@@ -1003,76 +1273,99 @@ def make_agent(device):
         def forward(self, m):
             return self.fc(self.net(m))
 
+    n_img = 128 if img_shape else 0
+
     def trunk(out):
-        return nn.Sequential(nn.Linear(OBS_DIM + 256, HIDDEN), nn.Tanh(), nn.Linear(HIDDEN, HIDDEN), nn.Tanh(),
+        return nn.Sequential(nn.Linear(obs_dim + n_img, HIDDEN), nn.Tanh(), nn.Linear(HIDDEN, HIDDEN), nn.Tanh(),
                              nn.Linear(HIDDEN, out))
 
     class Agent(nn.Module):
         def __init__(self):
             super().__init__()
-            self.map_a, self.map_c = MapEnc(*GMAP_SHAPE), MapEnc(*GMAP_SHAPE)      # overview of its map
-            self.loc_a, self.loc_c = MapEnc(*LMAP_SHAPE), MapEnc(*LMAP_SHAPE)      # local view ahead
+            if img_shape:
+                self.img_a, self.img_c = ImgEnc(*img_shape), ImgEnc(*img_shape)
             self.actor, self.critic = trunk(3), trunk(1)
             nn.init.zeros_(self.actor[-1].weight)
             with torch.no_grad():
-                self.actor[-1].bias.copy_(torch.tensor([0.4, 0.0, 0.0]))   # start near trim thrust, no turn
+                self.actor[-1].bias.copy_(torch.tensor(list(bias)))
             self.log_std = nn.Parameter(torch.full((3,), LOG_STD_INIT))
 
-        @staticmethod
-        def split(m):
-            m = m.float()
-            return m[:, :n_g].view(-1, *GMAP_SHAPE), m[:, n_g:].view(-1, *LMAP_SHAPE)
-
         def mean(self, o, m):
-            g, l_ = self.split(m)
-            return self.actor(torch.cat([o, self.map_a(g), self.loc_a(l_)], -1))
+            if img_shape:
+                o = torch.cat([o, self.img_a(m.float().view(-1, *img_shape))], -1)
+            return self.actor(o)
 
         def value(self, o, m):
-            g, l_ = self.split(m)
-            return self.critic(torch.cat([o, self.map_c(g), self.loc_c(l_)], -1)).squeeze(-1)
+            if img_shape:
+                o = torch.cat([o, self.img_c(m.float().view(-1, *img_shape))], -1)
+            return self.critic(o).squeeze(-1)
 
     return Agent().to(device)
 
 
+def strategy_decide(sim, strat, rows, explore):
+    """The strategist picks the next waypoint for flights rows -> (inputs, far-scan images, action, log-prob, value)."""
+    import torch
+    o, m = sim.strat_obs(rows)
+    mu = strat.mean(o, m)
+    if explore:
+        std = strat.log_std.clamp(min=LOG_STD_MIN_S).exp()
+        a_ = mu + std * torch.randn_like(mu)
+        lp = (-0.5 * ((a_ - mu) / std) ** 2 - torch.log(std) - 0.5 * math.log(2 * math.pi)).sum(-1)
+        v = strat.value(o, m)
+    else:
+        a_, lp, v = mu, None, None
+    sim.wp_from_action(rows, a_.clamp(-1, 1))
+    return o, m, a_, lp, v
+
+
 def fly(agent, sim_template, W, maps, bench_tf, af, env_rows, device, max_mult=TIME_LIMIT_X, keep_frac=1.0, seed=0,
-        record=False):
-    """Fly the agent's mean action on the given environments; its path (flight frame). record=True
-    also returns the lidar along the path and the map it built."""
+        record=False, strategy=None, wp_mode=None):
+    """Fly the agent (the flier) with its mean action on the given environments; its path (flight
+    frame). Targets: strategy given -> the strategist's waypoints (mean action); else wp_mode
+    ("goal": straight to the goal, "line": waypoints along the line to it, "random": practice waypoints). record=True also returns
+    the lidar along the path, what the far scans hit and the waypoints."""
     import numpy as np
     import torch
     n = len(env_rows)
     sim = Sim(W, None, bench_tf, af, n, device, seed=seed)
     sim.keep_frac = keep_frac
     sim.record = record
+    sim.wp_mode = wp_mode or ("external" if strategy is not None else "goal")
     ids = torch.as_tensor(np.asarray(env_rows), device=device)
     sim.reset(torch.arange(n, device=device), ids)
     status = torch.zeros(n, dtype=torch.long, device=device)
-    known = torch.zeros(n, device=device)
     steps = int(max_mult * sim.tref.max().item() / DT) + 2
     with torch.no_grad():
         for _ in range(steps):
+            if strategy is not None:
+                due = torch.nonzero(sim.decisions_due()).squeeze(1)
+                if len(due):
+                    strategy_decide(sim, strategy, due, explore=False)
             o, m = sim.obs()
             act = agent.mean(o, m).clamp(-1, 1)
             sim.step(act)
             status = torch.where(sim.ended, sim.last_status, status)
-            if bool(sim.ended.any()):
-                known = torch.where(sim.ended, sim.known_share(), known)
             sim.frozen = sim.frozen | sim.ended
             if sim.frozen.all():
                 break
-    known = torch.where(sim.frozen, known, sim.known_share())
     L = sim.hist_len.cpu().numpy()
     X, U, Tm = sim.hist_x.cpu().numpy(), sim.hist_u.cpu().numpy(), sim.hist_t.cpu().numpy()
     out = []
+    gl = W["goal"][ids].cpu().numpy()
     for i in range(n):
         k = int(L[i])
+        if int(status[i]) == 1:                                   # cut at the closest point to the goal
+            k = int(np.argmin(np.linalg.norm(X[i, :k, :3] - gl[i], axis=1))) + 1
         f = {"status": STATUS[int(status[i])], "t": Tm[i, :k], "X": X[i, :k], "U": U[i, :k],
-             "crashes": 0, "known": float(known[i])}
+             "crashes": 0,
+             "wp_reached": int(sim.wp_reached[i]), "wp_missed": int(sim.wp_missed[i])}
         if record:
             f["rays"] = sim.hist_r[i, :k].cpu().numpy() * RAY_RANGE_M
-            f["seen"] = sim.seen[i].view(sim.SX, sim.SY, sim.SZ).cpu()
             f["far_hits"] = [h for j, h in sim.far_hits if j == i]
+            f["far_hits_t"] = [t_ for j, t_ in sim.far_hits_t if j == i]
             f["drop"] = sim.drop[i].cpu()
+            f["waypoints"] = [(t_, p_, fin_) for j, t_, p_, fin_ in (sim.wp_log or []) if j == i]
         out.append(f)
     return out
 
@@ -1159,8 +1452,73 @@ def run(cfg, submit_solves, commit):
         test_rows = test_rows[:cfg["test_envs"]]
 
     import copy
-    agent = make_agent(device)                                 # the master copy (optimizer, evaluation, saving)
-    opt = torch.optim.Adam(agent.parameters(), lr=LR, eps=1e-5)
+    stage = cfg.get("stage") or "flier"
+    cur = {"ent": ENT_COEF_S, "ls_min": LOG_STD_MIN_S} if stage == "strategy" else \
+        {"ent": ENT_COEF, "ls_min": LOG_STD_MIN}                 # current exploration settings (flier: annealed)
+
+    def set_exploration():
+        if stage == "strategy":
+            return
+        f_ = min(1.0, max(0.0, (st["update"] - st.setdefault("anneal_start", st["update"])) / max(STD_ANNEAL_UPDATES, 1)))
+        cur["ent"] = ENT_COEF * (ENT_COEF_END / ENT_COEF) ** f_
+        cur["ls_min"] = LOG_STD_MIN + f_ * (LOG_STD_MIN_END - LOG_STD_MIN)
+
+    def load_run(rname, want_stage, what, prefer="best.pt"):
+        """Another run's checkpoint from the Volume (prefer, else the other one), checked for this code.
+        Frozen partners and --init-from use checkpoint.pt (the latest weights: the solver evaluations fly
+        all obstacles, which says little about a partner still partway up the curriculum)
+        (the latest weights)."""
+        rdir = V / "rl_pilot" / rname
+        other = "checkpoint.pt" if prefer == "best.pt" else "best.pt"
+        rpath = rdir / prefer if (rdir / prefer).exists() else rdir / other
+        if not rpath.exists():
+            raise SystemExit(f"{what} run not found on the Volume: {rdir}")
+        ck_ = torch.load(rpath, map_location=device, weights_only=False)
+        ver = (ck_.get("settings") or {}).get("OBS_VERSION")
+        if ver != OBS_VERSION:
+            raise SystemExit(f"{what} run {rname} has OBS_VERSION {ver}, this code needs {OBS_VERSION}")
+        rst = ((ck_.get("cfg") or {}).get("stage") or "flier")
+        if rst != want_stage:
+            raise SystemExit(f"{what} run {rname} is a '{rst}' run, a '{want_stage}' run is needed")
+        if rpath.name == "best.pt" and (rdir / "checkpoint.pt").exists():   # curriculum position: the latest
+            ck_["state"] = torch.load(rdir / "checkpoint.pt", map_location="cpu", weights_only=False).get("state", ck_.get("state"))
+        return ck_, rpath.name
+
+    def frozen(net):
+        net.eval()
+        for p_ in net.parameters():
+            p_.requires_grad_(False)
+        return [net] + [copy.deepcopy(net).to(d) for d in devices[1:]]
+
+    flier, flier_reps, strat_reps, fkeep = None, [], [], 1.0
+    if stage == "strategy":                                    # the frozen flier
+        if not cfg.get("flier"):
+            raise SystemExit("stage 'strategy' needs --flier NAME (a trained flier run)")
+        fck, fname_ = load_run(cfg["flier"], "flier", "flier", prefer="checkpoint.pt")
+        flier = make_agent(device)
+        flier.load_state_dict(fck["agent"])
+        flier_reps = frozen(flier)
+        fst_ = fck.get("state") or {}                            # start where the flier got to
+        fkeep = fst_.get("keep", _OLD_KEEP_STAGES[fst_["keep_idx"]] if "keep_idx" in fst_ else 1.0)
+        log(f"strategist training; flier = {cfg['flier']} ({fname_}, frozen; it reached {fkeep:.0%} of the obstacles)")
+        agent = make_agent(device, STRAT_DIM, (0.0, 0.0, 0.0), FAR_SHAPE)   # the strategist (trained)
+    else:
+        agent = make_agent(device)                             # the master copy (optimizer, evaluation, saving)
+        if cfg.get("strategy"):                                # a frozen strategist sets most waypoints
+            sck, sname_ = load_run(cfg["strategy"], "strategy", "strategist", prefer="checkpoint.pt")
+            strat = make_agent(device, STRAT_DIM, (0.0, 0.0, 0.0), FAR_SHAPE)
+            strat.load_state_dict(sck["agent"])
+            strat_reps = frozen(strat)
+            log(f"flier training on strategist {cfg['strategy']}'s waypoints ({sname_}, frozen; "
+                f"{WP_MIX_RANDOM:.0%} of flights on random practice waypoints)")
+        else:
+            log("flier training on random practice waypoints")
+    if stage == "strategy":                                    # the noise on its own, faster learning rate
+        rest_ = [p_ for n_, p_ in agent.named_parameters() if n_ != "log_std"]
+        opt = torch.optim.Adam([{"params": rest_}, {"params": [agent.log_std], "lr": LR * STD_LR_MULT_S}],
+                               lr=LR, eps=1e-5)
+    else:
+        opt = torch.optim.Adam(agent.parameters(), lr=LR, eps=1e-5)
     reps = [agent] + [copy.deepcopy(agent).to(d) for d in devices[1:]]
 
     def sync_replicas():
@@ -1168,15 +1526,45 @@ def run(cfg, submit_solves, commit):
             for r in reps[1:]:
                 for pr, p0 in zip(r.parameters(), agent.parameters()):
                     pr.copy_(p0)
-    st = {"update": 0, "keep_idx": 0, "pool_frac": CURRICULUM_START, "best_success": -1.0, "since_best": 0, "boosts": 0,
+    st = {"update": 0, "keep": fkeep if stage == "strategy" else KEEP_START, "pool_frac": CURRICULUM_START, "best_success": -1.0, "since_best": 0, "boosts": 0,
           "best_eval": -float("inf"), "best_eval_update": -1, "evals_done": [], "stopped": False}
     ck = root / "checkpoint.pt"
+    if cfg.get("init_from") and not ck.exists():               # a new round: start from another run
+        ick, iname_ = load_run(cfg["init_from"], stage, "init-from", prefer="checkpoint.pt")
+        agent.load_state_dict(ick["agent"])
+        ist = ick.get("state") or {}
+        st["keep"] = ist.get("keep", _OLD_KEEP_STAGES[ist["keep_idx"]] if "keep_idx" in ist else st["keep"])
+        st["pool_frac"] = ist.get("pool_frac", st["pool_frac"])
+        log(f"starting from {cfg['init_from']} ({iname_}): its weights and curriculum position "
+            f"(keep {st['keep']:.0%} of the obstacles, {st['pool_frac']:.0%} of the envs)")
+    if cfg.get("start_std") is not None and not ck.exists():   # --start-std: a new run explores this much at first
+        with torch.no_grad():
+            agent.log_std.fill_(math.log(max(1e-3, float(cfg["start_std"]))))
+        log(f"exploration noise set to {float(cfg['start_std']):.2f} (--start-std)")
+    if cfg.get("start_keep") is not None and not ck.exists():  # --start-keep: a new run starts at this share
+        st["keep"] = min(1.0, max(0.0, float(cfg["start_keep"])))
+        log(f"starting at {st['keep']:.0%} of the obstacles (--start-keep)")
+    if cfg.get("start_pool") is not None and not ck.exists():  # --start-pool: ... and this share of the envs
+        st["pool_frac"] = min(1.0, max(0.0, float(cfg["start_pool"])))
+        log(f"starting with the least cluttered {st['pool_frac']:.0%} of the training environments (--start-pool)")
+    if cfg.get("fixed_difficulty"):
+        log("difficulty held fixed (--fixed-difficulty): the curriculum will not change it")
+    if cfg.get("crash_penalty") is not None:                   # --crash-penalty: post-training on safety
+        globals()["CRASH_R"] = float(cfg["crash_penalty"])
+        log(f"crash / out-of-bounds / stall penalty {CRASH_R:g} (default 25; a missed goal costs up to "
+            f"{MISS_R:g}, a timeout {TIMEOUT_R:g}) (--crash-penalty)")
     if ck.exists():
         d = torch.load(ck, map_location=device, weights_only=False)
-        agent.load_state_dict(d["agent"]); opt.load_state_dict(d["opt"]); st = d["state"]
+        agent.load_state_dict(d["agent"]); st = d["state"]
+        try:
+            opt.load_state_dict(d["opt"])
+        except ValueError:                                     # (saved before the separate noise rate)
+            log("optimizer state from the checkpoint does not match this version: starting it fresh")
         log(f"resumed at update {st['update']}")
         if "det_hist" not in st:                       # checkpoint from before the noise-free checks
             st.update(best_success=-1.0, since_best=0, boosts=0, det_hist=[])
+        if "keep" not in st:                           # checkpoint from the stage-based curriculum
+            st["keep"] = _OLD_KEEP_STAGES[st.get("keep_idx", len(_OLD_KEEP_STAGES) - 1)]
     sync_replicas()
     log("starting PPO" + (f" (resuming at update {st['update']})" if st["update"] else ""))
 
@@ -1195,12 +1583,32 @@ def run(cfg, submit_solves, commit):
             sm.keep_frac = frac
 
     set_pool()
-    set_keep(KEEP_STAGES[st.get("keep_idx", len(KEEP_STAGES) - 1)])
+    set_keep(st["keep"])
     for sm in sims:
+        sm.level = st.setdefault("level", 0)
+    for sm in sims:
+        sm.wp_mode = "external" if stage == "strategy" else ("mixed" if strat_reps else "random")
         sm.reset(torch.arange(sm.n, device=sm.dev), sm.sample_envs(sm.n))
+    # stage 2: each flight's open strategist decision (kept across updates until it is complete)
+    pend = [{"has": torch.zeros(sm.n, dtype=torch.bool, device=sm.dev),
+             "O": torch.zeros((sm.n, STRAT_DIM), device=sm.dev), "M": torch.zeros((sm.n, MAP_FLAT), dtype=torch.half, device=sm.dev),
+             "A": torch.zeros((sm.n, 3), device=sm.dev), "LP": torch.zeros(sm.n, device=sm.dev),
+             "V": torch.zeros(sm.n, device=sm.dev), "R": torch.zeros(sm.n, device=sm.dev)} for sm in sims]
+    order = [0]
+
+    def fly_eval(rows, keep_frac=1.0, seed=0, check=False):
+        """Noise-free flights: a flier on practice waypoints (checks) or on waypoints along the straight
+        line to the goal (solver evaluations); a flier round with a strategist, or a strategist run -> the
+        pair (the strategist's waypoints)."""
+        if stage == "strategy":
+            return fly(flier, None, W, maps, bench_tf, af, rows, device, keep_frac=keep_frac, seed=seed, strategy=agent)
+        if strat_reps:                                          # flier round with a strategist: fly the pair
+            return fly(agent, None, W, maps, bench_tf, af, rows, device, keep_frac=keep_frac, seed=seed,
+                       strategy=strat_reps[0])
+        return fly(agent, None, W, maps, bench_tf, af, rows, device, keep_frac=keep_frac, seed=seed,
+                   wp_mode="random" if check else "line")
     ep_ret = [torch.zeros(sm.n, device=sm.dev) for sm in sims]
     recent = []                                                    # finished flights (status, return, tf ratio, crashes)
-    recent_known = []                                             # share of the corridor its map knew at the end
 
     def save(best=False):
         buf = io.BytesIO()
@@ -1251,14 +1659,13 @@ def run(cfg, submit_solves, commit):
                 "solve_time_median_s": med([r["solve_time"] for r in ok])}
 
     def start_eval(update, rows, split, kinds, tag):
-        flights = fly(agent, None, W, maps, bench_tf, af, rows, device)
+        flights = fly_eval(rows)
         fstat = {k: 100 * sum(f["status"] == k for f in flights) / len(flights) for k in STATUS.values() if k != "flying"}
-        fstat["map_known"] = 100 * float(np.mean([f["known"] for f in flights]))
         items = items_from_flights(rows, flights, split, kinds)
         pending.append({"update": update, "split": split, "tag": tag, "fstat": fstat,
                         "snapshot": {k: v.detach().cpu().clone() for k, v in agent.state_dict().items()},
                         "get": submit_solves(items), "t0": time.time()})
-        log(f"{tag} update {update}: flew {len(rows)} {split} envs (map known {fstat['map_known']:.0f}%; goal {fstat['goal']:.0f}%, crash "
+        log(f"{tag} update {update}: flew {len(rows)} {split} envs (goal {fstat['goal']:.0f}%, crash "
             f"{fstat['crash']:.0f}%, stall {fstat['stall']:.0f}%, timeout {fstat['timeout']:.0f}%); "
             f"{len(items)} solves sent")
 
@@ -1296,24 +1703,22 @@ def run(cfg, submit_solves, commit):
                 write_bytes_atomic(root / "test_summary.json", json.dumps(rows, indent=1).encode())
             commit()
 
-    # ---- PPO ----
-    t_start = time.time()
-    while st["update"] < cfg["updates"] and not st["stopped"]:
-        k = st["update"]
-        if k % cfg["eval_every"] == 0 and k not in st["evals_done"]:
-            start_eval(k, val_rows, "val", ["pilot", "straight"] if k == 0 else ["pilot"], "VAL")
-            st["evals_done"].append(k)
-        poll_evals()
-        t0 = time.time()
+    def flier_rollout():
+        """Stage 1: ROLLOUT steps of every flight with exploration noise -> per-GPU PPO data."""
+        nonlocal recent
         buf = [{"O": [], "M": [], "A": [], "LP": [], "R": [], "D": [], "V": []} for _ in range(G)]
         with torch.no_grad():
             for _ in range(ROLLOUT):
                 outs = []
                 for g, sm in enumerate(sims):                 # launch every GPU's work first (runs in parallel)
                     ag = reps[g]
+                    if strat_reps:                            # the frozen strategist's waypoints, where due
+                        due = torch.nonzero(sm.decisions_due()).squeeze(1)
+                        if len(due):
+                            strategy_decide(sm, strat_reps[g], due, explore=False)
                     o, m = sm.obs()
                     mu = ag.mean(o, m)
-                    std = ag.log_std.clamp(min=LOG_STD_MIN).exp()
+                    std = ag.log_std.clamp(min=cur['ls_min']).exp()
                     a_ = mu + std * torch.randn_like(mu)
                     lp = (-0.5 * ((a_ - mu) / std) ** 2 - torch.log(std) - 0.5 * math.log(2 * math.pi)).sum(-1)
                     v = ag.value(o, m)
@@ -1325,15 +1730,14 @@ def run(cfg, submit_solves, commit):
                     outs.append((done, status))
                 for g, sm in enumerate(sims):                 # then the bookkeeping that waits for results
                     done, status = outs[g]
-                    idx = torch.nonzero(sm.ended).squeeze(1)      # flights that finished (crashes with budget
-                                                                  #   left were rewound and keep flying)
+                    idx = torch.nonzero(sm.ended).squeeze(1)      # flights that finished
                     if len(idx):
                         stt, tt = status[idx].cpu().numpy(), sm.t[idx].cpu().numpy()
                         ee, rr = sm.env[idx].cpu().numpy(), ep_ret[g][idx].cpu().numpy()
-                        kn = sm.known_share()[idx].cpu().numpy()
-                        for s_, t_, e_, r_, k_ in zip(stt, tt, ee, rr, kn):
-                            recent.append((int(s_), float(r_), float(t_ / bench_tf[int(e_)]) if s_ == 1 else float("nan"), 0))
-                            recent_known.append(float(k_))
+                        wps = list(zip(sm.wp_reached[idx].tolist(), sm.wp_missed[idx].tolist()))
+                        lvs, sts, exs = sm.start_level[idx].tolist(), sm.start_step[idx].tolist(), sm.ext[idx].tolist()
+                        for ii, (s_, t_, e_, r_) in enumerate(zip(stt, tt, ee, rr)):
+                            recent.append((int(s_), float(r_), float(t_ / bench_tf[int(e_)]) if s_ == 1 else float("nan"), wps[ii], lvs[ii], sts[ii], exs[ii]))
                         ep_ret[g][idx] = 0.0
                         sm.reset(idx, sm.sample_envs(len(idx)))
             data = []
@@ -1352,21 +1756,98 @@ def run(cfg, submit_solves, commit):
                 data.append({"O": torch.cat(bg["O"]), "M": torch.cat(bg["M"]), "A": torch.cat(bg["A"]),
                              "LP": torch.cat(bg["LP"]), "adv": adv.reshape(-1), "ret": (adv + Vv).reshape(-1)})
             del buf
+        return data
+
+    def strategy_rollout():
+        """Stage 2: STRAT_ROLLOUT simulator steps; the frozen flier flies every step, the strategist
+        decides when a flight needs a waypoint. One PPO sample per completed decision: its reward is
+        everything the flight earned until the next decision (or the end of the flight)."""
+        nonlocal recent
+        recs = [[] for _ in range(G)]
+
+        def close(g, rows, done, nv):
+            pg = pend[g]
+            recs[g].append({"fid": rows.clone(), "ord": torch.full_like(rows, order[0]), "O": pg["O"][rows].clone(),
+                            "M": pg["M"][rows].clone(), "A": pg["A"][rows].clone(), "LP": pg["LP"][rows].clone(),
+                            "V": pg["V"][rows].clone(), "R": pg["R"][rows].clone(),
+                            "D": torch.full_like(pg["R"][rows], float(done)), "NV": nv})
+            order[0] += 1
+            pg["has"][rows] = False
+
+        with torch.no_grad():
+            for _ in range(STRAT_ROLLOUT):
+                for g, sm in enumerate(sims):
+                    pg = pend[g]
+                    due = torch.nonzero(sm.decisions_due()).squeeze(1)
+                    if len(due):
+                        o_s, m_s, a_s, lp_s, v_s = strategy_decide(sm, reps[g], due, explore=True)
+                        prev = pg["has"][due]
+                        if bool(prev.any()):
+                            close(g, due[prev], False, v_s[prev])
+                        pg["O"][due], pg["M"][due], pg["A"][due] = o_s, m_s, a_s
+                        pg["LP"][due], pg["V"][due], pg["R"][due] = lp_s, v_s, 0.0
+                        pg["has"][due] = True
+                    o, m = sm.obs()
+                    act = flier_reps[g].mean(o, m).clamp(-1, 1)
+                    sm.step(act)
+                    pg["R"] += sm.r_goal * pg["has"].float()
+                    ep_ret[g] += sm.r_goal
+                    idx = torch.nonzero(sm.ended).squeeze(1)
+                    if len(idx):
+                        h_ = pg["has"][idx]
+                        if bool(h_.any()):
+                            close(g, idx[h_], True, torch.zeros(int(h_.sum()), device=sm.dev))
+                        stt, tt = sm.last_status[idx].cpu().numpy(), sm.t[idx].cpu().numpy()
+                        ee, rr = sm.env[idx].cpu().numpy(), ep_ret[g][idx].cpu().numpy()
+                        wps = list(zip(sm.wp_reached[idx].tolist(), sm.wp_missed[idx].tolist()))
+                        lvs, sts, exs = sm.start_level[idx].tolist(), sm.start_step[idx].tolist(), sm.ext[idx].tolist()
+                        for ii, (s_, t_, e_, r_) in enumerate(zip(stt, tt, ee, rr)):
+                            recent.append((int(s_), float(r_), float(t_ / bench_tf[int(e_)]) if s_ == 1 else float("nan"), wps[ii], lvs[ii], sts[ii], exs[ii]))
+                        ep_ret[g][idx] = 0.0
+                        sm.reset(idx, sm.sample_envs(len(idx)))
+        data = []
+        for g in range(G):
+            rg = recs[g]
+            if not rg:
+                data.append(None)
+                continue
+            cat = {k_: torch.cat([r_[k_] for r_ in rg]) for k_ in rg[0]}
+            fid, od = cat["fid"].cpu().numpy(), cat["ord"].cpu().numpy()
+            R, D, Vv, NV = (cat[k_].cpu().numpy() for k_ in ("R", "D", "V", "NV"))
+            srt = np.lexsort((od, fid))
+            adv = np.zeros(len(R), np.float32)
+            gae, last_f = 0.0, -1
+            for i in srt[::-1]:                                   # backward in time, per flight
+                if fid[i] != last_f:
+                    gae, last_f = 0.0, fid[i]
+                delta = R[i] + GAMMA_S * NV[i] * (1 - D[i]) - Vv[i]
+                gae = delta + GAMMA_S * LAMBDA_S * (1 - D[i]) * gae
+                adv[i] = gae
+            adv_t = torch.as_tensor(adv, device=cat["R"].device)
+            data.append({"O": cat["O"], "M": cat["M"], "A": cat["A"], "LP": cat["LP"],
+                         "adv": adv_t, "ret": adv_t + cat["V"]})
+        return data if any(d_ is not None for d_ in data) else None      # None entries: GPUs with no
+                                                                            #   completed decision yet
+
+    def ppo_update(data):
+        """Clipped PPO epochs over per-GPU data (O, M, A, LP, adv, ret) -> loss info."""
         info = {"pl": 0.0, "vl": 0.0, "ent": 0.0, "clip": 0.0}
         nb = 0
         mb_g = max(1, MINIBATCH // G)                       # each GPU's share of a minibatch
-        n_mb = max(1, math.ceil(len(data[0]["adv"]) / mb_g))
+        n_mb = max(1, math.ceil(max(len(dg["adv"]) for dg in data if dg is not None) / mb_g))
         for _ in range(EPOCHS):
-            perms = [torch.randperm(len(dg["adv"]), device=dg["adv"].device) for dg in data]
+            perms = [None if dg is None else torch.randperm(len(dg["adv"]), device=dg["adv"].device) for dg in data]
             for j in range(n_mb):
                 losses = []
-                for g in range(G):                            # forward/backward on every GPU (in parallel)
+                for g in range(len(data)):                    # forward/backward on every GPU (in parallel)
                     ag, dg = reps[g], data[g]
+                    if dg is None:
+                        continue
                     bidx = perms[g][j * mb_g:(j + 1) * mb_g]
                     if len(bidx) == 0:
                         continue
                     mu = ag.mean(dg["O"][bidx], dg["M"][bidx])
-                    ls = ag.log_std.clamp(min=LOG_STD_MIN)
+                    ls = ag.log_std.clamp(min=cur['ls_min'])
                     std = ls.exp()
                     lp = (-0.5 * ((dg["A"][bidx] - mu) / std) ** 2 - ls - 0.5 * math.log(2 * math.pi)).sum(-1)
                     ratio = (lp - dg["LP"][bidx]).exp()
@@ -1375,7 +1856,7 @@ def run(cfg, submit_solves, commit):
                     pl = -torch.min(ratio * ab, ratio.clamp(1 - CLIP, 1 + CLIP) * ab).mean()
                     vl = ((ag.value(dg["O"][bidx], dg["M"][bidx]) - dg["ret"][bidx]) ** 2).mean()
                     ent = (ls + 0.5 * (1 + math.log(2 * math.pi))).sum()
-                    loss = pl + VF_COEF * vl - ENT_COEF * ent
+                    loss = pl + VF_COEF * vl - cur['ent'] * ent
                     ag.zero_grad(set_to_none=True)
                     loss.backward()
                     losses.append((pl.detach(), vl.detach(), ent.detach(), ((ratio - 1).abs() > CLIP).float().mean().detach()))
@@ -1388,89 +1869,148 @@ def run(cfg, submit_solves, commit):
                 torch.nn.utils.clip_grad_norm_(agent.parameters(), 0.5)
                 opt.step()
                 with torch.no_grad():
-                    agent.log_std.clamp_(min=LOG_STD_MIN)
+                    agent.log_std.clamp_(min=cur['ls_min'])
                 sync_replicas()
+                if not losses:
+                    continue
                 for pl_, vl_, en_, cl_ in losses:
                     info["pl"] += pl_.item() / len(losses); info["vl"] += vl_.item() / len(losses)
                     info["ent"] += en_.item() / len(losses); info["clip"] += cl_.item() / len(losses)
                 nb += 1
-        del data
         info = {kk: vv / max(nb, 1) for kk, vv in info.items()}
+        return info
+
+    # ---- PPO ----
+    t_start = time.time()
+    while st["update"] < cfg["updates"] and not st["stopped"]:
+        set_exploration()
+        k = st["update"]
+        if k % cfg["eval_every"] == 0 and k not in st["evals_done"]:
+            start_eval(k, val_rows, "val", ["pilot", "straight"] if k == 0 else ["pilot"], "VAL")
+            st["evals_done"].append(k)
+        poll_evals()
+        t0 = time.time()
+        if stage == "strategy":
+            data = strategy_rollout()
+        else:
+            data = flier_rollout()
+        info = ppo_update(data) if data else {"pl": 0.0, "vl": 0.0, "ent": 0.0, "clip": 0.0}
 
         # ---- stats, curriculum, stagnation ----
-        recent = recent[-4000:]
-        recent_known = recent_known[-4000:]
+        recent = recent[-8000:]
         last = recent[-max(1, min(len(recent), 2 * n)):]
         cnt = lambda c: 100 * sum(e_[0] == c for e_ in last) / max(len(last), 1)
         succ = cnt(1)
         ratios = [e_[2] for e_ in last if e_[0] == 1]
+        wr = sum(e_[3][0] for e_ in last)
+        wm = sum(e_[3][1] for e_ in last)
+        wp_pct = 100 * wr / max(wr + wm, 1)
+        steps_done = (STRAT_ROLLOUT if stage == "strategy" else ROLLOUT) * n
         st["update"] = k + 1
         action = ""
-        det = ""
-        at_end = st["keep_idx"] >= len(KEEP_STAGES) - 1 and st["pool_frac"] >= 1.0
+        det = det_wp = det_crash = ""
+        at_end = (st["keep"] >= 1.0 - 1e-9 and st["pool_frac"] >= 1.0 - 1e-9) or bool(cfg.get("fixed_difficulty"))
+        # curriculum: the training flights that started at the current difficulty
+        # Judged on the FIRST CURRICULUM_MIN_FLIGHTS flights to start at it, once all of them have
+        # finished: taking whichever finish first would over-count crashes (they end early).
+        mixed_ = stage != "strategy" and bool(strat_reps)       # flier round with a strategist: judge its flights
+        win = [e_ for e_ in recent if len(e_) > 6 and e_[4] == st["level"] and (e_[6] or not mixed_)]
+        fly_now = torch.cat([sm.start_step[(sm.start_level == st["level"]) & (sm.ext | (not mixed_))].cpu()
+                             for sm in sims]).tolist()
+        stamps = sorted([e_[5] for e_ in win] + fly_now)
+        ready = len(stamps) >= CURRICULUM_MIN_FLIGHTS
+        if ready:
+            cut = stamps[CURRICULUM_MIN_FLIGHTS - 1]
+            ready = not any(s_ <= cut for s_ in fly_now)            # the whole cohort has finished
+            win = [e_ for e_ in win if e_[5] <= cut]
+        if ready:
+            sw = sum(e_[0] == 1 for e_ in win) / len(win)
+            wrw, wmw = sum(e_[3][0] for e_ in win), sum(e_[3][1] for e_ in win)
+            margin = sw - CURRICULUM_SUCCESS
+            if stage != "strategy" and not mixed_:
+                margin = min(margin, wrw / max(wrw + wmw, 1) - CURRICULUM_WP)
+            bump = CURRICULUM_GAIN * margin
+            if cfg.get("stop_at_keep") is not None and st["keep"] >= cfg["stop_at_keep"] - 1e-9 and bump > 0:
+                st["stopped"] = True                             # mastered the requested obstacle share
+                action = f"stop: above the thresholds at {st['keep']:.0%} of the obstacles (--stop-at-keep)"
+            elif bump > 0 and not at_end:
+                if st["keep"] < 1.0 - 1e-9:
+                    st["keep"] = min(1.0, st["keep"] + bump)
+                    set_keep(st["keep"])
+                    action = f"curriculum +{100 * bump:.1f} -> keep {st['keep']:.0%} of the obstacles"
+                else:
+                    st["pool_frac"] = min(1.0, st["pool_frac"] + bump)
+                    set_pool()
+                    action = f"curriculum +{100 * bump:.1f} -> {st['pool_frac']:.0%} of training envs"
+                st["best_success"], st["since_best"] = -1.0, 0
+            elif not at_end:
+                action = "curriculum hold"
+            # either way, a fresh group of flights is judged next (a hold must not keep re-reading the
+            # same group: the agent keeps improving)
+            st["level"] += 1
+            for sm in sims:
+                sm.level = st["level"]
+            st["cohort"] = (round(100 * sw, 1), round(100 * wrw / max(wrw + wmw, 1), 1))
         if (k + 1) % CHECK_EVERY == 0:
-            # noise-free check flights on the current stage
+            # noise-free check flights at the current difficulty (log, stall detection)
             pool = sims[0].pool.numpy()
             rows_c = np.random.default_rng(cfg["seed"] * 7919 + k).choice(pool, CHECK_FLIGHTS, replace=len(pool) < CHECK_FLIGHTS)
-            fl = fly(agent, None, W, maps, bench_tf, af, rows_c, device, keep_frac=KEEP_STAGES[st["keep_idx"]], seed=k)
+            fl = fly_eval(rows_c, keep_frac=st["keep"], seed=k, check=True)
             det = 100 * sum(f["status"] == "goal" for f in fl) / len(fl)
-
+            wr_, wm_ = sum(f["wp_reached"] for f in fl), sum(f["wp_missed"] for f in fl)
+            det_wp = 100 * wr_ / max(wr_ + wm_, 1)
+            det_crash = 100 * sum(f["status"] in ("crash", "out_of_bounds", "stall") for f in fl) / len(fl)
+            if cfg.get("stop_crash_pct") is not None and det_crash <= cfg["stop_crash_pct"] + 1e-9:
+                st["stopped"] = True                                 # --stop-crash: target reached
+                action = (f"stop: noise-free crash rate {det_crash:.1f}% <= {cfg['stop_crash_pct']:g}% "
+                          f"({len(fl)} check flights, --stop-crash)")
             hist = st.setdefault("det_hist", [])
             hist.append(det)
             score2 = float(np.mean(hist[-2:]))
-            if len(hist) >= 2 and score2 >= 100 * CURRICULUM_SUCCESS and not at_end:
-                if st["keep_idx"] < len(KEEP_STAGES) - 1:
-                    st["keep_idx"] += 1
-                    set_keep(KEEP_STAGES[st["keep_idx"]])
-                    action = f"curriculum -> keep {KEEP_STAGES[st['keep_idx']]:.0%} of the obstacles"
-                else:
-                    st["pool_frac"] = min(1.0, st["pool_frac"] + CURRICULUM_STEP)
-                    set_pool()
-                    action = f"curriculum -> {st['pool_frac']:.0%} of training envs"
-                st["best_success"], st["since_best"] = -1.0, 0
-                hist.clear()
-                recent.clear()
-                recent_known.clear()
+            # watch for a stall (each bump resets the count)
+            if st["best_success"] < 0 or score2 > st["best_success"] + 1.0:
+                st["best_success"], st["since_best"] = score2, 0
+                if not at_end:
+                    st["boosts"] = 0
             else:
-                if st["best_success"] < 0 or score2 > st["best_success"] + 1.0:
-                    st["best_success"], st["since_best"] = score2, 0
-                    if not at_end:
-                        st["boosts"] = 0
+                st["since_best"] += CHECK_EVERY
+            if st["since_best"] >= PLATEAU_UPDATES:
+                st["since_best"] = 0
+                st["boosts"] += 1
+                std_now = agent.log_std.clamp(min=cur['ls_min']).exp()
+                if bool((std_now < BOOST_BELOW * math.exp(LOG_STD_INIT)).all()):
+                    with torch.no_grad():
+                        agent.log_std.copy_(torch.maximum(agent.log_std, torch.full_like(agent.log_std, LOG_STD_INIT)))
+                    sync_replicas()
+                    action = f"plateau {st['boosts']}: exploration boosted"
                 else:
-                    st["since_best"] += CHECK_EVERY
-                if st["since_best"] >= PLATEAU_UPDATES:
-                    st["since_best"] = 0
-                    st["boosts"] += 1
-                    std_now = agent.log_std.clamp(min=LOG_STD_MIN).exp()
-                    if bool((std_now < BOOST_BELOW * math.exp(LOG_STD_INIT)).all()):
-                        with torch.no_grad():
-                            agent.log_std.copy_(torch.maximum(agent.log_std, torch.full_like(agent.log_std, LOG_STD_INIT)))
-                        sync_replicas()
-                        action = f"plateau {st['boosts']}: exploration boosted"
-                    else:
-                        action = f"plateau {st['boosts']}: noise not collapsed, no boost"
-                    if at_end and st["boosts"] >= MAX_BOOSTS:
-                        st["stopped"] = True
-                        action += "; stop: no further improvement"
-        sig = agent.log_std.clamp(min=LOG_STD_MIN).exp().tolist()
-        row = {"update": k + 1, "obstacles_kept": KEEP_STAGES[st["keep_idx"]], "pool_frac": round(st["pool_frac"], 2),
+                    action = f"plateau {st['boosts']}: noise not collapsed, no boost"
+                if at_end and st["boosts"] >= MAX_BOOSTS:
+                    st["stopped"] = True
+                    action += "; stop: no further improvement"
+        sig = agent.log_std.clamp(min=cur['ls_min']).exp().tolist()
+        row = {"update": k + 1, "obstacles_kept": round(st["keep"], 3), "pool_frac": round(st["pool_frac"], 3),
                "episodes": len(last),
                "goal_pct": round(succ, 2), "goal_noise_free_pct": round(det, 2) if det != "" else "",
+               "waypoints_noise_free_pct": round(det_wp, 2) if det_wp != "" else "",
+               "crash_noise_free_pct": round(det_crash, 2) if det != "" else "",
                "crash_pct": round(cnt(2) + cnt(3), 2), "stall_pct": round(cnt(4), 2),
                "timeout_pct": round(cnt(5), 2), "missed_pct": round(cnt(6), 2),
-               "map_known_pct": round(100 * float(np.mean(recent_known[-len(last):])), 2) if recent_known else "", "return_mean": round(float(np.mean([e_[1] for e_ in last])) if last else 0.0, 3),
+               "waypoints_reached_pct": round(wp_pct, 2), "return_mean": round(float(np.mean([e_[1] for e_ in last])) if last else 0.0, 3),
                "tf_vs_benchmark": round(float(np.median(ratios)), 4) if ratios else "",
                "std_T": round(sig[0], 3), "std_nv": round(sig[1], 3), "std_nh": round(sig[2], 3),
                **{kk: round(vv, 4) for kk, vv in info.items()},
-               "steps_per_s": round(ROLLOUT * n / (time.time() - t0)), "action": action,
+               "steps_per_s": round(steps_done / (time.time() - t0)), "action": action,
                "elapsed_min": round((time.time() - t_start) / 60, 1)}
         append_csv(root / "updates.csv", [row])
-        if (k + 1) % 5 == 0 or action:
-            log(f"update {k + 1:5d}: goal {succ:5.1f}%" + (f" (noise-free {det:5.1f}%)" if det != "" else "")
+        quiet = action.startswith("curriculum +") or action == "curriculum hold"
+        if (k + 1) % 5 == 0 or (action and not quiet) or (k + 1) % CHECK_EVERY == 0:
+            log(f"update {k + 1:5d}: goal {succ:5.1f}%" + (f" (noise-free {det:5.1f}%, crash {det_crash:4.1f}%, waypoints {det_wp:5.1f}%)" if det != "" else "")
                 + f"  crash {row['crash_pct']:5.1f}%  stall {row['stall_pct']:4.1f}%  "
-                f"timeout {row['timeout_pct']:4.1f}%  missed {row['missed_pct']:4.1f}%  map known {row['map_known_pct'] or 0:4.1f}%  tf/bench {row['tf_vs_benchmark'] or float('nan'):.3f}  "
-                f"obst {KEEP_STAGES[st['keep_idx']]:.0%} pool {st['pool_frac']:.0%}  std {sig[1]:.2f}  [{row['steps_per_s']} steps/s] {action}")
-        if (k + 1) % CHECKPOINT_EVERY == 0 or action:
+                f"timeout {row['timeout_pct']:4.1f}%  missed {row['missed_pct']:4.1f}%  waypoints reached {wp_pct:4.1f}%  tf/bench {row['tf_vs_benchmark'] or float('nan'):.3f}  "
+                f"obst {st['keep']:.0%} pool {st['pool_frac']:.0%}  std {sig[1]:.2f} (floor {math.exp(cur['ls_min']):.2f})  [{row['steps_per_s']} steps/s] {'' if quiet else action}"
+                + (f"  (last judged group: goal {st['cohort'][0]:.0f}%, waypoints {st['cohort'][1]:.0f}%)" if st.get("cohort") else ""))
+        if (k + 1) % CHECKPOINT_EVERY == 0 or (action and action != "curriculum hold"):
             save()
 
     save()
@@ -1597,13 +2137,31 @@ if modal is not None:
     @app.local_entrypoint()
     def main(dataset: str = DATASET, run: str = RUN, name: str = NAME, updates: int = UPDATES,
              n_envs: int = N_ENVS, eval_every: int = EVAL_EVERY, val_envs: int = VAL_ENVS,
-             test_envs: int = -1, seed: int = SEED, download_only: bool = False):
+             test_envs: int = -1, seed: int = SEED, download_only: bool = False, stage: str = STAGE,
+             flier: str = "", strategy: str = "", init_from: str = "", stop_at_keep: float = -1.0,
+             start_keep: float = -1.0, start_std: float = -1.0, start_pool: float = -1.0,
+             fixed_difficulty: bool = False, stop_crash: float = -1.0, crash_penalty: float = -1.0):
         if not download_only:
             _ensure_inputs(dataset, run)
             cfg = {"dataset": dataset, "run": run, "name": name, "updates": updates, "n_envs": n_envs,
                    "eval_every": eval_every, "val_envs": val_envs,
-                   "test_envs": None if test_envs < 0 else test_envs, "seed": seed, "n_gpus": N_GPUS}
-            print(f"Starting pilot training '{name}' on Modal: {json.dumps(cfg)}", flush=True)
+                   "test_envs": None if test_envs < 0 else test_envs, "seed": seed, "n_gpus": N_GPUS,
+                   "stage": stage, "flier": flier or None, "strategy": strategy or None,
+                   "init_from": init_from or None, "stop_at_keep": None if stop_at_keep < 0 else stop_at_keep,
+                   "start_keep": None if start_keep < 0 else start_keep,
+                   "start_std": None if start_std < 0 else start_std,
+                   "start_pool": None if start_pool < 0 else start_pool,
+                   "fixed_difficulty": fixed_difficulty, "stop_crash_pct": None if stop_crash < 0 else stop_crash,
+                   "crash_penalty": None if crash_penalty < 0 else crash_penalty}
+            if stage == "flier" and flier:
+                raise SystemExit("--flier is for strategist runs; a flier run takes --strategy NAME (optional)")
+            if stage == "strategy" and (strategy or stop_at_keep >= 0):
+                raise SystemExit("--strategy and --stop-at-keep are for flier runs")
+            if stage not in ("flier", "strategy"):
+                raise SystemExit("--stage must be 'flier' or 'strategy'")
+            if stage == "strategy" and not flier:
+                raise SystemExit("--stage strategy needs --flier NAME (the stage-1 run to fly the waypoints)")
+            print(f"Starting {stage} training '{name}' on Modal: {json.dumps(cfg)}", flush=True)
             train_remote.remote(cfg)
         _download(name)
 

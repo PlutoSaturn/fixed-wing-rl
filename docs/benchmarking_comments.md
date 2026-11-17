@@ -23,6 +23,8 @@ over the course of the flight and whether the path is flyable. How much less oft
 A feasible solution must be close to the initial guess, within a certain region for the solver to find it. How is this region different between solvers (similar to first idea), but 
 also what can this difference be attributed to.
 
+Can you increase this range by decreasing the slack penalty attributed to running into obstacles, so the solver has more freedom to roam?
+
 ______________________
 
 Modal Setup -> run "pip install modal" and it should guide you

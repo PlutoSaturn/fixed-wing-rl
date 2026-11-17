@@ -8,6 +8,8 @@ describing the state derivates at each node using a continuous polynomial that c
 Instead of the Pseudospectral method of tracking state derivative and integrating, the shooting method tracks state. Nodes positions are related to eachother using RK4 which estimates
 state 2 from state 1 and the derivative of state 1. These RK4 equations are the method of enforcing dynamics, and are performed between nodes.
 
+______________________
+
 Some ideas for benchmarking:
 
 How does the ability of the two systems to converge off an intiail guess differ? Is birkhoff more likely to come to a feasible solution if both are initialized off the exact same path?
@@ -20,3 +22,7 @@ over the course of the flight and whether the path is flyable. How much less oft
 
 A feasible solution must be close to the initial guess, within a certain region for the solver to find it. How is this region different between solvers (similar to first idea), but 
 also what can this difference be attributed to.
+
+______________________
+
+Modal Setup -> run "pip install modal" and it should guide you

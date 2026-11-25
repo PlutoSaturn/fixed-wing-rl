@@ -136,18 +136,37 @@ BATCH_SPEED_PROFILE  = "plan"            # tracking setup v4: the plan's airspee
                                          #   (a TECS step at each speed command). Commanding the speeds 4 or 8 s
                                          #   early (speed_lead_test.py) was worse than no lead.
 GUIDED_LOOKAHEAD_M   = 150.0             # --follower guided: the L1 aim point this far along the curved plan
-GUIDED_ALT_LEAD_M    = 30.0              #   altitude commanded this far ahead along the plan (guided_test round 3:
-                                         #   dense_1 max altitude error 8.6 m with none, 5.8 m with 30 m, 7.7 m with 60 m)
-GUIDED_PARAM_OVERRIDES = {"TECS_CLMB_MAX": 6.5}  # GUIDED batches only (tracking setup v5): 5.0 m/s capped the
+GUIDED_ALT_LEAD_M    = 10.0              #   altitude commanded this far ahead along the plan (guided_test round 3:
+                                         #   dense_1 max altitude error 8.6 m with none, 5.8 m with 30 m, 7.7 m with 60 m;
+                                         #   round 7, with v6's faster commands: max vertical 4.4 m with 30 m, 3.2 with 20,
+                                         #   2.8 with 15, 2.3 with 10 -> 10 m = tracking setup v7. v6 used 30 m)
+GUIDED_PARAM_OVERRIDES = {"TECS_CLMB_MAX": 6.5,  # GUIDED batches only (tracking setup v5): 5.0 m/s capped the
                                          #   plan's 6 deg climbs at 47-57 m/s (5.1-5.9 m/s); with 6.5, dense_2's
-                                         #   end climb 13.1 -> 5.0 m (batch tier3_guided_clmb). Not in
-                                         #   c172_sitl.parm, so the waypoint setups (v1-v4) keep their results
+                                         #   end climb 13.1 -> 5.0 m (batch tier3_guided_clmb).
+                          "THR_SLEWRATE": 30,   # tracking setup v6: throttle may move at most 30 %/s (default
+                                         #   100). guided_test round 5, dense_1: throttle travel 1108 -> 691 %/min,
+                                         #   jitter 4.0 -> 2.9 %, tracking unchanged.
+                          "TECS_SINK_MAX": 8.0}  # tracking setup v8 (c172_sitl.parm: 6 = the planner's 6 deg descent
+                                         #   at top speed in still air). A tailwind raises the sink rate the plan's
+                                         #   ground slope needs: guided_test round 11, dense_1, 10 m/s tailwind,
+                                         #   highest above the plan +25.3 -> +2.8 m. None of these is in
+                                         #   c172_sitl.parm, so the waypoint setups (v1-v4) keep their results;
+                                         #   rebuild v5-v7 exactly with --param TECS_SINK_MAX=6
+# speed loop defaults (tracking setup v8, guided_test rounds 9-14): wind feedforward + P+I trim on the schedule
+# error ("hybrid"), that may only ADD airspeed (slowing below the plan on 6-deg grades cost 10-20 m of altitude),
+# changing at most 0.5 m/s per s, no altitude guard. Rebuild v7 with --guided-speed-ctrl off
+GUIDED_SPEED_CTRL    = "hybrid"
+GUIDED_SPEED_UP_ONLY = True
+GUIDED_SPEED_RATE    = 0.5
+GUIDED_ALT_GUARD     = False
 GUIDED_ALT_RATE_MS   = 100000.0          #   climb rate sent with each altitude (so ArduPlane never clips the target)
 GUIDED_ALT_STEP_M    = 0.5               #   send a new altitude when it changes by this much
 GUIDED_REF_STEP_M    = 5.0               #   reference trajectory sample spacing (guided_follower.py interpolates)
 GUIDED_EXTEND_BACK_M = 3000.0            #   straight extension before the start (the lead-in) ...
 GUIDED_EXTEND_FWD_M  = 1000.0            #   ... and after the goal, so the aim point always exists
 BATCH_SPEEDUP        = 5                 # SITL --speedup used by run_batch.py (JSBSim manages about 2x)
+GUIDED_SPEEDUP       = 3                 #   ... for GUIDED batches: guided_follower.py's 20 Hz stream keeps up
+BATCH_FOLLOWER       = "guided"          # batch-make default since tracking setup v7 ("waypoints" = setup v4)
 # pass / fail for one flight (see evaluate_flight); every check must pass
 PASS_MAX_ERROR_FRAC  = 1.0               # max distance from the plan < this x the planner's margin
 PASS_RMS_M           = 10.0              # rms distance from the plan
@@ -1793,9 +1812,20 @@ def batch_make(args):
     track_comp = None if track_comp == "none" else track_comp
     if getattr(args, "arcs", False) or getattr(args, "max_waypoints", None) or getattr(args, "alt_lead", 0.0):
         wp_spacing, track_comp = None, None
+    # the CLI defaults to BATCH_FOLLOWER (guided); scripted experiments that don't say (fix_sweep.py,
+    # speed_lead_test.py: the v3 and v4 waypoint experiments) keep waypoints, so they rebuild as they were flown
     follower = getattr(args, "follower", None) or "waypoints"
     guided = None
     if follower == "guided":
+        waypoint_only = [f for f, on in (("--arcs", getattr(args, "arcs", False)),
+                                         ("--max-waypoints", getattr(args, "max_waypoints", None)),
+                                         ("--alt-lead", getattr(args, "alt_lead", 0.0)),
+                                         ("--track-comp", getattr(args, "track_comp", None)),
+                                         ("--speed-profile", getattr(args, "speed_profile", None)),
+                                         ("--speed-lead", getattr(args, "speed_lead", 0.0))) if on]
+        if waypoint_only:
+            raise SystemExit(f"{', '.join(waypoint_only)} only apply to waypoint missions: "
+                             f"add --follower waypoints (GUIDED is the default)")
         # the plan itself is streamed in GUIDED (guided_follower.py); the 30 m waypoints are built only for
         # the flyability check and the preview, without the tracking correction (nothing flies them)
         wp_spacing, track_comp = wp_spacing or BATCH_WP_SPACING_M, None
@@ -1806,7 +1836,27 @@ def batch_make(args):
                                       else args.guided_alt_lead),
                   "speed_ramp": getattr(args, "guided_speed_ramp", "off") == "on",
                   "alt_rate_ms": float(getattr(args, "guided_alt_rate", GUIDED_ALT_RATE_MS)),
-                  "alt_step_m": float(getattr(args, "guided_alt_step", GUIDED_ALT_STEP_M))}
+                  "alt_step_m": float(getattr(args, "guided_alt_step", GUIDED_ALT_STEP_M)),
+                  "speed_hold": getattr(args, "guided_speed_hold", "off") == "on"}
+        if getattr(args, "guided_speed_step", None) is not None:
+            guided["speed_step_ms"] = float(args.guided_speed_step)
+        sc = getattr(args, "guided_speed_ctrl", "off") or "off"
+        if sc != "off":                                     # speed loop: keep the plan's schedule (rounds 9, 10)
+            guided["speed_ctrl"] = {"on": "pi"}.get(sc, sc)
+            if getattr(args, "guided_descent_guard", "off") == "on":
+                guided["descent_guard"] = True
+            if getattr(args, "guided_alt_guard", "on") == "off":
+                guided["alt_guard"] = False
+            if getattr(args, "guided_speed_rate", None):
+                guided["speed_rate_ms2"] = float(args.guided_speed_rate)
+            if getattr(args, "guided_speed_up_only", "off") == "on":
+                guided["speed_up_only"] = True
+            for k in ("speed_kp", "speed_ki"):
+                if getattr(args, f"guided_{k}", None) is not None:
+                    guided[k] = float(getattr(args, f"guided_{k}"))
+        for k in ("cmd_delay", "pos_delay"):                 # robustness tests (guided_test round 6)
+            if getattr(args, f"guided_{k}", None):
+                guided[f"{k}_s"] = float(getattr(args, f"guided_{k}"))
     # tracking setup v4: the plan's speed on every leg, but only with dense waypoints (with long legs it
     # tracked worse); --speed-profile overrides
     speed_profile = getattr(args, "speed_profile", None) or (BATCH_SPEED_PROFILE if wp_spacing else "constant")
@@ -1869,7 +1919,7 @@ def batch_make(args):
                   + "".join(f"\n      {'FLOWN ANYWAY (--fly-all)' if fly_all else 'NOT FLYABLE'}: {x}"
                             for x in m["rejects"]))
     manifest = {"name": args.name, "created": datetime.datetime.now().isoformat(timespec="seconds"),
-                "note": args.note or "", "chord_tol_m": chord_tol, "speedup": args.speedup,
+                "note": args.note or "", "chord_tol_m": chord_tol, "speedup": args.speedup or (GUIDED_SPEEDUP if guided else BATCH_SPEEDUP),
                 "max_waypoints": getattr(args, "max_waypoints", None),
                 "alt_lead_s": getattr(args, "alt_lead", 0.0) or 0.0, "min_spacing_m": getattr(args, "min_spacing", None),
                 "arcs": getattr(args, "arcs", False), "track_comp": track_comp, "wp_spacing_m": wp_spacing,
@@ -2102,7 +2152,8 @@ def main():
                          f"with --wp-spacing waypoints, constant otherwise)")
     bm.add_argument("--speed-lead", type=float, default=0.0,
                     help="with --speed-profile plan: command each leg's speed this many seconds early")
-    bm.add_argument("--speedup", type=int, default=BATCH_SPEEDUP, help="SITL speedup for run_batch.py")
+    bm.add_argument("--speedup", type=int, default=None,
+                    help=f"SITL speedup for run_batch.py (default {GUIDED_SPEEDUP} with GUIDED, {BATCH_SPEEDUP} with waypoints)")
     bm.add_argument("--note", default=None, help='e.g. "tracking setup v1"')
     bm.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
                     help="autopilot parameter for this batch only, set by run_batch.py before arming "
@@ -2129,9 +2180,9 @@ def main():
                     help="fly missions that fail the flyability check too (for experiments; the reasons are "
                          "kept in the manifest as rejects_ignored)")
     bm.add_argument("--overwrite", action="store_true", help="rebuild the missions of an existing batch")
-    bm.add_argument("--follower", choices=["waypoints", "guided"], default="waypoints",
-                    help="waypoints: upload the plan as a mission (tracking setup v4); guided: stream it in GUIDED "
-                         "mode from guided_follower.py, the 'companion computer' (experimental)")
+    bm.add_argument("--follower", choices=["waypoints", "guided"], default=BATCH_FOLLOWER,
+                    help="guided (default, tracking setup v7): stream the plan in GUIDED mode from guided_follower.py, "
+                         "the 'companion computer'; waypoints: upload it as a mission (tracking setup v4)")
     bm.add_argument("--lookahead", type=float, default=None,
                     help=f"--follower guided: L1 aim point distance along the plan, m (default {GUIDED_LOOKAHEAD_M:g})")
     bm.add_argument("--guided-alt-comp", choices=["on", "off"], default="on",
@@ -2149,6 +2200,32 @@ def main():
                          "ArduPlane never clips the altitude target towards the current altitude)")
     bm.add_argument("--guided-alt-step", type=float, default=GUIDED_ALT_STEP_M,
                     help="--follower guided: send a new altitude when it changes by this much, m")
+    bm.add_argument("--guided-speed-step", type=float, default=None,
+                    help="--follower guided: send a new airspeed when it changes by this much, m/s "
+                         "(default SPEED_STEP_MS in guided_follower.py; 0 = every update)")
+    bm.add_argument("--guided-speed-hold", choices=["on", "off"], default="off",
+                    help="--follower guided: TEST ONLY - hold one constant airspeed (the plan's mean)")
+    bm.add_argument("--guided-speed-ctrl", choices=["off", "ff", "hybrid", "pi", "on"], default=GUIDED_SPEED_CTRL,
+                    help="--follower guided: speed loop to keep the plan's schedule in wind - ff: wind feedforward + "
+                         "small trim; hybrid: ff + integral trim; pi (= on): round 9's PI loop (not kept)")
+    bm.add_argument("--guided-descent-guard", choices=["on", "off"], default="off",
+                    help="--follower guided, with --guided-speed-ctrl ff/hybrid: never slow below the plan's airspeed "
+                         "ahead of a descent steeper than 5%%")
+    bm.add_argument("--guided-alt-guard", choices=["on", "off"], default="on" if GUIDED_ALT_GUARD else "off",
+                    help="--follower guided, with --guided-speed-ctrl ff/hybrid: the 'altitude first' guard (round 13: off)")
+    bm.add_argument("--guided-speed-rate", type=float, default=GUIDED_SPEED_RATE,
+                    help="--follower guided, with --guided-speed-ctrl ff/hybrid: max rate of change of the speed "
+                         "correction, m/s per s (round 13: 0.5)")
+    bm.add_argument("--guided-speed-up-only", choices=["on", "off"], default="on" if GUIDED_SPEED_UP_ONLY else "off",
+                    help="--follower guided, with --guided-speed-ctrl ff/hybrid: the loop may only add airspeed (round 14)")
+    bm.add_argument("--guided-speed-kp", type=float, default=None,
+                    help="--follower guided: speed loop gain, (m/s) per m of schedule error (default SPEED_KP)")
+    bm.add_argument("--guided-speed-ki", type=float, default=None,
+                    help="--follower guided: speed loop integral gain, (m/s) per m*s (default SPEED_KI)")
+    bm.add_argument("--guided-cmd-delay", type=float, default=None,
+                    help="--follower guided: TEST ONLY - delay every setpoint by this many (simulated) seconds")
+    bm.add_argument("--guided-pos-delay", type=float, default=None,
+                    help="--follower guided: TEST ONLY - steer from the position reported this many seconds ago")
     ba = sub.add_parser("batch-analyze", help="Tier 3: score every flown instance of a batch and summarize")
     ba.add_argument("--name", required=True)
     ba.add_argument("--plot", action="store_true", help="show the summary plot (saved either way)")

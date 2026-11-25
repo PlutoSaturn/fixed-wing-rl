@@ -157,6 +157,9 @@ class Link:
                 self.max_alt = max(self.max_alt, self.alt_rel)
             if self.follower is not None:
                 self.follower.on_position(self, msg)
+        elif t == "VFR_HUD":
+            if self.follower is not None and hasattr(self.follower, "on_airspeed"):
+                self.follower.on_airspeed(msg.airspeed)      # the speed loop's wind estimate
         elif t == "COMMAND_ACK":
             if self.follower is not None:
                 self.follower.on_ack(msg)

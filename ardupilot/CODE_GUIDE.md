@@ -28,7 +28,7 @@ The autopilot's settings live in `c172_sitl.parm`, loaded every time SITL starts
 | `wobble_sweep.py` | WSL, during a SITL session | Flies straight and level and steps through autopilot settings to measure the wobble |
 | `fix_sweep.py` | PyCharm | Builds and scores several candidate setups on the same plans |
 | `speed_lead_test.py` | PyCharm | Builds and scores dense_1 with the plan's speeds commanded 0, 4 or 8 s early |
-| `guided_follower.py` | WSL, inside `run_batch.py` | Tracking setup v5: streams the plan to ArduPlane in GUIDED mode (the "companion computer") |
+| `guided_follower.py` | WSL, inside `run_batch.py` | Tracking setups v5 to v8: streams the plan to ArduPlane in GUIDED mode (the "companion computer") |
 | `guided_test.py` | PyCharm | Builds and scores GUIDED follower settings on chosen plans |
 | `test_ardupilot_mission.py` | PyCharm | Tests (`python -m ardupilot.test_ardupilot_mission`) |
 
@@ -56,7 +56,9 @@ All tunable numbers are named constants near the top, each with a comment saying
 - **Tracking correction:** `TRACK_COMP_K_M2` (sideways shift = K / radius), `TRACK_COMP_SLOPE_M`, `TRACK_COMP_CURV_M2`, `TRACK_COMP_BIAS_M` (altitude shift), and the caps. Fitted from flight data at ~52 m/s; refit if the autopilot settings change.
 - **Arcs (`--arcs`):** `ARC_MAX_RADIUS_M`, `ARC_MIN_TURN_DEG`, `ARC_GAP_M`, `ARC_ENTRY_ACCEPT_M`, and so on.
 - **Speed:** `SPEED_PROFILE` (`"constant"`; `"plan"` was tested and was worse).
-- **GUIDED follower (`--follower guided`, tracking setup v5):** `GUIDED_LOOKAHEAD_M` (150 m), `GUIDED_ALT_LEAD_M` (30 m), `GUIDED_ALT_RATE_MS` and `GUIDED_ALT_STEP_M` (how the altitude is sent), `GUIDED_PARAM_OVERRIDES` (`TECS_CLMB_MAX` 6.5, GUIDED batches only), `GUIDED_REF_STEP_M`, `GUIDED_EXTEND_BACK_M` / `GUIDED_EXTEND_FWD_M` (the reference trajectory).
+- **Batch defaults:** `BATCH_FOLLOWER` (`"guided"` since v7; the CLI default, while scripted experiments that don't pass a follower keep waypoints), `GUIDED_SPEEDUP` (3) and `BATCH_SPEEDUP` (5, waypoints).
+- **Speed loop defaults (tracking setup v8):** `GUIDED_SPEED_CTRL` (`"hybrid"`), `GUIDED_SPEED_UP_ONLY` (True), `GUIDED_SPEED_RATE` (0.5 m/s per s), `GUIDED_ALT_GUARD` (False); `GUIDED_PARAM_OVERRIDES` also holds `TECS_SINK_MAX` 8 since v8.
+- **GUIDED follower (`--follower guided`, the default, tracking setup v8):** `GUIDED_LOOKAHEAD_M` (150 m), `GUIDED_ALT_LEAD_M` (10 m since v7; 30 m in v5 and v6), `GUIDED_ALT_RATE_MS` and `GUIDED_ALT_STEP_M` (how the altitude is sent), `GUIDED_PARAM_OVERRIDES` (`TECS_CLMB_MAX` 6.5 and, since v6, `THR_SLEWRATE` 30; GUIDED batches only), `GUIDED_REF_STEP_M`, `GUIDED_EXTEND_BACK_M` / `GUIDED_EXTEND_FWD_M` (the reference trajectory).
 - **Flyability:** `FLY_MIN_CLEARANCE_FRAC` (the expected path must keep half the planner's margin), `AP_ROLL_LIMIT_DEG`.
 - **Pass/fail:** `PASS_MAX_ERROR_FRAC`, `PASS_RMS_M`, `PASS_GOAL_M`, `PASS_TIME_FRAC`, `NEAR_MISS_FRAC`.
 - **Measurement:** `OSC_WINDOW_S`, `OSC_SKIP_S` (how oscillation is measured).
@@ -111,7 +113,7 @@ python3 /mnt/c/Users/isaia/fixed-wing-rl/ardupilot/run_batch.py /mnt/c/Users/isa
 
 For each instance:
 1. **`start_sitl`** starts ArduPlane SITL with JSBSim's C172 at the mission's home, with `c172_sitl.parm`, without MAVProxy.
-2. **`connect`** opens the MAVLink link (the `Link` class: keeps a heartbeat, records every message to the `.tlog`, tracks mode, arming, altitude and mission item).
+2. **`connect`** opens the MAVLink link (the `Link` class: keeps a heartbeat, records every message to the `.tlog`, tracks mode, arming, altitude and mission item; with a GUIDED follower it passes each `GLOBAL_POSITION_INT` to `on_position`, each `VFR_HUD` airspeed to `on_airspeed` (the speed loop's wind estimate) and each `COMMAND_ACK` to `on_ack`).
 3. **`set_params`** applies the batch's `--param` overrides and waits for the aircraft to confirm each.
 4. **`fly`** uploads the mission (`Link.upload`), arms in AUTO, follows the flight, sets any `--param-in-plan` parameters once the plan starts, and decides when it is done (30 s circling in the final loiter) or what went wrong.
 5. **`stop_sitl`** shuts SITL and JSBSim down and writes `logs/<id>.run.json`.
@@ -142,14 +144,16 @@ The v4 experiment: dense_1 on tracking setup v3 with the plan's airspeed on ever
 
 ## `guided_follower.py`
 
-Tracking setup v5: the plan flown by streaming setpoints in GUIDED mode instead of uploading waypoints (the way a companion computer drives a flight controller). Pure Python, no numpy, so it runs in ArduPilot's environment. The `GuidedFollower` class:
-- **`on_position`** (called for every `GLOBAL_POSITION_INT`): switches to GUIDED near the plan's start; then each update finds the aircraft's place on the plan (`project`) and sends the roll (L1 law aimed `lookahead_m` along the curved plan; `send_roll`, `SET_ATTITUDE_TARGET` with only the roll used), the altitude (`send_alt`, `MAV_CMD_GUIDED_CHANGE_ALTITUDE`) and the airspeed (`send_speed`, `MAV_CMD_GUIDED_CHANGE_SPEED`); at the goal it hands back to AUTO at the exit waypoint.
+Tracking setups v5 to v8: the plan flown by streaming setpoints in GUIDED mode instead of uploading waypoints (the way a companion computer drives a flight controller). Pure Python, no numpy, so it runs in ArduPilot's environment. The `GuidedFollower` class:
+- **`on_position`** (called for every `GLOBAL_POSITION_INT`): switches to GUIDED near the plan's start; then each update finds the aircraft's place on the plan (`project`) and sends the roll (L1 law aimed `lookahead_m` along the curved plan; `send_roll`, `SET_ATTITUDE_TARGET` with only the roll used), the altitude (`send_alt`, `MAV_CMD_GUIDED_CHANGE_ALTITUDE`) and the airspeed (`send_speed`, `MAV_CMD_GUIDED_CHANGE_SPEED`, every update since v6: `SPEED_STEP_MS = 0`); at the goal it hands back to AUTO at the exit waypoint.
+- **Speed loop** (`speed_ctrl`; on in v8 as `"hybrid"`): keeps the plan's schedule. `s_sched` gives where the plan is at a given plan time (T = integral ds / v, from the plan's start); the schedule error is s_sched - s. `speed_correction_ff` ("ff"/"hybrid", v8): the along-track wind estimate (groundspeed - the `VFR_HUD` airspeed from `on_airspeed`, smoothed over `WIND_TAU_S`) is subtracted from the plan's airspeed, plus a trim on the schedule error (P for "ff", P+I for "hybrid", at most `TRIM_MAX_MS`), then `speed_up_only` (never below the plan's airspeed), `speed_rate_ms2` (rate limit), clamp `SPEED_MIN_MS`-`SPEED_MAX_MS`. Test-only variants: `alt_guard`, `descent_guard`, and `speed_correction`'s plain PI ("pi", round 9). The log adds `v_plan_ms`, `sched_err_m`, `airspeed_ms`, `wind_est_ms`.
+- **Options** (from the batch manifest): `lookahead_m`, `alt_lead_m`, `alt_rate_ms`, `alt_step_m`, `speed_step_ms`, and, for tests only, `speed_ramp`, `speed_hold` (one constant airspeed, the plan's mean), `cmd_delay_s` (every setpoint queued and sent this many simulated seconds late; mode changes are not delayed) and `pos_delay_s` (steer from the position reported this long ago).
 - **`on_ack`**: fails the flight if ArduPlane keeps rejecting the GUIDED commands (they need ArduPlane 4.3+).
 - Writes `logs/<id>.guided.csv`: per update, the distance along the plan, sideways error, aim angle and the roll, airspeed and altitude it commanded.
 
 ## `guided_test.py` and `fly_guided_test.sh`
 
-The v5 experiments: GUIDED follower settings flown on chosen plans and compared with `tier3_v4`, including the throttle (travel in %/min and time at 0 or 100%). `python -m ardupilot.guided_test make`, `fly_guided_test.sh` (WSL), `python -m ardupilot.guided_test analyze`. Its docstring records the three rounds (lookahead; speed ramp; altitude rate and lead).
+The v5 to v8 experiments and the robustness tests: GUIDED follower settings flown on chosen plans and compared with earlier batches, including the throttle (travel in %/min, time at 0 or 100%, and the jitter of the throttle and of TECS's pitch command: the rms of their part faster than 5 s). `python -m ardupilot.guided_test make`, `fly_guided_test.sh` (WSL), `python -m ardupilot.guided_test analyze`. Its docstring records the rounds (1: lookahead; 2: speed ramp; 3: altitude rate and lead, giving v5; 4: what causes the throttle bumps; 5: ArduPilot settings to calm them, giving v6; 6: command and position delay; 7: altitude lead, giving v7; 8: wind; 9-14: speed loops, giving v8). `timing` measures the schedule (flight time against the plan's, and the lag at the goal) from the follower's log.
 
 ## `test_ardupilot_mission.py`
 
@@ -162,7 +166,7 @@ Checks the module without ArduPilot, using synthetic flights and logs written by
 
 | File | What it is |
 | --- | --- |
-| `c172_sitl.parm` | ArduPlane parameters for the JSBSim C172: ArduPilot's SITL defaults, the airframe's speeds and limits, and the tuned gains (tracking setup v3, used by v3-v5; v5 adds `TECS_CLMB_MAX` 6.5 per batch). Every tuned value has a comment with the test that justified it |
+| `c172_sitl.parm` | ArduPlane parameters for the JSBSim C172: ArduPilot's SITL defaults, the airframe's speeds and limits, and the tuned gains (tracking setup v3, used by v3-v8; GUIDED batches add `TECS_CLMB_MAX` 6.5 (v5) and `THR_SLEWRATE` 30 (v6) and `TECS_SINK_MAX` 8 (v8)). Every tuned value has a comment with the test that justified it |
 | `setup_c172_sitl.sh` | One-time setup (WSL): copies JSBSim's c172x model into ArduPilot and checks it loads |
 | `figures/` | Images used in the README |
 | `README.md` | Results and how the tracking setup evolved |
